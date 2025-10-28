@@ -12,6 +12,7 @@ FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
+    libcurl4-openssl-dev \
     unzip \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
@@ -23,6 +24,11 @@ RUN make && strip audit_webhook
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
+    libcurl4 \
+    texlive-latex-recommended \
+    texlive-fonts-recommended \
+    texlive-latex-extra \
+    ghostscript \
     unzip \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /srv/audit-webhook
