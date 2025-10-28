@@ -1,4 +1,9 @@
-import type { AuditDetailResponse, AuditSummary } from './types';
+import type {
+  AuditDetailResponse,
+  AuditSummary,
+  LocationDetail,
+  LocationSummary
+} from './types';
 
 const rawBase = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
 const rawPath = import.meta.env.VITE_API_PATH?.trim() ?? '/webhook';
@@ -41,12 +46,17 @@ async function fetchJSON<T>(path: string): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function fetchAudits(): Promise<AuditSummary[]> {
-  return fetchJSON<AuditSummary[]>('/audits');
-}
-
 export function fetchAuditDetail(id: string): Promise<AuditDetailResponse> {
   return fetchJSON<AuditDetailResponse>(`/audits/${id}`);
+}
+
+export function fetchLocations(): Promise<LocationSummary[]> {
+  return fetchJSON<LocationSummary[]>('/locations');
+}
+
+export function fetchLocationDetail(address: string): Promise<LocationDetail> {
+  const query = new URLSearchParams({ address }).toString();
+  return fetchJSON<LocationDetail>(`/locations?${query}`);
 }
 
 interface DeficiencyUpdateResponse {
@@ -79,4 +89,29 @@ export async function updateDeficiencyStatus(auditId: string, deficiencyId: numb
   }
 
   return (await response.json()) as DeficiencyUpdateResponse;
+}
+
+export async function downloadReport(address: string): Promise<Blob> {
+  const url = buildUrl(`/reports?address=${encodeURIComponent(address)}`);
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/json'
+    }
+  });
+
+  if (!response.ok) {
+    let message = response.statusText;
+    try {
+      const data = await response.json();
+      if (typeof data?.message === 'string' && data.message.trim().length > 0) {
+        message = data.message;
+      }
+    } catch (err) {
+      // ignore JSON parse errors
+    }
+    throw new Error(message || `Request failed with status ${response.status}`);
+  }
+
+  const text = await response.text();
+  return new Blob([text], { type: 'application/json' });
 }

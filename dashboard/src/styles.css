@@ -455,6 +455,144 @@ tbody tr:hover {
   order: 2;
 }
 
+.back-button {
+  background: none;
+  border: none;
+  color: #38bdf8;
+  font-size: 0.95rem;
+  cursor: pointer;
+  margin-bottom: 0.5rem;
+  padding: 0;
+}
+
+.back-button:hover {
+  text-decoration: underline;
+}
+
+.location-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.summary-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.summary-card {
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  border-radius: 12px;
+  padding: 0.85rem 1rem;
+}
+
+.summary-label {
+  display: block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: rgba(148, 163, 184, 0.7);
+  margin-bottom: 0.25rem;
+}
+
+.summary-value {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #f8fafc;
+}
+
+.summary-value.warning {
+  color: #f97316;
+}
+
+.summary-section h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  color: #cbd5f5;
+}
+
+.tag-list {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  background: rgba(56, 189, 248, 0.18);
+  color: #38bdf8;
+  padding: 0.35rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.tag-count {
+  background: rgba(15, 23, 42, 0.65);
+  border-radius: 999px;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.7rem;
+  color: #f1f5f9;
+}
+
+.success-banner,
+.error-banner {
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+  font-size: 0.9rem;
+}
+
+.success-banner {
+  background: rgba(34, 197, 94, 0.18);
+  border: 1px solid rgba(34, 197, 94, 0.35);
+  color: #bbf7d0;
+}
+
+.error-banner {
+  background: rgba(239, 68, 68, 0.18);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  color: #fecaca;
+}
+
+.status-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.8rem;
+  color: rgba(203, 213, 225, 0.85);
+}
+
+.action-group {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.action-group button {
+  border: none;
+  border-radius: 8px;
+  padding: 0.35rem 0.75rem;
+  background: rgba(56, 189, 248, 0.2);
+  color: #38bdf8;
+  cursor: pointer;
+  font-size: 0.8rem;
+}
+
+.action-group button:hover {
+  background: rgba(56, 189, 248, 0.3);
+}
+
+.deficiency-note {
+  color: rgba(148, 163, 184, 0.8);
+}
+
 @media (max-width: 720px) {
   .app-header {
     flex-direction: column;

@@ -35,3 +35,12 @@ export function formatNumber(value: number | null | undefined, options?: Intl.Nu
 export function dataUrl(contentType: string, base64: string): string {
   return `data:${contentType};base64,${base64}`;
 }
+
+export function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .substring(0, 64) || 'report';
+}

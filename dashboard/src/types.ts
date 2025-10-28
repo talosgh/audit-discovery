@@ -121,3 +121,63 @@ export interface AuditDetailResponse {
   deficiencies: Deficiency[];
   photos: PhotoAsset[];
 }
+
+export interface LocationSummary {
+  address: string;
+  building_owner: string | null;
+  elevator_contractor: string | null;
+  city_id: string | null;
+  audit_count: number;
+  device_count: number;
+  open_deficiencies: number;
+  last_audit: string | null;
+  first_audit: string | null;
+}
+
+export interface LocationDeviceDeficiency {
+  equipment: string | null;
+  condition: string | null;
+  remedy: string | null;
+  note: string | null;
+  resolved: boolean;
+  resolved_at: string | null;
+}
+
+export interface LocationDevice {
+  audit_uuid: string;
+  device_id: string | null;
+  device_type: string | null;
+  bank_name: string | null;
+  city_id: string | null;
+  submitted_on: string | null;
+  controller_install_year: number | null;
+  controller_age: number | null;
+  dlm_compliant: boolean | null;
+  cat1_tag_current: boolean | null;
+  cat5_tag_current: boolean | null;
+  maintenance_log_up_to_date: boolean | null;
+  is_first_car: boolean | null;
+  total_deficiencies: number;
+  open_deficiencies: number;
+  cars_in_bank: string[];
+  floors_served: string[];
+  total_floor_stop_names: string[];
+  deficiencies: LocationDeviceDeficiency[];
+}
+
+export interface LocationDetail {
+  summary: {
+    address: string;
+    building_owner: string | null;
+    elevator_contractor: string | null;
+    city_id: string | null;
+    device_count: number;
+    audit_count: number;
+    first_audit: string | null;
+    last_audit: string | null;
+    total_deficiencies: number;
+    open_deficiencies: number;
+    deficiencies_by_code: Record<string, number>;
+  };
+  devices: LocationDevice[];
+}
