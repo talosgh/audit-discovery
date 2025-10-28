@@ -130,3 +130,21 @@ CREATE INDEX IF NOT EXISTS idx_audit_deficiencies_audit_uuid ON audit_deficienci
 
 ALTER TABLE audit_deficiencies
     ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+
+CREATE TABLE IF NOT EXISTS report_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    job_id UUID NOT NULL,
+    address TEXT NOT NULL,
+    notes TEXT,
+    recommendations TEXT,
+    status TEXT NOT NULL DEFAULT 'queued',
+    error TEXT,
+    output_path TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_report_jobs_job_id ON report_jobs (job_id);
+CREATE INDEX IF NOT EXISTS idx_report_jobs_status ON report_jobs (status);

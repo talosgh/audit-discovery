@@ -1,10 +1,10 @@
 import type { Component } from 'solid-js';
-import { For, Match, Show, Switch, createResource, createSignal, createMemo } from 'solid-js';
-import { fetchLocationDetail, downloadReport } from '../api';
+import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
+import { fetchLocationDetail, downloadReport, createReportJob, fetchReportJob } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
 import { formatDateTime, slugify } from '../utils';
-import type { LocationDetail as LocationDetailType, LocationDevice } from '../types';
+import type { LocationDetail as LocationDetailType, LocationDevice, ReportJobStatus } from '../types';
 
 interface LocationDetailProps {
   address: string;
@@ -16,18 +16,99 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [message, setMessage] = createSignal<string | null>(null);
   const [errorMessage, setErrorMessage] = createSignal<string | null>(null);
   const [isGenerating, setIsGenerating] = createSignal(false);
+  const [jobId, setJobId] = createSignal<string | null>(null);
+  const [jobStatus, setJobStatus] = createSignal<ReportJobStatus | null>(null);
   const [detail, { refetch }] = createResource<LocationDetailType, string>(() => props.address, fetchLocationDetail);
 
   const summary = createMemo(() => detail()?.summary);
   const devices = createMemo(() => detail()?.devices ?? []);
 
+  let pollTimer: number | null = null;
+
+  const stopPolling = () => {
+    if (pollTimer !== null) {
+      window.clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  };
+
+  const updateStatusFromPoll = (status: ReportJobStatus) => {
+    setJobStatus(status);
+    if (status.status === 'failed') {
+      setErrorMessage(status.error ?? 'Report generation failed');
+      setIsGenerating(false);
+      stopPolling();
+      return;
+    }
+    if (status.status === 'completed' && status.download_ready) {
+      setMessage('Report ready for download.');
+      setIsGenerating(false);
+      stopPolling();
+      return;
+    }
+    if (status.status === 'processing') {
+      setMessage('Report generation in progress…');
+    } else if (status.status === 'queued') {
+      setMessage('Report queued for generation…');
+    }
+  };
+
+  const startPolling = (id: string) => {
+    stopPolling();
+    setIsGenerating(true);
+    const poll = async () => {
+      try {
+        const status = await fetchReportJob(id);
+        updateStatusFromPoll(status);
+      } catch (err) {
+        setErrorMessage((err as Error).message);
+        setIsGenerating(false);
+        stopPolling();
+      }
+    };
+    poll();
+    pollTimer = window.setInterval(poll, 5000);
+  };
+
+  onCleanup(() => {
+    stopPolling();
+  });
+
+  createEffect(() => {
+    props.address;
+    stopPolling();
+    setJobId(null);
+    setJobStatus(null);
+    setIsGenerating(false);
+    setMessage(null);
+    setErrorMessage(null);
+  });
+
   const handleGenerateReport = async () => {
     setMessage(null);
     setErrorMessage(null);
-    setIsGenerating(true);
+    setJobStatus(null);
+    stopPolling();
     try {
-      const blob = await downloadReport(props.address);
-      const filename = `audit-report-${slugify(props.address)}.json`;
+      setIsGenerating(true);
+      const response = await createReportJob(props.address);
+      setJobId(response.job_id);
+      setMessage('Report request queued. We will notify when it is ready.');
+      startPolling(response.job_id);
+    } catch (error) {
+      setIsGenerating(false);
+      const message = error instanceof Error ? error.message : 'Failed to queue report';
+      setErrorMessage(message);
+    }
+  };
+
+  const handleDownloadReport = async () => {
+    const id = jobId();
+    if (!id) return;
+    setErrorMessage(null);
+    try {
+      const blob = await downloadReport(id);
+      const filename = `audit-report-${slugify(props.address)}.pdf`;
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -36,12 +117,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
-      setMessage(`Report data saved as ${filename}`);
+      setMessage(`Report downloaded as ${filename}`);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to generate report';
+      const message = error instanceof Error ? error.message : 'Failed to download report';
       setErrorMessage(message);
-    } finally {
-      setIsGenerating(false);
     }
   };
 
@@ -82,8 +161,13 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
             disabled={isGenerating()}
             onClick={handleGenerateReport}
           >
-            {isGenerating() ? 'Generating…' : 'Generate Report Data'}
+            {isGenerating() ? 'Generating…' : 'Generate Report'}
           </button>
+          <Show when={jobStatus()?.download_ready}>
+            <button type="button" class="action-button" onClick={handleDownloadReport}>
+              Download Report
+            </button>
+          </Show>
         </div>
       </div>
 
@@ -154,6 +238,11 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
             </Show>
             <Show when={errorMessage()}>
               {(msg) => <div class="error-banner" role="alert">{msg()}</div>}
+            </Show>
+            <Show when={jobStatus() && !jobStatus()?.download_ready && isGenerating()}>
+              {(status) => (
+                <div class="info-banner" role="status">Current status: {status().status}</div>
+              )}
             </Show>
           </div>
 

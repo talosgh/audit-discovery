@@ -197,6 +197,32 @@ tbody tr:hover {
   box-shadow: 0 0 8px rgba(249, 115, 22, 0.6);
 }
 
+.location-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.location-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.has-open-deficiencies .location-name {
+  color: #f8fafc;
+  font-weight: 600;
+}
+
+.deficiency-chip {
+  font-size: 0.95rem;
+  line-height: 1;
+  padding: 0.15rem 0.4rem;
+  border-radius: 999px;
+  background: rgba(249, 115, 22, 0.2);
+  color: #fb923c;
+  box-shadow: 0 0 12px rgba(249, 115, 22, 0.4);
+}
+
 .status-pill {
   border-radius: 999px;
   padding: 0.25rem 0.75rem;
@@ -560,6 +586,15 @@ tbody tr:hover {
   background: rgba(239, 68, 68, 0.18);
   border: 1px solid rgba(239, 68, 68, 0.35);
   color: #fecaca;
+}
+
+.info-banner {
+  border-radius: 10px;
+  padding: 0.75rem 1rem;
+  font-size: 0.9rem;
+  background: rgba(59, 130, 246, 0.18);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  color: #bfdbfe;
 }
 
 .status-stack {

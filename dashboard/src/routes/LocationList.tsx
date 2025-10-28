@@ -100,7 +100,12 @@ const LocationList: Component<LocationListProps> = (props) => {
                           }
                         }}
                       >
-                        <td>{location.address}</td>
+                        <td class={openCount > 0 ? 'location-cell has-open-deficiencies' : 'location-cell'}>
+                          <span class="location-name">{location.address}</span>
+                          <Show when={openCount > 0}>
+                            <span class="deficiency-chip" role="img" aria-label="Open deficiencies">⚠</span>
+                          </Show>
+                        </td>
                         <td>{location.building_owner ?? '—'}</td>
                         <td>{location.elevator_contractor ?? '—'}</td>
                         <td>{location.city_id ?? '—'}</td>

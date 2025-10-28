@@ -20,6 +20,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <curl/curl.h>
 
 #include "csv.h"
 #include "json.h"
@@ -33,6 +35,17 @@ static char *g_api_key = NULL;
 static char *g_api_prefix = NULL;
 static size_t g_api_prefix_len = 0;
 static char *g_static_dir = NULL;
+static char *g_database_dsn = NULL;
+static char *g_report_output_dir = NULL;
+static char *g_xai_api_key = NULL;
+
+static pthread_t g_report_thread;
+static pthread_mutex_t g_report_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_report_cond = PTHREAD_COND_INITIALIZER;
+static bool g_report_stop = false;
+static bool g_report_signal = false;
+static bool g_report_thread_started = false;
+static bool g_curl_initialized = false;
 
 typedef struct {
     bool has_value;
@@ -366,16 +379,39 @@ typedef struct {
     size_t capacity;
 } AllocationList;
 
+typedef struct {
+    char job_id[37];
+    char *address;
+    char *notes;
+    char *recommendations;
+} ReportJob;
+
+typedef struct {
+    char *executive_summary;
+    char *key_findings;
+    char *methodology;
+    char *maintenance_performance;
+    char *recommendations;
+    char *conclusion;
+} NarrativeSet;
+
 static bool is_valid_uuid(const char *uuid);
 static void handle_options_request(int client_fd);
 static void handle_get_request(int client_fd, PGconn *conn, const char *path, const char *query_string);
 static char *db_fetch_audit_list(PGconn *conn, char **error_out);
 static char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out);
 static void serve_static_file(int client_fd, const char *path);
+static void send_file_download(int client_fd, const char *path, const char *content_type, const char *filename);
 static const char *mime_type_for(const char *path);
 static bool path_is_safe(const char *path);
+static int ensure_directory_exists(const char *path);
+static char *join_path(const char *dir, const char *filename);
+static int write_buffer_to_file(const char *path, const char *data, size_t len);
+static const char *optional_bool_to_text(const OptionalBool *value);
+static const char *optional_int_to_text(const OptionalInt *value, char *buffer, size_t buffer_len);
 static bool audit_exists(PGconn *conn, const char *uuid);
 static bool db_update_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool resolved, char **resolved_at_out, char **error_out);
+static bool db_fetch_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool *resolved_out, char **error_out);
 static char *build_deficiency_key(const char *overlay_code, const char *device_id, const char *equipment, const char *condition, const char *remedy, const char *note);
 static OptionalInt parse_optional_int(const char *text);
 static OptionalDouble parse_optional_double(const char *text);
@@ -390,6 +426,24 @@ static bool extract_resolved_flag(const char *body, bool *resolved_out);
 static char *extract_query_param(const char *query_string, const char *key);
 static char *db_fetch_location_list(PGconn *conn, char **error_out);
 static char *build_location_detail_json(const ReportData *report);
+static void report_job_init(ReportJob *job);
+static void report_job_clear(ReportJob *job);
+static int generate_uuid_v4(char out[37]);
+static char *string_array_join(const StringArray *array, const char *separator);
+static int db_insert_report_job(PGconn *conn, const char *job_id, const char *address, const char *notes, const char *recs, char **error_out);
+static int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out);
+static int db_complete_report_job(PGconn *conn, const char *job_id, const char *status, const char *error_text, const char *output_path, char **error_out);
+static char *db_fetch_report_job_status(PGconn *conn, const char *job_id, char **error_out);
+static int db_fetch_report_download_path(PGconn *conn, const char *job_id, char **path_out, char **error_out);
+static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out);
+static void *report_worker_main(void *arg);
+static void signal_report_worker(void);
+static int generate_grok_completion(const char *system_prompt, const char *user_prompt, char **response_out, char **error_out);
+static void narrative_set_init(NarrativeSet *set);
+static void narrative_set_clear(NarrativeSet *set);
+static int build_report_latex(const ReportData *report, const NarrativeSet *narratives, const ReportJob *job, const char *output_path, char **error_out);
+static int run_pdflatex(const char *working_dir, const char *tex_filename, char **error_out);
+static char *latex_escape(const char *text);
 
 static void log_error(const char *fmt, ...) {
     va_list args;
@@ -452,6 +506,130 @@ static void string_array_clear(StringArray *array) {
     array->values = NULL;
     array->count = 0;
     array->capacity = 0;
+}
+
+static char *string_array_join(const StringArray *array, const char *separator) {
+    if (!array || array->count == 0) {
+        return NULL;
+    }
+    const char *sep = separator ? separator : ", ";
+    size_t sep_len = strlen(sep);
+    size_t total = 1;
+    for (size_t i = 0; i < array->count; ++i) {
+        if (array->values[i]) {
+            total += strlen(array->values[i]);
+        }
+        if (i + 1 < array->count) {
+            total += sep_len;
+        }
+    }
+    char *result = malloc(total);
+    if (!result) {
+        return NULL;
+    }
+    result[0] = '\0';
+    for (size_t i = 0; i < array->count; ++i) {
+        if (array->values[i]) {
+            strcat(result, array->values[i]);
+        }
+        if (i + 1 < array->count) {
+            strcat(result, sep);
+        }
+    }
+    return result;
+}
+
+static const char *optional_bool_to_text(const OptionalBool *value) {
+    if (!value || !value->has_value) {
+        return "—";
+    }
+    return value->value ? "Yes" : "No";
+}
+
+static const char *optional_int_to_text(const OptionalInt *value, char *buffer, size_t buffer_len) {
+    if (!buffer || buffer_len == 0) {
+        return "";
+    }
+    if (!value || !value->has_value) {
+        return "—";
+    }
+    snprintf(buffer, buffer_len, "%d", value->value);
+    return buffer;
+}
+
+
+static void report_job_init(ReportJob *job) {
+    if (!job) return;
+    job->job_id[0] = '\0';
+    job->address = NULL;
+    job->notes = NULL;
+    job->recommendations = NULL;
+}
+
+static void report_job_clear(ReportJob *job) {
+    if (!job) return;
+    free(job->address);
+    free(job->notes);
+    free(job->recommendations);
+    job->address = NULL;
+    job->notes = NULL;
+    job->recommendations = NULL;
+    job->job_id[0] = '\0';
+}
+
+static void narrative_set_init(NarrativeSet *set) {
+    if (!set) return;
+    set->executive_summary = NULL;
+    set->key_findings = NULL;
+    set->methodology = NULL;
+    set->maintenance_performance = NULL;
+    set->recommendations = NULL;
+    set->conclusion = NULL;
+}
+
+static void narrative_set_clear(NarrativeSet *set) {
+    if (!set) return;
+    free(set->executive_summary);
+    free(set->key_findings);
+    free(set->methodology);
+    free(set->maintenance_performance);
+    free(set->recommendations);
+    free(set->conclusion);
+    narrative_set_init(set);
+}
+
+static int generate_uuid_v4(char out[37]) {
+    if (!out) {
+        return 0;
+    }
+    unsigned char bytes[16];
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, bytes, sizeof(bytes));
+        close(fd);
+        if (n != (ssize_t)sizeof(bytes)) {
+            fd = -1;
+        }
+    }
+    if (fd < 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        unsigned int seed = (unsigned int)(ts.tv_nsec ^ ts.tv_sec ^ getpid());
+        for (size_t i = 0; i < sizeof(bytes); ++i) {
+            seed = seed * 1103515245u + 12345u;
+            bytes[i] = (unsigned char)((seed >> 16) & 0xFF);
+        }
+    }
+    bytes[6] = (unsigned char)((bytes[6] & 0x0F) | 0x40);
+    bytes[8] = (unsigned char)((bytes[8] & 0x3F) | 0x80);
+    int written = snprintf(out, 37,
+                           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                           bytes[0], bytes[1], bytes[2], bytes[3],
+                           bytes[4], bytes[5],
+                           bytes[6], bytes[7],
+                           bytes[8], bytes[9],
+                           bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]);
+    return written == 36;
 }
 
 typedef struct {
@@ -4204,7 +4382,7 @@ static void send_http_response(int client_fd, int status_code, const char *statu
                               "Content-Type: %s\r\n"
                               "Content-Length: %zu\r\n"
                               "Access-Control-Allow-Origin: *\r\n"
-                              "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                              "Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS\r\n"
                               "Access-Control-Allow-Headers: Content-Type, X-API-Key\r\n"
                               "Connection: close\r\n\r\n",
                               status_code, status_text, content_type, body_len);
@@ -4530,9 +4708,553 @@ static bool db_update_deficiency_status(PGconn *conn, const char *uuid, long def
     return true;
 }
 
+static bool db_fetch_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool *resolved_out, char **error_out) {
+    if (!conn || !uuid || !resolved_out) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid parameters while reading deficiency");
+        }
+        return false;
+    }
+
+    const char *sql =
+        "SELECT resolved_at IS NOT NULL "
+        "FROM audit_deficiencies "
+        "WHERE audit_uuid = $1::uuid AND id = $2";
+    char id_buf[32];
+    snprintf(id_buf, sizeof(id_buf), "%ld", deficiency_id);
+    const char *params[2] = { uuid, id_buf };
+    PGresult *res = PQexecParams(conn, sql, 2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to read deficiency status");
+        }
+        PQclear(res);
+        return false;
+    }
+    if (PQntuples(res) == 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Deficiency not found");
+        }
+        PQclear(res);
+        return false;
+    }
+    *resolved_out = !PQgetisnull(res, 0, 0) ? (strcmp(PQgetvalue(res, 0, 0), "t") == 0 || strcmp(PQgetvalue(res, 0, 0), "1") == 0) : false;
+    PQclear(res);
+    return true;
+}
+
+static int db_insert_report_job(PGconn *conn, const char *job_id, const char *address, const char *notes, const char *recs, char **error_out) {
+    if (!conn || !job_id || !address || address[0] == '\0') {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid report job parameters");
+        }
+        return 0;
+    }
+    const char *sql =
+        "INSERT INTO report_jobs (job_id, address, notes, recommendations) "
+        "VALUES ($1::uuid, $2, $3, $4)";
+    const char *params[4] = { job_id, address, notes, recs };
+    const int formats[4] = { 0, 0, 0, 0 };
+    const int lengths[4] = { 0, 0, 0, 0 };
+    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, lengths, formats, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to insert report job");
+        }
+        PQclear(res);
+        return 0;
+    }
+    PQclear(res);
+    return 1;
+}
+
+static int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
+    if (!conn || !job) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid report job request");
+        }
+        return -1;
+    }
+    const char *sql =
+        "WITH job AS ("
+        "    SELECT id, job_id::text AS job_id_text, address, notes, recommendations "
+        "    FROM report_jobs "
+        "    WHERE status = 'queued' "
+        "    ORDER BY created_at "
+        "    LIMIT 1 "
+        "    FOR UPDATE SKIP LOCKED"
+        ") "
+        "UPDATE report_jobs r "
+        "SET status = 'processing', started_at = COALESCE(r.started_at, NOW()), updated_at = NOW() "
+        "FROM job "
+        "WHERE r.id = job.id "
+        "RETURNING job.job_id_text, job.address, job.notes, job.recommendations";
+    PGresult *res = PQexec(conn, sql);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to claim report job");
+        }
+        PQclear(res);
+        return -1;
+    }
+    int rows = PQntuples(res);
+    if (rows == 0) {
+        PQclear(res);
+        return 0;
+    }
+    report_job_clear(job);
+    report_job_init(job);
+    const char *job_id = PQgetvalue(res, 0, 0);
+    if (!job_id || strlen(job_id) >= sizeof(job->job_id)) {
+        PQclear(res);
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid job identifier");
+        }
+        return -1;
+    }
+    strncpy(job->job_id, job_id, sizeof(job->job_id));
+    job->job_id[36] = '\0';
+
+    if (!PQgetisnull(res, 0, 1)) {
+        job->address = strdup(PQgetvalue(res, 0, 1));
+        if (!job->address) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying address");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 2)) {
+        job->notes = strdup(PQgetvalue(res, 0, 2));
+        if (!job->notes) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying notes");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 3)) {
+        job->recommendations = strdup(PQgetvalue(res, 0, 3));
+        if (!job->recommendations) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying recommendations");
+            }
+            return -1;
+        }
+    }
+    PQclear(res);
+    return 1;
+}
+
+static int db_complete_report_job(PGconn *conn, const char *job_id, const char *status, const char *error_text, const char *output_path, char **error_out) {
+    if (!conn || !job_id || !status) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid report job completion parameters");
+        }
+        return 0;
+    }
+    const char *sql =
+        "UPDATE report_jobs "
+        "SET status = $2, "
+        "    error = $3, "
+        "    output_path = $4, "
+        "    completed_at = CASE WHEN $2 IN ('completed','failed') THEN NOW() ELSE completed_at END, "
+        "    updated_at = NOW() "
+        "WHERE job_id = $1::uuid";
+    const char *params[4] = { job_id, status, error_text, output_path };
+    const int formats[4] = { 0, 0, 0, 0 };
+    const int lengths[4] = { 0, 0, 0, 0 };
+    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, lengths, formats, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed updating report job");
+        }
+        PQclear(res);
+        return 0;
+    }
+    if (PQcmdTuples(res)[0] == '0') {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Report job not found");
+        }
+        PQclear(res);
+        return 0;
+    }
+    PQclear(res);
+    return 1;
+}
+
+static char *db_fetch_report_job_status(PGconn *conn, const char *job_id, char **error_out) {
+    if (!conn || !job_id) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Job id required");
+        }
+        return NULL;
+    }
+    const char *sql =
+        "SELECT json_build_object("
+        "  'job_id', job_id::text,"
+        "  'status', status,"
+        "  'address', address,"
+        "  'created_at', created_at,"
+        "  'started_at', started_at,"
+        "  'completed_at', completed_at,"
+        "  'error', error,"
+        "  'download_ready', (status = 'completed' AND output_path IS NOT NULL)"
+        ")::text "
+        "FROM report_jobs "
+        "WHERE job_id = $1::uuid";
+    const char *params[1] = { job_id };
+    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to fetch report job");
+        }
+        PQclear(res);
+        return NULL;
+    }
+    if (PQntuples(res) == 0 || PQgetisnull(res, 0, 0)) {
+        PQclear(res);
+        if (error_out && !*error_out) {
+            *error_out = strdup("Report job not found");
+        }
+        return NULL;
+    }
+    const char *value = PQgetvalue(res, 0, 0);
+    char *json = strdup(value ? value : "{}");
+    PQclear(res);
+    return json;
+}
+
+static int db_fetch_report_download_path(PGconn *conn, const char *job_id, char **path_out, char **error_out) {
+    if (!conn || !job_id || !path_out) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Job id required");
+        }
+        return 0;
+    }
+    const char *sql =
+        "SELECT status, output_path "
+        "FROM report_jobs "
+        "WHERE job_id = $1::uuid";
+    const char *params[1] = { job_id };
+    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to fetch download path");
+        }
+        PQclear(res);
+        return 0;
+    }
+    if (PQntuples(res) == 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Report job not found");
+        }
+        PQclear(res);
+        return 0;
+    }
+    const char *status = PQgetvalue(res, 0, 0);
+    bool completed = status && strcmp(status, "completed") == 0;
+    if (!completed) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Report not ready");
+        }
+        PQclear(res);
+        return 0;
+    }
+    if (PQgetisnull(res, 0, 1)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Report artifact missing");
+        }
+        PQclear(res);
+        return 0;
+    }
+    const char *path = PQgetvalue(res, 0, 1);
+    *path_out = strdup(path);
+    PQclear(res);
+    if (!*path_out) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory copying path");
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out) {
+    if (output_path_out) {
+        *output_path_out = NULL;
+    }
+    if (!conn || !job || !job->address || !g_report_output_dir) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid report job");
+        }
+        return 0;
+    }
+
+    int success = 0;
+    ReportData report;
+    report_data_init(&report);
+
+    char *job_dir = NULL;
+    char *tex_path = NULL;
+    char *pdf_path = NULL;
+    char *report_json = NULL;
+    NarrativeSet narratives;
+    narrative_set_init(&narratives);
+
+    char *load_error = NULL;
+    if (!load_report_for_building(conn, job->address, &report, &load_error)) {
+        if (error_out && !*error_out) {
+            *error_out = load_error ? load_error : strdup("Failed to load report data");
+        } else {
+            free(load_error);
+        }
+        goto cleanup;
+    }
+    free(load_error);
+
+    job_dir = join_path(g_report_output_dir, job->job_id);
+    if (!job_dir) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory");
+        }
+        goto cleanup;
+    }
+    if (ensure_directory_exists(job_dir) != 0) {
+        if (error_out && !*error_out) {
+            char *msg = malloc(128);
+            if (msg) {
+                snprintf(msg, 128, "Failed to prepare report directory %s: %s", job_dir, strerror(errno));
+                *error_out = msg;
+            }
+        }
+        goto cleanup;
+    }
+
+    tex_path = join_path(job_dir, "audit_report.tex");
+    pdf_path = join_path(job_dir, "audit_report.pdf");
+    if (!tex_path || !pdf_path) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory");
+        }
+        goto cleanup;
+    }
+
+    report_json = report_data_to_json(&report);
+    if (!report_json) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to serialize report data");
+        }
+        goto cleanup;
+    }
+
+    const char *system_prompt = "You are an expert vertical transportation safety consultant. Provide concise, professional narrative text suitable for a building owner. Do not include LaTeX syntax or markdown.";
+
+    struct {
+        const char *title;
+        char **slot;
+        const char *instructions;
+        int include_notes;
+        int include_recommendations;
+    } sections[] = {
+        {"Executive Summary", &narratives.executive_summary,
+         "Write an executive summary highlighting equipment condition, total device count, total deficiencies, and the most critical safety issues.\nProvide actionable context appropriate for ownership decisions.", 1, 0},
+        {"Key Findings", &narratives.key_findings,
+         "List the top findings from the audit with concise explanations. Focus on safety, compliance, and maintenance trends across devices.", 1, 0},
+        {"Methodology", &narratives.methodology,
+         "Describe the inspection methodology, standards referenced, and scope of the audit. Mention any limitations or assumptions.", 0, 0},
+        {"Maintenance Performance", &narratives.maintenance_performance,
+         "Analyze maintenance performance and recurring issues observed in the audit. Discuss patterns tied to equipment age, usage, or contractor performance.", 1, 0},
+        {"Recommendations", &narratives.recommendations,
+         "Provide prioritized recommendations for remediation, including immediate safety concerns, short-term actions, and long-term planning guidance.", 1, 1},
+        {"Conclusion", &narratives.conclusion,
+         "Deliver a closing narrative summarizing risk outlook, benefits of addressing recommendations, and next steps for maintaining compliance.", 0, 0}
+    };
+
+    for (size_t i = 0; i < sizeof(sections) / sizeof(sections[0]); ++i) {
+        Buffer prompt;
+        if (!buffer_init(&prompt)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory");
+            }
+            goto cleanup;
+        }
+
+        if (!buffer_appendf(&prompt, "%s\n\nAudit Data:\n%s", sections[i].instructions, report_json)) {
+            buffer_free(&prompt);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory");
+            }
+            goto cleanup;
+        }
+
+        if (sections[i].include_notes && job->notes && job->notes[0]) {
+            buffer_appendf(&prompt, "\n\nInspector Notes:\n%s", job->notes);
+        }
+        if (sections[i].include_recommendations && job->recommendations && job->recommendations[0]) {
+            buffer_appendf(&prompt, "\n\nClient Guidance:\n%s", job->recommendations);
+        }
+
+        char *section_text = NULL;
+        char *section_error = NULL;
+        if (!generate_grok_completion(system_prompt, prompt.data, &section_text, &section_error)) {
+            if (error_out && !*error_out) {
+                *error_out = section_error ? section_error : strdup("Narrative generation failed");
+            } else {
+                free(section_error);
+            }
+            buffer_free(&prompt);
+            goto cleanup;
+        }
+        buffer_free(&prompt);
+        *(sections[i].slot) = section_text;
+    }
+
+    char *latex_error = NULL;
+    if (!build_report_latex(&report, &narratives, job, tex_path, &latex_error)) {
+        if (error_out && !*error_out) {
+            *error_out = latex_error ? latex_error : strdup("Failed to build LaTeX");
+        } else {
+            free(latex_error);
+        }
+        goto cleanup;
+    }
+    free(latex_error);
+
+    char *compile_error = NULL;
+    if (!run_pdflatex(job_dir, "audit_report.tex", &compile_error)) {
+        if (error_out && !*error_out) {
+            *error_out = compile_error ? compile_error : strdup("Failed compiling PDF");
+        } else {
+            free(compile_error);
+        }
+        goto cleanup;
+    }
+    free(compile_error);
+
+    if (output_path_out) {
+        *output_path_out = pdf_path;
+        pdf_path = NULL;
+    }
+    success = 1;
+
+cleanup:
+    if (!success && output_path_out && *output_path_out) {
+        free(*output_path_out);
+        *output_path_out = NULL;
+    }
+    free(report_json);
+    narrative_set_clear(&narratives);
+    report_data_clear(&report);
+    free(job_dir);
+    free(tex_path);
+    if (pdf_path) {
+        free(pdf_path);
+    }
+    return success;
+}
+
 static void handle_get_request(int client_fd, PGconn *conn, const char *path, const char *query_string) {
     if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0) {
         send_http_json(client_fd, 200, "OK", "{\"status\":\"ok\"}");
+        return;
+    }
+
+    if (strncmp(path, "/reports/", 9) == 0) {
+        const char *rest = path + 9;
+        const char *suffix = strchr(rest, '/');
+        char job_id[37];
+        if (suffix) {
+            size_t len = (size_t)(suffix - rest);
+            if (len >= sizeof(job_id) || len == 0) {
+                char *body = build_error_response("Invalid job id");
+                send_http_json(client_fd, 400, "Bad Request", body);
+                free(body);
+                return;
+            }
+            memcpy(job_id, rest, len);
+            job_id[len] = '\0';
+        } else {
+            size_t len = strlen(rest);
+            if (len >= sizeof(job_id) || len == 0) {
+                char *body = build_error_response("Invalid job id");
+                send_http_json(client_fd, 400, "Bad Request", body);
+                free(body);
+                return;
+            }
+            memcpy(job_id, rest, len + 1);
+        }
+
+        if (!is_valid_uuid(job_id)) {
+            char *body = build_error_response("Invalid job id");
+            send_http_json(client_fd, 400, "Bad Request", body);
+            free(body);
+            return;
+        }
+
+        if (suffix && strcmp(suffix, "/download") == 0) {
+            char *path_str = NULL;
+            char *error = NULL;
+            if (!db_fetch_report_download_path(conn, job_id, &path_str, &error)) {
+                char *body = build_error_response(error ? error : "Report not available");
+                int status = 404;
+                if (error && strcmp(error, "Report not ready") == 0) {
+                    status = 409;
+                } else if (error && strcmp(error, "Report job not found") == 0) {
+                    status = 404;
+                }
+                send_http_json(client_fd, status, status == 404 ? "Not Found" : "Conflict", body);
+                free(body);
+                free(error);
+                return;
+            }
+
+            struct stat st;
+            if (stat(path_str, &st) != 0 || !S_ISREG(st.st_mode)) {
+                free(path_str);
+                char *body = build_error_response("Report artifact missing");
+                send_http_json(client_fd, 500, "Internal Server Error", body);
+                free(body);
+                return;
+            }
+
+            char download_name[64];
+            snprintf(download_name, sizeof(download_name), "audit-report-%s.pdf", job_id);
+            const char *name_to_use = download_name;
+            send_file_download(client_fd, path_str, "application/pdf", name_to_use);
+            free(path_str);
+            return;
+        }
+
+        if (suffix && suffix[0] != '\0') {
+            char *body = build_error_response("Not Found");
+            send_http_json(client_fd, 404, "Not Found", body);
+            free(body);
+            return;
+        }
+
+        char *error = NULL;
+        char *json = db_fetch_report_job_status(conn, job_id, &error);
+        if (!json) {
+            char *body = build_error_response(error ? error : "Failed to fetch report job");
+            int status = (error && strcmp(error, "Report job not found") == 0) ? 404 : 500;
+            send_http_json(client_fd, status, status == 404 ? "Not Found" : "Internal Server Error", body);
+            free(body);
+            free(error);
+            return;
+        }
+        send_http_json(client_fd, 200, "OK", json);
+        free(json);
+        free(error);
         return;
     }
 
@@ -4716,6 +5438,886 @@ static bool path_is_safe(const char *path) {
     if (strstr(path, "..")) return false;
     if (strchr(path, '\\')) return false;
     return true;
+}
+
+static void signal_report_worker(void) {
+    pthread_mutex_lock(&g_report_mutex);
+    g_report_signal = true;
+    pthread_cond_signal(&g_report_cond);
+    pthread_mutex_unlock(&g_report_mutex);
+}
+
+static void *report_worker_main(void *arg) {
+    (void)arg;
+    PGconn *conn = NULL;
+
+    for (;;) {
+        pthread_mutex_lock(&g_report_mutex);
+        bool stop_requested = g_report_stop;
+        pthread_mutex_unlock(&g_report_mutex);
+        if (stop_requested) {
+            break;
+        }
+
+        if (!g_database_dsn) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 5;
+            pthread_mutex_lock(&g_report_mutex);
+            if (!g_report_stop) {
+                pthread_cond_timedwait(&g_report_cond, &g_report_mutex, &ts);
+            }
+            g_report_signal = false;
+            pthread_mutex_unlock(&g_report_mutex);
+            continue;
+        }
+
+        if (!conn) {
+            conn = PQconnectdb(g_database_dsn);
+            if (PQstatus(conn) != CONNECTION_OK) {
+                log_error("Report worker failed to connect to database: %s", PQerrorMessage(conn));
+                PQfinish(conn);
+                conn = NULL;
+                sleep(5);
+                continue;
+            }
+        }
+
+        ReportJob job;
+        report_job_init(&job);
+        char *claim_error = NULL;
+        int claimed = db_claim_next_report_job(conn, &job, &claim_error);
+        if (claimed < 0) {
+            log_error("Failed to claim report job: %s", claim_error ? claim_error : "unknown error");
+            free(claim_error);
+            report_job_clear(&job);
+            PQfinish(conn);
+            conn = NULL;
+            sleep(2);
+            continue;
+        }
+        free(claim_error);
+
+        if (claimed == 0) {
+            report_job_clear(&job);
+            pthread_mutex_lock(&g_report_mutex);
+            if (!g_report_stop) {
+                struct timespec ts;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_sec += 5;
+                pthread_cond_timedwait(&g_report_cond, &g_report_mutex, &ts);
+            }
+            g_report_signal = false;
+            stop_requested = g_report_stop;
+            pthread_mutex_unlock(&g_report_mutex);
+            if (stop_requested) {
+                break;
+            }
+            continue;
+        }
+
+        log_info("Processing report job %s for %s", job.job_id, job.address ? job.address : "(unknown address)");
+
+        char *output_path = NULL;
+        char *process_error = NULL;
+        int success = process_report_job(conn, &job, &output_path, &process_error);
+        char *update_error = NULL;
+        if (success) {
+            if (!db_complete_report_job(conn, job.job_id, "completed", NULL, output_path, &update_error)) {
+                log_error("Failed to mark report job %s completed: %s", job.job_id, update_error ? update_error : "unknown error");
+            } else {
+                log_info("Report job %s completed", job.job_id);
+            }
+        } else {
+            const char *message = process_error ? process_error : "Report generation failed";
+            if (!db_complete_report_job(conn, job.job_id, "failed", message, NULL, &update_error)) {
+                log_error("Failed to mark report job %s failed: %s", job.job_id, update_error ? update_error : "unknown error");
+            } else {
+                log_error("Report job %s failed: %s", job.job_id, message);
+            }
+        }
+        free(update_error);
+        free(process_error);
+        free(output_path);
+        report_job_clear(&job);
+    }
+
+    if (conn) {
+        PQfinish(conn);
+    }
+    return NULL;
+}
+
+static void send_file_download(int client_fd, const char *path, const char *content_type, const char *filename) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        char *body = build_error_response("File not found");
+        send_http_json(client_fd, 404, "Not Found", body);
+        free(body);
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        char *body = build_error_response("Failed to read file");
+        send_http_json(client_fd, 500, "Internal Server Error", body);
+        free(body);
+        return;
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        close(fd);
+        char *body = build_error_response("Invalid file");
+        send_http_json(client_fd, 400, "Bad Request", body);
+        free(body);
+        return;
+    }
+
+    const char *ctype = content_type ? content_type : "application/octet-stream";
+    const char *name = filename ? filename : "download.bin";
+
+    char header[1024];
+    int header_len = snprintf(header, sizeof(header),
+                              "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: %s\r\n"
+                              "Content-Length: %lld\r\n"
+                              "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                              "Access-Control-Allow-Origin: *\r\n"
+                              "Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS\r\n"
+                              "Access-Control-Allow-Headers: Content-Type, X-API-Key\r\n"
+                              "Connection: close\r\n\r\n",
+                              ctype,
+                              (long long)st.st_size,
+                              name);
+    if (header_len < 0 || header_len >= (int)sizeof(header)) {
+        close(fd);
+        char *body = build_error_response("Failed to send headers");
+        send_http_json(client_fd, 500, "Internal Server Error", body);
+        free(body);
+        return;
+    }
+
+    if (send(client_fd, header, (size_t)header_len, 0) < 0) {
+        close(fd);
+        return;
+    }
+
+    off_t offset = 0;
+    while (offset < st.st_size) {
+        ssize_t sent = sendfile(client_fd, fd, &offset, (size_t)(st.st_size - offset));
+        if (sent <= 0) {
+            if (sent < 0 && errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+    }
+
+    close(fd);
+}
+
+static int ensure_directory_exists(const char *path) {
+    if (!path || *path == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char temp[PATH_MAX];
+    size_t len = strlen(path);
+    if (len >= sizeof(temp)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(temp, path, len + 1);
+
+    for (size_t i = 1; i < len; ++i) {
+        if (temp[i] == '/' || temp[i] == '\\') {
+            char saved = temp[i];
+            temp[i] = '\0';
+            if (temp[0] != '\0') {
+                if (mkdir(temp, 0775) != 0 && errno != EEXIST) {
+                    temp[i] = saved;
+                    return -1;
+                }
+            }
+            temp[i] = saved;
+        }
+    }
+
+    if (mkdir(temp, 0775) != 0 && errno != EEXIST) {
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(temp, &st) != 0) {
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        errno = ENOTDIR;
+        return -1;
+    }
+    return 0;
+}
+
+static char *join_path(const char *dir, const char *filename) {
+    if (!dir || !filename) {
+        return NULL;
+    }
+    size_t dir_len = strlen(dir);
+    size_t file_len = strlen(filename);
+    size_t needs_sep = (dir_len > 0 && dir[dir_len - 1] != '/' && dir[dir_len - 1] != '\\') ? 1 : 0;
+    size_t total = dir_len + needs_sep + file_len + 1;
+    if (total >= PATH_MAX) {
+        return NULL;
+    }
+    char *out = malloc(total);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, dir, dir_len);
+    size_t pos = dir_len;
+    if (needs_sep) {
+        out[pos++] = '/';
+    }
+    memcpy(out + pos, filename, file_len + 1);
+    return out;
+}
+
+static int write_buffer_to_file(const char *path, const char *data, size_t len) {
+    if (!path || !data) {
+        errno = EINVAL;
+        return -1;
+    }
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        return -1;
+    }
+    size_t written = fwrite(data, 1, len, fp);
+    if (written != len) {
+        fclose(fp);
+        errno = EIO;
+        return -1;
+    }
+    if (fclose(fp) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+#define GROK_API_URL "https://api.x.ai/v1/chat/completions"
+#define GROK_MODEL "grok-3-mini-latest"
+
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+} HttpBuffer;
+
+static void http_buffer_init(HttpBuffer *buf) {
+    buf->data = NULL;
+    buf->length = 0;
+    buf->capacity = 0;
+}
+
+static void http_buffer_free(HttpBuffer *buf) {
+    if (!buf) return;
+    free(buf->data);
+    buf->data = NULL;
+    buf->length = 0;
+    buf->capacity = 0;
+}
+
+static int http_buffer_reserve(HttpBuffer *buf, size_t additional) {
+    if (buf->length + additional + 1 <= buf->capacity) {
+        return 1;
+    }
+    size_t new_cap = buf->capacity == 0 ? (additional + 1024) : buf->capacity * 2;
+    while (buf->length + additional + 1 > new_cap) {
+        new_cap *= 2;
+    }
+    char *tmp = realloc(buf->data, new_cap);
+    if (!tmp) {
+        return 0;
+    }
+    buf->data = tmp;
+    buf->capacity = new_cap;
+    return 1;
+}
+
+static size_t curl_response_write(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t total = size * nmemb;
+    HttpBuffer *buf = (HttpBuffer *)userp;
+    if (!http_buffer_reserve(buf, total)) {
+        return 0;
+    }
+    memcpy(buf->data + buf->length, contents, total);
+    buf->length += total;
+    buf->data[buf->length] = '\0';
+    return total;
+}
+
+static int generate_grok_completion(const char *system_prompt, const char *user_prompt, char **response_out, char **error_out) {
+    if (!system_prompt || !user_prompt || !response_out) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid narrative parameters");
+        }
+        return 0;
+    }
+    if (!g_xai_api_key) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("XAI_API_KEY not configured");
+        }
+        return 0;
+    }
+
+    CURL *curl = curl_easy_init();
+    if (!curl) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to initialize HTTP client");
+        }
+        return 0;
+    }
+
+    Buffer body;
+    if (!buffer_init(&body)) {
+        curl_easy_cleanup(curl);
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory");
+        }
+        return 0;
+    }
+
+    char *system_json = json_escape_string(system_prompt);
+    char *user_json = json_escape_string(user_prompt);
+    if (!system_json || !user_json) {
+        free(system_json);
+        free(user_json);
+        buffer_free(&body);
+        curl_easy_cleanup(curl);
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory");
+        }
+        return 0;
+    }
+
+    buffer_append_cstr(&body, "{");
+    buffer_append_cstr(&body, "\"model\":\"");
+    buffer_append_cstr(&body, GROK_MODEL);
+    buffer_append_cstr(&body, "\",");
+    buffer_append_cstr(&body, "\"temperature\":0.1,");
+    buffer_append_cstr(&body, "\"max_tokens\":4000,");
+    buffer_append_cstr(&body, "\"messages\":[");
+    buffer_append_cstr(&body, "{\"role\":\"system\",\"content\":\"");
+    buffer_append_cstr(&body, system_json);
+    buffer_append_cstr(&body, "\"},");
+    buffer_append_cstr(&body, "{\"role\":\"user\",\"content\":\"");
+    buffer_append_cstr(&body, user_json);
+    buffer_append_cstr(&body, "\"}]}");
+
+    free(system_json);
+    free(user_json);
+
+    char *auth_header = NULL;
+    size_t auth_len = strlen(g_xai_api_key) + strlen("Authorization: Bearer ") + 1;
+    auth_header = malloc(auth_len);
+    if (!auth_header) {
+        buffer_free(&body);
+        curl_easy_cleanup(curl);
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory");
+        }
+        return 0;
+    }
+    snprintf(auth_header, auth_len, "Authorization: Bearer %s", g_xai_api_key);
+
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: application/json");
+    headers = curl_slist_append(headers, auth_header);
+
+    HttpBuffer response;
+    http_buffer_init(&response);
+
+    curl_easy_setopt(curl, CURLOPT_URL, GROK_API_URL);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_response_write);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = curl_easy_strerror(res);
+            size_t len = msg ? strlen(msg) : 0;
+            char *copy = malloc(len + 32);
+            if (copy) {
+                snprintf(copy, len + 32, "HTTP request failed: %s", msg ? msg : "unknown error");
+                *error_out = copy;
+            }
+        }
+        http_buffer_free(&response);
+        curl_slist_free_all(headers);
+        free(auth_header);
+        buffer_free(&body);
+        curl_easy_cleanup(curl);
+        return 0;
+    }
+
+    long status_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
+
+    curl_slist_free_all(headers);
+    free(auth_header);
+    buffer_free(&body);
+    curl_easy_cleanup(curl);
+
+    if (status_code != 200) {
+        if (error_out && !*error_out) {
+            if (response.length > 0) {
+                *error_out = strdup(response.data);
+            } else {
+                char *msg = malloc(64);
+                if (msg) {
+                    snprintf(msg, 64, "HTTP status %ld", status_code);
+                    *error_out = msg;
+                }
+            }
+        }
+        http_buffer_free(&response);
+        return 0;
+    }
+
+    char *content_copy = NULL;
+    char *parse_error = NULL;
+    JsonValue *root = json_parse(response.data ? response.data : "", &parse_error);
+    if (root) {
+        JsonValue *choices = json_object_get(root, "choices");
+        if (choices && choices->type == JSON_ARRAY && json_array_size(choices) > 0) {
+            JsonValue *first = json_array_get(choices, 0);
+            JsonValue *message = json_object_get(first, "message");
+            if (message && message->type == JSON_OBJECT) {
+                JsonValue *content = json_object_get(message, "content");
+                const char *text = json_as_string(content);
+                if (text) {
+                    content_copy = strdup(text);
+                }
+            }
+        }
+        json_free(root);
+    }
+    if (parse_error) {
+        free(parse_error);
+    }
+    http_buffer_free(&response);
+
+    if (!content_copy) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to parse Grok response");
+        }
+        return 0;
+    }
+
+    *response_out = content_copy;
+    return 1;
+}
+
+static int run_pdflatex(const char *working_dir, const char *tex_filename, char **error_out) {
+    if (!working_dir || !tex_filename) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid LaTeX arguments");
+        }
+        return 0;
+    }
+    for (int pass = 0; pass < 3; ++pass) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            if (chdir(working_dir) != 0) {
+                _exit(1);
+            }
+            execlp("pdflatex", "pdflatex", "-interaction=nonstopmode", tex_filename, (char *)NULL);
+            _exit(1);
+        } else if (pid < 0) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Failed to spawn pdflatex");
+            }
+            return 0;
+        }
+
+        int status = 0;
+        if (waitpid(pid, &status, 0) < 0) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("pdflatex wait failed");
+            }
+            return 0;
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            if (error_out && !*error_out) {
+                char *msg = malloc(64);
+                if (msg) {
+                    snprintf(msg, 64, "pdflatex failed on pass %d", pass + 1);
+                    *error_out = msg;
+                }
+            }
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static char *latex_escape(const char *text) {
+    if (!text) {
+        return strdup("");
+    }
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        return NULL;
+    }
+    for (const unsigned char *ptr = (const unsigned char *)text; *ptr; ++ptr) {
+        unsigned char c = *ptr;
+        switch (c) {
+            case '\\':
+                buffer_append_cstr(&buf, "\\textbackslash{}");
+                break;
+            case '{':
+                buffer_append_cstr(&buf, "\\{");
+                break;
+            case '}':
+                buffer_append_cstr(&buf, "\\}");
+                break;
+            case '#':
+                buffer_append_cstr(&buf, "\\#");
+                break;
+            case '$':
+                buffer_append_cstr(&buf, "\\$");
+                break;
+            case '%':
+                buffer_append_cstr(&buf, "\\%");
+                break;
+            case '&':
+                buffer_append_cstr(&buf, "\\&");
+                break;
+            case '_':
+                buffer_append_cstr(&buf, "\\_");
+                break;
+            case '^':
+                buffer_append_cstr(&buf, "\\textasciicircum{}");
+                break;
+            case '~':
+                buffer_append_cstr(&buf, "\\textasciitilde{}");
+                break;
+            case '\n':
+                buffer_append_cstr(&buf, "\\\\\n");
+                break;
+            default:
+                if (c < 0x20) {
+                    // Skip control characters
+                } else {
+                    buffer_append_char(&buf, (char)c);
+                }
+                break;
+        }
+    }
+    char *escaped = buf.data;
+    buf.data = NULL;
+    buffer_free(&buf);
+    if (!escaped) {
+        escaped = strdup("");
+    }
+    return escaped;
+}
+
+static int append_narrative_section(Buffer *buf, const char *title, const char *content) {
+    if (!buf || !title) {
+        return 0;
+    }
+    char *title_tex = latex_escape(title);
+    char *body_tex = latex_escape(content && content[0] ? content : "Narrative unavailable.");
+    if (!title_tex || !body_tex) {
+        free(title_tex);
+        free(body_tex);
+        return 0;
+    }
+    if (!buffer_appendf(buf, "\\section*{%s}\n%s\n\n", title_tex, body_tex)) {
+        free(title_tex);
+        free(body_tex);
+        return 0;
+    }
+    free(title_tex);
+    free(body_tex);
+    return 1;
+}
+
+static int build_report_latex(const ReportData *report,
+                              const NarrativeSet *narratives,
+                              const ReportJob *job,
+                              const char *output_path,
+                              char **error_out) {
+    if (!report || !narratives || !job || !output_path) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid report parameters");
+        }
+        return 0;
+    }
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory");
+        }
+        return 0;
+    }
+
+    int success = 0;
+
+    const char *address_src = report->summary.building_address ? report->summary.building_address : job->address;
+    char *address_tex = latex_escape(address_src ? address_src : "Unknown address");
+    char *owner_tex = latex_escape(report->summary.building_owner ? report->summary.building_owner : "Unknown owner");
+    char *contractor_tex = latex_escape(report->summary.elevator_contractor ? report->summary.elevator_contractor : "Unknown contractor");
+    char *city_tex = latex_escape(report->summary.city_id ? report->summary.city_id : "—");
+
+    char date_range_buf[256];
+    if (report->summary.audit_range.start && report->summary.audit_range.end) {
+        snprintf(date_range_buf, sizeof(date_range_buf), "%s to %s",
+                 report->summary.audit_range.start,
+                 report->summary.audit_range.end);
+    } else if (report->summary.audit_range.start) {
+        snprintf(date_range_buf, sizeof(date_range_buf), "Since %s", report->summary.audit_range.start);
+    } else if (report->summary.audit_range.end) {
+        snprintf(date_range_buf, sizeof(date_range_buf), "Through %s", report->summary.audit_range.end);
+    } else {
+        snprintf(date_range_buf, sizeof(date_range_buf), "—");
+    }
+    char *date_range_tex = latex_escape(date_range_buf);
+
+    if (!address_tex || !owner_tex || !contractor_tex || !city_tex || !date_range_tex) {
+        free(address_tex);
+        free(owner_tex);
+        free(contractor_tex);
+        free(city_tex);
+        free(date_range_tex);
+        buffer_free(&buf);
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory");
+        }
+        return 0;
+    }
+
+    if (!buffer_append_cstr(&buf,
+        "\\documentclass[12pt]{article}\n"
+        "\\usepackage[utf8]{inputenc}\n"
+        "\\usepackage[T1]{fontenc}\n"
+        "\\usepackage{geometry}\n"
+        "\\usepackage{fancyhdr}\n"
+        "\\usepackage{graphicx}\n"
+        "\\usepackage{longtable}\n"
+        "\\usepackage{array}\n"
+        "\\usepackage{booktabs}\n"
+        "\\usepackage{tabularx}\n"
+        "\\usepackage{xcolor}\n"
+        "\\usepackage{float}\n"
+        "\\geometry{letterpaper, margin=1in}\n"
+        "\\setlength{\\parskip}{0.6em}\n"
+        "\\setlength{\\parindent}{0pt}\n"
+        "\\begin{document}\n\n")) {
+        goto cleanup;
+    }
+
+    if (!buffer_appendf(&buf,
+        "\\begin{center}\n{\\Large\\textbf{Audit Report}}\\[0.6em]\n%s\\\\\\[0.4em]\n{\\normalsize %s}\\[1em]\n\\end{center}\n\\hrule\\n\\vspace{1em}\n",
+        address_tex,
+        date_range_tex)) {
+        goto cleanup;
+    }
+
+    if (!buffer_append_cstr(&buf, "\\section*{Property Summary}\n")) {
+        goto cleanup;
+    }
+    if (!buffer_append_cstr(&buf, "\\begin{tabular}{ll}\n")) {
+        goto cleanup;
+    }
+
+    char buffer_num[64];
+    if (!buffer_appendf(&buf, "Address & %s \\\\ \n", address_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "Owner & %s \\\\ \n", owner_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "Elevator Contractor & %s \\\\ \n", contractor_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "City ID & %s \\\\ \n", city_tex)) goto cleanup;
+    snprintf(buffer_num, sizeof(buffer_num), "%d", report->summary.total_devices);
+    if (!buffer_appendf(&buf, "Total Devices & %s \\\\ \n", buffer_num)) goto cleanup;
+    snprintf(buffer_num, sizeof(buffer_num), "%d", report->summary.audit_count);
+    if (!buffer_appendf(&buf, "Audit Count & %s \\\\ \n", buffer_num)) goto cleanup;
+    snprintf(buffer_num, sizeof(buffer_num), "%d", report->summary.total_deficiencies);
+    if (!buffer_appendf(&buf, "Total Deficiencies & %s \\\\ \n", buffer_num)) goto cleanup;
+    snprintf(buffer_num, sizeof(buffer_num), "%0.2f", report->summary.average_deficiencies_per_device);
+    if (!buffer_appendf(&buf, "Average Deficiencies / Device & %s \\\\ \n", buffer_num)) goto cleanup;
+    if (!buffer_appendf(&buf, "Audit Date Range & %s \\\\ \n", date_range_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\end{tabular}\n\n")) goto cleanup;
+
+    if (!append_narrative_section(&buf, "Executive Summary", narratives->executive_summary)) goto cleanup;
+    if (!append_narrative_section(&buf, "Key Findings", narratives->key_findings)) goto cleanup;
+    if (!append_narrative_section(&buf, "Methodology", narratives->methodology)) goto cleanup;
+    if (!append_narrative_section(&buf, "Maintenance Performance", narratives->maintenance_performance)) goto cleanup;
+    if (!append_narrative_section(&buf, "Recommendations", narratives->recommendations)) goto cleanup;
+    if (!append_narrative_section(&buf, "Conclusion", narratives->conclusion)) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\section*{Device Overview}\n")) goto cleanup;
+
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        ReportDevice *device = &report->devices.items[i];
+        const char *device_id_raw = device->device_id ? device->device_id : (device->submission_id ? device->submission_id : device->audit_uuid);
+        char *device_id_tex = latex_escape(device_id_raw ? device_id_raw : "Unknown Device");
+        char *device_type_tex = latex_escape(device->device_type ? device->device_type : "Device");
+        char *bank_tex = latex_escape(device->bank_name ? device->bank_name : "—");
+        char *city_device_tex = latex_escape(device->city_id ? device->city_id : "—");
+        char *controller_manufacturer_tex = latex_escape(device->controller_manufacturer ? device->controller_manufacturer : "—");
+        char *controller_model_tex = latex_escape(device->controller_model ? device->controller_model : "—");
+        char *machine_type_tex = latex_escape(device->machine_type ? device->machine_type : "—");
+        char *general_notes_tex = latex_escape(device->general_notes ? device->general_notes : "No general notes.");
+        char *floors_join = string_array_join(&device->floors_served, ", ");
+        char *floors_tex = latex_escape(floors_join ? floors_join : "—");
+        free(floors_join);
+
+        char int_buffer[64];
+        const char *capacity_text = optional_int_to_text(&device->metrics.capacity, int_buffer, sizeof(int_buffer));
+        char *capacity_tex = latex_escape(capacity_text);
+        const char *speed_text = optional_int_to_text(&device->metrics.car_speed, int_buffer, sizeof(int_buffer));
+        char *speed_tex = latex_escape(speed_text);
+        const char *install_year_text = optional_int_to_text(&device->metrics.controller_install_year, int_buffer, sizeof(int_buffer));
+        char *install_year_tex = latex_escape(install_year_text);
+        const char *stops_text = optional_int_to_text(&device->metrics.number_of_stops, int_buffer, sizeof(int_buffer));
+        char *stops_tex = latex_escape(stops_text);
+        const char *openings_text = optional_int_to_text(&device->metrics.number_of_openings, int_buffer, sizeof(int_buffer));
+        char *openings_tex = latex_escape(openings_text);
+        const char *code_year_text = optional_int_to_text(&device->metrics.code_data_year, int_buffer, sizeof(int_buffer));
+        char *code_year_tex = latex_escape(code_year_text);
+        const char *dlm_text = optional_bool_to_text(&device->metrics.dlm_compliant);
+        char *dlm_tex = latex_escape(dlm_text);
+        const char *cat1_text = optional_bool_to_text(&device->metrics.cat1_tag_current);
+        char *cat1_tex = latex_escape(cat1_text);
+        const char *cat5_text = optional_bool_to_text(&device->metrics.cat5_tag_current);
+        char *cat5_tex = latex_escape(cat5_text);
+        const char *maint_text = optional_bool_to_text(&device->metrics.maintenance_log_up_to_date);
+        char *maint_tex = latex_escape(maint_text);
+
+        if (!device_id_tex || !device_type_tex || !bank_tex || !city_device_tex || !controller_manufacturer_tex || !controller_model_tex ||
+            !machine_type_tex || !general_notes_tex || !floors_tex || !capacity_tex || !speed_tex || !install_year_tex || !stops_tex ||
+            !openings_tex || !code_year_tex || !dlm_tex || !cat1_tex || !cat5_tex || !maint_tex) {
+            free(device_id_tex); free(device_type_tex); free(bank_tex); free(city_device_tex);
+            free(controller_manufacturer_tex); free(controller_model_tex); free(machine_type_tex);
+            free(general_notes_tex); free(floors_tex); free(capacity_tex); free(speed_tex);
+            free(install_year_tex); free(stops_tex); free(openings_tex); free(code_year_tex);
+            free(dlm_tex); free(cat1_tex); free(cat5_tex); free(maint_tex);
+            goto cleanup;
+        }
+
+        if (!buffer_appendf(&buf, "\\subsection*{%s (Type: %s)}\n", device_id_tex, device_type_tex)) {
+            free(device_id_tex); free(device_type_tex); free(bank_tex); free(city_device_tex);
+            free(controller_manufacturer_tex); free(controller_model_tex); free(machine_type_tex);
+            free(general_notes_tex); free(floors_tex); free(capacity_tex); free(speed_tex);
+            free(install_year_tex); free(stops_tex); free(openings_tex); free(code_year_tex);
+            free(dlm_tex); free(cat1_tex); free(cat5_tex); free(maint_tex);
+            goto cleanup;
+        }
+
+        if (!buffer_append_cstr(&buf, "\\begin{tabular}{ll}\n")) {
+            free(device_id_tex); free(device_type_tex); free(bank_tex); free(city_device_tex);
+            free(controller_manufacturer_tex); free(controller_model_tex); free(machine_type_tex);
+            free(general_notes_tex); free(floors_tex); free(capacity_tex); free(speed_tex);
+            free(install_year_tex); free(stops_tex); free(openings_tex); free(code_year_tex);
+            free(dlm_tex); free(cat1_tex); free(cat5_tex); free(maint_tex);
+            goto cleanup;
+        }
+        if (!buffer_appendf(&buf, "Bank & %s \\\\ \n", bank_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "City ID & %s \\\\ \n", city_device_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Controller Manufacturer & %s \\\\ \n", controller_manufacturer_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Controller Model & %s \\\\ \n", controller_model_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Controller Install Year & %s \\\\ \n", install_year_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Machine Type & %s \\\\ \n", machine_type_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Capacity (lbs) & %s \\\\ \n", capacity_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Car Speed (fpm) & %s \\\\ \n", speed_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Number of Stops & %s \\\\ \n", stops_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Number of Openings & %s \\\\ \n", openings_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Code Data Year & %s \\\\ \n", code_year_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Floors Served & %s \\\\ \n", floors_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "DLM Compliant & %s \\\\ \n", dlm_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Cat 1 Tag Current & %s \\\\ \n", cat1_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Cat 5 Tag Current & %s \\\\ \n", cat5_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "Maintenance Log Up to Date & %s \\\\ \n", maint_tex)) goto device_cleanup;
+        if (!buffer_append_cstr(&buf, "\\end{tabular}\n\n")) goto device_cleanup;
+
+        if (!buffer_appendf(&buf, "\\textbf{General Notes:}~%s\\[0.5em]\n", general_notes_tex)) goto device_cleanup;
+
+        size_t deficiency_count = device->deficiencies.count;
+        if (deficiency_count == 0) {
+            if (!buffer_append_cstr(&buf, "No deficiencies documented.\\\\\n\n")) goto device_cleanup;
+        } else {
+            if (!buffer_append_cstr(&buf,
+                "\\begin{tabularx}{\\textwidth}{p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} p{.1\\textwidth} X}\\toprule\n"
+                "\\textbf{Equipment} & \\textbf{Condition} & \\textbf{Remedy} & \\textbf{Status} & \\textbf{Note}\\\\\\\\midrule\n")) goto device_cleanup;
+
+            for (size_t j = 0; j < deficiency_count; ++j) {
+                ReportDeficiency *def = &device->deficiencies.items[j];
+                char *equipment_tex = latex_escape(def->equipment ? def->equipment : "—");
+                char *condition_tex = latex_escape(def->condition ? def->condition : "—");
+                char *remedy_tex = latex_escape(def->remedy ? def->remedy : "—");
+                char *note_tex = latex_escape(def->note ? def->note : "—");
+                const char *status_text = (def->resolved.has_value && def->resolved.value) ? "Closed" : "Open";
+                char *status_tex = latex_escape(status_text);
+                if (!equipment_tex || !condition_tex || !remedy_tex || !note_tex || !status_tex) {
+                    free(equipment_tex); free(condition_tex); free(remedy_tex); free(note_tex); free(status_tex);
+                    goto device_cleanup;
+                }
+                if (!buffer_appendf(&buf, "%s & %s & %s & %s & %s \\\\ \n",
+                                    equipment_tex, condition_tex, remedy_tex, status_tex, note_tex)) {
+                    free(equipment_tex); free(condition_tex); free(remedy_tex); free(note_tex); free(status_tex);
+                    goto device_cleanup;
+                }
+                free(equipment_tex); free(condition_tex); free(remedy_tex); free(note_tex); free(status_tex);
+            }
+            if (!buffer_append_cstr(&buf, "\\bottomrule\\n\\end{tabularx}\\n\\n")) goto device_cleanup;
+        }
+
+device_cleanup:
+        free(device_id_tex); free(device_type_tex); free(bank_tex); free(city_device_tex);
+        free(controller_manufacturer_tex); free(controller_model_tex); free(machine_type_tex);
+        free(general_notes_tex); free(floors_tex); free(capacity_tex); free(speed_tex);
+        free(install_year_tex); free(stops_tex); free(openings_tex); free(code_year_tex);
+        free(dlm_tex); free(cat1_tex); free(cat5_tex); free(maint_tex);
+        if (buf.length == 0) {
+            goto cleanup;
+        }
+    }
+
+    if (!buffer_append_cstr(&buf, "\\end{document}\n")) {
+        goto cleanup;
+    }
+
+    if (write_buffer_to_file(output_path, buf.data, buf.length) != 0) {
+        if (error_out && !*error_out) {
+            char *msg = malloc(128);
+            if (msg) {
+                snprintf(msg, 128, "Failed to write %s: %s", output_path, strerror(errno));
+                *error_out = msg;
+            }
+        }
+        goto cleanup;
+    }
+
+    success = 1;
+
+cleanup:
+    free(address_tex);
+    free(owner_tex);
+    free(contractor_tex);
+    free(city_tex);
+    free(date_range_tex);
+    buffer_free(&buf);
+    if (!success && error_out && !*error_out) {
+        *error_out = strdup("Failed to build LaTeX report");
+    }
+    return success;
 }
 
 static void serve_static_file(int client_fd, const char *path) {
@@ -4997,17 +6599,25 @@ static void handle_client(int client_fd, PGconn *conn) {
 
                 bool resolved = false;
                 bool resolved_set = extract_resolved_flag(body_json, &resolved);
+                char *precheck_error = NULL;
                 if (!resolved_set) {
-                    free(body_json);
-                    char *body = build_error_response("Missing resolved flag");
-                    send_http_json(client_fd, 400, "Bad Request", body);
-                    free(body);
-                    return;
+                    bool current_resolved = false;
+                    if (!db_fetch_deficiency_status(conn, target_uuid, deficiency_id, &current_resolved, &precheck_error)) {
+                        free(body_json);
+                        char *body = build_error_response(precheck_error ? precheck_error : "Missing resolved flag");
+                        int status = precheck_error && strcmp(precheck_error, "Deficiency not found") == 0 ? 404 : 400;
+                        send_http_json(client_fd, status, status == 404 ? "Not Found" : "Bad Request", body);
+                        free(body);
+                        free(precheck_error);
+                        return;
+                    }
+                    resolved = !current_resolved;
                 }
 
                 char *resolved_at = NULL;
                 char *update_error = NULL;
                 bool success = db_update_deficiency_status(conn, target_uuid, deficiency_id, resolved, &resolved_at, &update_error);
+                free(precheck_error);
                 free(body_json);
                 if (!success) {
                     int status = 500;
@@ -5031,6 +6641,153 @@ static void handle_client(int client_fd, PGconn *conn) {
                 }
                 free(resolved_at);
                 send_http_json(client_fd, 200, "OK", response);
+                return;
+            }
+
+            if (strcmp(method, "POST") == 0 && is_api_path && api_path && strcmp(api_path, "/reports") == 0) {
+                long content_length = -1;
+                char *line = header_lines;
+                while (line && *line) {
+                    char *next = strstr(line, "\r\n");
+                    if (!next) break;
+                    if (next == line) break;
+                    size_t len = (size_t)(next - line);
+                    if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
+                        const char *value = line + 15;
+                        while (*value == ' ' || *value == '\t') value++;
+                        content_length = strtol(value, NULL, 10);
+                    }
+                    line = next + 2;
+                }
+
+                if (content_length < 0 || content_length > 262144) {
+                    char *body = build_error_response("Invalid request body length");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    return;
+                }
+
+                char *body_json = malloc((size_t)content_length + 1);
+                if (!body_json) {
+                    char *body = build_error_response("Out of memory");
+                    send_http_json(client_fd, 500, "Internal Server Error", body);
+                    free(body);
+                    return;
+                }
+                size_t offset = 0;
+                if (leftover > 0) {
+                    size_t copy_len = leftover > (size_t)content_length ? (size_t)content_length : leftover;
+                    memcpy(body_json, end_ptr + 4, copy_len);
+                    offset += copy_len;
+                }
+                while ((long)offset < content_length) {
+                    ssize_t read_bytes = recv(client_fd, body_json + offset, (size_t)content_length - offset, 0);
+                    if (read_bytes <= 0) {
+                        free(body_json);
+                        char *body = build_error_response("Unexpected end of stream");
+                        send_http_json(client_fd, 400, "Bad Request", body);
+                        free(body);
+                        return;
+                    }
+                    offset += (size_t)read_bytes;
+                }
+                body_json[content_length] = '\0';
+
+                char *parse_error = NULL;
+                JsonValue *root = json_parse(body_json, &parse_error);
+                if (!root || root->type != JSON_OBJECT) {
+                    free(body_json);
+                    char *body = build_error_response("Invalid JSON payload");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    if (root) json_free(root);
+                    free(parse_error);
+                    return;
+                }
+
+                JsonValue *addr_val = json_object_get(root, "address");
+                const char *addr_raw = json_as_string(addr_val);
+                char *address_value = addr_raw ? trim_copy(addr_raw) : NULL;
+                if (!address_value || address_value[0] == '\0') {
+                    json_free(root);
+                    free(parse_error);
+                    free(body_json);
+                    free(address_value);
+                    char *body = build_error_response("address field is required");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    return;
+                }
+
+                JsonValue *notes_val = json_object_get(root, "notes");
+                const char *notes_raw = json_as_string(notes_val);
+                char *notes_value = NULL;
+                if (notes_raw) {
+                    notes_value = trim_copy(notes_raw);
+                    if (notes_value && notes_value[0] == '\0') {
+                        free(notes_value);
+                        notes_value = NULL;
+                    }
+                }
+
+                JsonValue *recs_val = json_object_get(root, "recommendations");
+                const char *recs_raw = json_as_string(recs_val);
+                char *recs_value = NULL;
+                if (recs_raw) {
+                    recs_value = trim_copy(recs_raw);
+                    if (recs_value && recs_value[0] == '\0') {
+                        free(recs_value);
+                        recs_value = NULL;
+                    }
+                }
+
+                json_free(root);
+                free(parse_error);
+                free(body_json);
+
+                char job_id[37];
+                if (!generate_uuid_v4(job_id)) {
+                    free(address_value);
+                    free(notes_value);
+                    free(recs_value);
+                    char *body = build_error_response("Failed to create job id");
+                    send_http_json(client_fd, 500, "Internal Server Error", body);
+                    free(body);
+                    return;
+                }
+
+                char *insert_error = NULL;
+                if (!db_insert_report_job(conn, job_id, address_value, notes_value, recs_value, &insert_error)) {
+                    char *body = build_error_response(insert_error ? insert_error : "Failed to create report job");
+                    send_http_json(client_fd, 500, "Internal Server Error", body);
+                    free(body);
+                    free(insert_error);
+                    free(address_value);
+                    free(notes_value);
+                    free(recs_value);
+                    return;
+                }
+                free(insert_error);
+                free(notes_value);
+                free(recs_value);
+
+                char *address_json = json_escape_string(address_value);
+                free(address_value);
+                if (!address_json) {
+                    char *body = build_error_response("Failed to encode address");
+                    send_http_json(client_fd, 500, "Internal Server Error", body);
+                    free(body);
+                    return;
+                }
+                char response[256];
+                snprintf(response, sizeof(response),
+                         "{\"status\":\"queued\",\"job_id\":\"%s\",\"address\":\"%s\"}",
+                         job_id,
+                         address_json);
+                free(address_json);
+
+                signal_report_worker();
+                send_http_json(client_fd, 202, "Accepted", response);
                 return;
             }
 
@@ -5224,12 +6981,15 @@ int main(int argc, char **argv) {
 
     signal(SIGPIPE, SIG_IGN);
 
+    int exit_code = 1;
+    PGconn *conn = NULL;
+
     const char *env_file = getenv("ENV_FILE");
     if (!env_file || env_file[0] == '\0') {
         env_file = ".env";
     }
     if (!load_env_file(env_file)) {
-        return 1;
+        goto cleanup;
     }
 
     const char *dsn = getenv("DATABASE_URL");
@@ -5238,14 +6998,20 @@ int main(int argc, char **argv) {
     }
     if (!dsn || dsn[0] == '\0') {
         log_error("DATABASE_URL or POSTGRES_DSN must be set");
-        return 1;
+        goto cleanup;
+    }
+
+    g_database_dsn = strdup(dsn);
+    if (!g_database_dsn) {
+        log_error("Failed to allocate database DSN");
+        goto cleanup;
     }
 
     char *api_key_trimmed = trim_copy(getenv("API_KEY"));
     if (!api_key_trimmed || api_key_trimmed[0] == '\0') {
         log_error("API_KEY must be set");
         free(api_key_trimmed);
-        return 1;
+        goto cleanup;
     }
     g_api_key = api_key_trimmed;
 
@@ -5256,7 +7022,7 @@ int main(int argc, char **argv) {
     }
     if (!api_prefix_trimmed) {
         log_error("Failed to allocate API prefix");
-        return 1;
+        goto cleanup;
     }
     if (api_prefix_trimmed[0] != '/') {
         size_t len = strlen(api_prefix_trimmed);
@@ -5264,7 +7030,7 @@ int main(int argc, char **argv) {
         if (!prefixed) {
             log_error("Failed to allocate API prefix");
             free(api_prefix_trimmed);
-            return 1;
+            goto cleanup;
         }
         prefixed[0] = '/';
         memcpy(prefixed + 1, api_prefix_trimmed, len + 1);
@@ -5280,7 +7046,7 @@ int main(int argc, char **argv) {
         free(api_prefix_trimmed);
         if (!g_api_prefix) {
             log_error("Failed to allocate API prefix");
-            return 1;
+            goto cleanup;
         }
         g_api_prefix_len = 0;
     } else {
@@ -5295,17 +7061,52 @@ int main(int argc, char **argv) {
     }
     if (!static_dir_trimmed) {
         log_error("Failed to allocate static directory");
-        return 1;
+        goto cleanup;
     }
     g_static_dir = static_dir_trimmed;
 
-    PGconn *conn = PQconnectdb(dsn);
+    char *report_dir_trimmed = trim_copy(getenv("REPORT_OUTPUT_DIR"));
+    if (!report_dir_trimmed || report_dir_trimmed[0] == '\0') {
+        free(report_dir_trimmed);
+        report_dir_trimmed = strdup("./reports");
+    }
+    if (!report_dir_trimmed) {
+        log_error("Failed to allocate report output directory");
+        goto cleanup;
+    }
+    if (ensure_directory_exists(report_dir_trimmed) != 0) {
+        log_error("Failed to initialize report output directory %s", report_dir_trimmed);
+        free(report_dir_trimmed);
+        goto cleanup;
+    }
+    g_report_output_dir = report_dir_trimmed;
+
+    char *xai_key_trimmed = trim_copy(getenv("XAI_API_KEY"));
+    if (!xai_key_trimmed || xai_key_trimmed[0] == '\0') {
+        log_error("XAI_API_KEY must be set");
+        free(xai_key_trimmed);
+        goto cleanup;
+    }
+    g_xai_api_key = xai_key_trimmed;
+
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+        log_error("Failed to initialize HTTP client");
+        goto cleanup;
+    }
+    g_curl_initialized = true;
+
+    conn = PQconnectdb(dsn);
     if (PQstatus(conn) != CONNECTION_OK) {
         log_error("Failed to connect to database: %s", PQerrorMessage(conn));
-        PQfinish(conn);
-        return 1;
+        goto cleanup;
     }
     log_info("Connected to Postgres");
+
+    if (pthread_create(&g_report_thread, NULL, report_worker_main, NULL) != 0) {
+        log_error("Failed to start report worker thread");
+        goto cleanup;
+    }
+    g_report_thread_started = true;
 
     int port = DEFAULT_PORT;
     const char *port_env = getenv("WEBHOOK_PORT");
@@ -5316,10 +7117,36 @@ int main(int argc, char **argv) {
         }
     }
 
-    int ok = run_server(conn, port);
-    PQfinish(conn);
+    exit_code = run_server(conn, port) ? 0 : 1;
+
+cleanup:
+    if (conn) {
+        PQfinish(conn);
+        conn = NULL;
+    }
+    pthread_mutex_lock(&g_report_mutex);
+    g_report_stop = true;
+    pthread_cond_broadcast(&g_report_cond);
+    pthread_mutex_unlock(&g_report_mutex);
+    if (g_report_thread_started) {
+        pthread_join(g_report_thread, NULL);
+        g_report_thread_started = false;
+    }
     free(g_api_key);
+    g_api_key = NULL;
     free(g_api_prefix);
+    g_api_prefix = NULL;
     free(g_static_dir);
-    return ok ? 0 : 1;
+    g_static_dir = NULL;
+    free(g_report_output_dir);
+    g_report_output_dir = NULL;
+    free(g_xai_api_key);
+    g_xai_api_key = NULL;
+    if (g_curl_initialized) {
+        curl_global_cleanup();
+        g_curl_initialized = false;
+    }
+    free(g_database_dsn);
+    g_database_dsn = NULL;
+    return exit_code;
 }

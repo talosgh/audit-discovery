@@ -181,3 +181,20 @@ export interface LocationDetail {
   };
   devices: LocationDevice[];
 }
+
+export interface ReportJobCreateResponse {
+  status: string;
+  job_id: string;
+  address: string | null;
+}
+
+export interface ReportJobStatus {
+  job_id: string;
+  status: string;
+  address: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  error: string | null;
+  download_ready: boolean;
+}

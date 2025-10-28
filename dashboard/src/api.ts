@@ -2,7 +2,9 @@ import type {
   AuditDetailResponse,
   AuditSummary,
   LocationDetail,
-  LocationSummary
+  LocationSummary,
+  ReportJobCreateResponse,
+  ReportJobStatus
 } from './types';
 
 const rawBase = import.meta.env.VITE_API_BASE_URL?.trim() ?? '';
@@ -59,6 +61,44 @@ export function fetchLocationDetail(address: string): Promise<LocationDetail> {
   return fetchJSON<LocationDetail>(`/locations?${query}`);
 }
 
+export async function createReportJob(address: string, notes?: string, recommendations?: string): Promise<ReportJobCreateResponse> {
+  const payload: Record<string, unknown> = { address };
+  if (notes && notes.trim().length > 0) {
+    payload.notes = notes.trim();
+  }
+  if (recommendations && recommendations.trim().length > 0) {
+    payload.recommendations = recommendations.trim();
+  }
+
+  const response = await fetch(buildUrl('/reports'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    let message = response.statusText;
+    try {
+      const data = await response.json();
+      if (typeof data?.message === 'string' && data.message.trim().length > 0) {
+        message = data.message;
+      }
+    } catch (err) {
+      /* ignore */
+    }
+    throw new Error(message || `Request failed with status ${response.status}`);
+  }
+
+  return (await response.json()) as ReportJobCreateResponse;
+}
+
+export function fetchReportJob(jobId: string): Promise<ReportJobStatus> {
+  return fetchJSON<ReportJobStatus>(`/reports/${jobId}`);
+}
+
 interface DeficiencyUpdateResponse {
   status: 'ok';
   resolved: boolean;
@@ -91,11 +131,11 @@ export async function updateDeficiencyStatus(auditId: string, deficiencyId: numb
   return (await response.json()) as DeficiencyUpdateResponse;
 }
 
-export async function downloadReport(address: string): Promise<Blob> {
-  const url = buildUrl(`/reports?address=${encodeURIComponent(address)}`);
+export async function downloadReport(jobId: string): Promise<Blob> {
+  const url = buildUrl(`/reports/${encodeURIComponent(jobId)}/download`);
   const response = await fetch(url, {
     headers: {
-      Accept: 'application/json'
+      Accept: 'application/pdf'
     }
   });
 
@@ -112,6 +152,5 @@ export async function downloadReport(address: string): Promise<Blob> {
     throw new Error(message || `Request failed with status ${response.status}`);
   }
 
-  const text = await response.text();
-  return new Blob([text], { type: 'application/json' });
+  return await response.blob();
 }
