@@ -388,6 +388,35 @@ tbody tr:hover {
   color: #38bdf8;
 }
 
+.photo-modal-nav {
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: #e2e8f0;
+  font-size: 2.5rem;
+  width: 3.25rem;
+  height: 3.25rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  margin: 0 1rem;
+  transition: background 0.2s ease, transform 0.15s ease;
+}
+
+.photo-modal-nav:hover {
+  background: rgba(56, 189, 248, 0.3);
+  transform: translateY(-1px);
+}
+
+.photo-modal-nav.prev {
+  order: 0;
+}
+
+.photo-modal-nav.next {
+  order: 2;
+}
+
 @media (max-width: 720px) {
   .app-header {
     flex-direction: column;

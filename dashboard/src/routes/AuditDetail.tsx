@@ -1,5 +1,5 @@
 import type { Component } from 'solid-js';
-import { For, Match, Show, Switch, createMemo, createResource, createSignal } from 'solid-js';
+import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
 import { fetchAuditDetail } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
@@ -49,7 +49,43 @@ const AuditDetail: Component<AuditDetailProps> = (props) => {
   const audit = createMemo(() => auditDetail()?.audit);
   const deficiencies = createMemo<Deficiency[]>(() => auditDetail()?.deficiencies ?? []);
   const photos = createMemo<PhotoAsset[]>(() => auditDetail()?.photos ?? []);
-  const [previewPhoto, setPreviewPhoto] = createSignal<PhotoAsset | null>(null);
+  const [previewIndex, setPreviewIndex] = createSignal<number | null>(null);
+
+  const closePreview = () => setPreviewIndex(null);
+  const openPreview = (index: number) => setPreviewIndex(index);
+  const navigatePreview = (direction: number) => {
+    const list = photos();
+    if (list.length === 0) return;
+    setPreviewIndex((prev) => {
+      const current = prev ?? (direction > 0 ? 0 : list.length - 1);
+      const next = (current + direction + list.length) % list.length;
+      return next;
+    });
+  };
+
+  createEffect(() => {
+    if (previewIndex() === null) return;
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        closePreview();
+      } else if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        navigatePreview(-1);
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        navigatePreview(1);
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    onCleanup(() => window.removeEventListener('keydown', handleKey));
+  });
+
+  const previewPhoto = createMemo<PhotoAsset | null>(() => {
+    const index = previewIndex();
+    if (index === null) return null;
+    const list = photos();
+    return list[index] ?? null;
+  });
 
   const sections = createMemo<DetailSection[]>(() => {
     const record = audit();
@@ -99,6 +135,7 @@ const AuditDetail: Component<AuditDetailProps> = (props) => {
             )
           },
           { label: 'Controller type', value: normalizeValue(record.controller_type) },
+          { label: 'Controller install year', value: formatNumber(numberOrNull(record.controller_install_year)) },
           { label: 'Controller power', value: normalizeValue(record.controller_power_system) },
           { label: 'Machine manufacturer', value: normalizeValue(record.machine_manufacturer) },
           { label: 'Machine type', value: normalizeValue(record.machine_type) },
@@ -276,12 +313,12 @@ const AuditDetail: Component<AuditDetailProps> = (props) => {
             <Show when={photos().length > 0} fallback={<div class="empty-state">No photos attached.</div>}>
               <div class="photos-grid">
                 <For each={photos()}>
-                  {(photo) => (
+                  {(photo, index) => (
                     <figure class="photo-card">
                       <button
                         type="button"
                         class="photo-button"
-                        onClick={() => setPreviewPhoto(photo)}
+                        onClick={() => openPreview(index())}
                         aria-label={`Preview ${photo.photo_filename}`}
                       >
                         <img src={dataUrl(photo.content_type, photo.photo_bytes)} alt={photo.photo_filename} loading="lazy" />
@@ -301,14 +338,20 @@ const AuditDetail: Component<AuditDetailProps> = (props) => {
 
       <Show when={previewPhoto()}>
         {(photo) => (
-          <div class="photo-modal" role="dialog" aria-modal="true" onClick={() => setPreviewPhoto(null)}>
+          <div class="photo-modal" role="dialog" aria-modal="true" onClick={closePreview}>
+            <button type="button" class="photo-modal-nav prev" aria-label="Previous photo" onClick={(event) => { event.stopPropagation(); navigatePreview(-1); }}>
+              ‹
+            </button>
             <div class="photo-modal-content" onClick={(event) => event.stopPropagation()}>
-              <button type="button" class="photo-modal-close" aria-label="Close" onClick={() => setPreviewPhoto(null)}>
+              <button type="button" class="photo-modal-close" aria-label="Close" onClick={closePreview}>
                 ×
               </button>
               <img src={dataUrl(photo().content_type, photo().photo_bytes)} alt={photo().photo_filename} />
               <p>{photo().photo_filename}</p>
             </div>
+            <button type="button" class="photo-modal-nav next" aria-label="Next photo" onClick={(event) => { event.stopPropagation(); navigatePreview(1); }}>
+              ›
+            </button>
           </div>
         )}
       </Show>
