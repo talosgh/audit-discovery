@@ -6127,9 +6127,9 @@ static int build_report_latex(const ReportData *report,
 
     if (!buffer_appendf(&buf,
         "\\begin{center}\n"
-        "{\\Large\\textbf{Audit Report}}\\[0.6em]\n"
+        "{\\Large\\textbf{Audit Report}}\\\\[0.6em]\n"
         "%s\\\\[0.4em]\n"
-        "{\\normalsize %s}\\[1em]\n"
+        "{\\normalsize %s}\\\\[1em]\n"
         "\\end{center}\n"
         "\\hrule\n"
         "\\vspace{1em}\n",
