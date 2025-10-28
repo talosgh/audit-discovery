@@ -6439,9 +6439,11 @@ static void handle_client(int client_fd, PGconn *conn) {
         end_ptr = strstr(header_buffer, "\r\n\r\n");
         if (end_ptr) {
             header_complete = true;
+            char *body_start = end_ptr + 4;
+            char saved_body_char = *body_start;
             size_t header_size = (size_t)(end_ptr - header_buffer) + 4;
             size_t leftover = header_len - header_size;
-            header_buffer[header_size] = '\0';
+            *body_start = '\0';
 
             char method[8];
             char path[512];
@@ -6580,9 +6582,12 @@ static void handle_client(int client_fd, PGconn *conn) {
                 }
                 size_t offset = 0;
                 if (leftover > 0) {
+                    *body_start = saved_body_char;
                     size_t copy_len = leftover > (size_t)content_length ? (size_t)content_length : leftover;
-                    memcpy(body_json, end_ptr + 4, copy_len);
+                    memcpy(body_json, body_start, copy_len);
                     offset += copy_len;
+                } else {
+                    *body_start = saved_body_char;
                 }
                 while ((long)offset < content_length) {
                     ssize_t read_bytes = recv(client_fd, body_json + offset, (size_t)content_length - offset, 0);
@@ -6677,9 +6682,12 @@ static void handle_client(int client_fd, PGconn *conn) {
                 log_info("/reports content-length=%ld leftover=%zu", content_length, leftover);
                 size_t offset = 0;
                 if (leftover > 0) {
+                    *body_start = saved_body_char;
                     size_t copy_len = leftover > (size_t)content_length ? (size_t)content_length : leftover;
-                    memcpy(body_json, end_ptr + 4, copy_len);
+                    memcpy(body_json, body_start, copy_len);
                     offset += copy_len;
+                } else {
+                    *body_start = saved_body_char;
                 }
                 while ((long)offset < content_length) {
                     ssize_t read_bytes = recv(client_fd, body_json + offset, (size_t)content_length - offset, 0);
