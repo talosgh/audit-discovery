@@ -93,6 +93,165 @@ typedef struct {
 } PhotoCollection;
 
 typedef struct {
+    char *equipment;
+    char *condition;
+    char *remedy;
+    char *note;
+    char *condition_code_raw;
+    OptionalBool resolved;
+    char *resolved_at;
+} ReportDeficiency;
+
+typedef struct {
+    ReportDeficiency *items;
+    size_t count;
+    size_t capacity;
+} ReportDeficiencyList;
+
+typedef struct {
+    char *key;
+    int count;
+} KeyCountEntry;
+
+typedef struct {
+    KeyCountEntry *items;
+    size_t count;
+    size_t capacity;
+} KeyCountList;
+
+typedef struct {
+    char *device_id;
+    StringArray codes;
+} DeviceCodesEntry;
+
+typedef struct {
+    DeviceCodesEntry *items;
+    size_t count;
+    size_t capacity;
+} DeviceCodesList;
+
+typedef struct {
+    OptionalInt controller_install_year;
+    OptionalInt controller_age;
+    OptionalInt capacity;
+    OptionalInt car_speed;
+    OptionalInt number_of_stops;
+    OptionalInt number_of_openings;
+    OptionalInt code_data_year;
+    OptionalInt ride_quality;
+    OptionalDouble door_opening_width;
+    OptionalBool dlm_compliant;
+    OptionalBool maintenance_log_up_to_date;
+    OptionalBool cat1_tag_current;
+    OptionalBool cat5_tag_current;
+    OptionalBool code_data_plate_present;
+    OptionalBool is_first_car;
+} ReportDeviceMetrics;
+
+typedef struct {
+    char *device_id;
+    char *submission_id;
+    char *device_type;
+    char *bank_name;
+    char *general_notes;
+    char *controller_manufacturer;
+    char *controller_model;
+    char *controller_type;
+    char *controller_power_system;
+    char *machine_manufacturer;
+    char *machine_type;
+    char *roping;
+    char *door_operation;
+    char *door_operation_type;
+    char *cat1_tag_date;
+    char *cat5_tag_date;
+    char *submitted_on_iso;
+    StringArray floors_served;
+    StringArray cars_in_bank;
+    StringArray total_floor_stop_names;
+    ReportDeviceMetrics metrics;
+    ReportDeficiencyList deficiencies;
+    const char *docstring;
+    const char *deficiencies_docstring;
+} ReportDevice;
+
+typedef struct {
+    ReportDevice *items;
+    size_t count;
+    size_t capacity;
+} ReportDeviceList;
+
+typedef struct {
+    char *start;
+    char *end;
+} ReportDateRange;
+
+typedef struct {
+    const char *docstring;
+    char *building_address;
+    char *building_owner;
+    char *elevator_contractor;
+    ReportDateRange audit_range;
+    int total_devices;
+    int elevator_count;
+    int escalator_count;
+    int total_deficiencies;
+    double average_deficiencies_per_device;
+    KeyCountList deficiencies_by_code;
+} ReportSummary;
+
+typedef struct {
+    ReportSummary summary;
+    ReportDeviceList devices;
+    DeviceCodesList deficiency_codes_by_device;
+} ReportData;
+
+static const char *REPORT_SUMMARY_DOCSTRING =
+    "Contains high-level metrics about the elevator audit.\n"
+    "- total_deficiencies: Total number of deficiencies/violations across all devices.\n"
+    "- total_devices: Total number of unique devices audited.\n"
+    "- deficiencies_by_code: Count of deficiencies per condition code (e.g., RUBBING, UNGUARDED).\n"
+    "- total_deficiencies_per_device: Number of deficiencies per device.\n"
+    "- average_deficiencies_per_device: Average number of deficiencies across all devices.\n"
+    "- audit_date_range: Earliest and latest submission dates.\n"
+    "- building_address: Address of the building audited.\n";
+
+static const char *REPORT_DEVICE_DOCSTRING =
+    "Contains detailed information for a single elevator device.\n"
+    "- device_id: Unique identifier for the device (normalized from Building ID).\n"
+    "- device_type: 'elevator' to distinguish from escalator devices.\n"
+    "- submission_id: Original submission UUID.\n"
+    "- root_details: All columns from the Root sheet for this device.\n"
+    "- general_notes: Inspector's general notes about this device.\n"
+    "- deficiencies: List of deficiencies with their details.\n"
+    "- deficiencies_docstring: Description of the deficiency fields.\n"
+    "- ride_quality: Ride quality rating (from CI_VARIABLES).\n"
+    "- controller_age: Age of the controller in years.\n"
+    "- dlm_compliant: Whether the device is Door Lock Monitoring compliant.\n"
+    "- unintended_motion_compliant: Whether the device meets unintended motion requirements.\n"
+    "- code_data_year: The revision year of the ASME A17.1 code that governs this elevator.\n"
+    "- cat1_tag_up_to_date: Whether the Category 1 test tag is current and shows testing compliance.\n"
+    "- cat5_tag_up_to_date: Whether the Category 5 test tag is current and shows testing compliance.\n"
+    "- maintenance_log_up_to_date: Whether the maintenance log is current and properly maintained.\n";
+
+static const char *REPORT_DEFICIENCIES_DOCSTRING =
+    "Each deficiency includes:\n"
+    "- equipment: The equipment related to the deficiency (e.g., GOVERNOR ROPES).\n"
+    "- condition: The condition causing the deficiency (e.g., RUBBING).\n"
+    "- remedy: The recommended remedy for the deficiency (e.g., ADJUST).\n"
+    "- note: Additional notes or description of the deficiency.\n";
+
+static const char *SUMMARY_DEF_PER_DEVICE_DOCSTRING =
+    "Number of deficiencies per device.\n"
+    "- Key: Device ID\n"
+    "- Value: Number of deficiencies for that device\n";
+
+static const char *SUMMARY_DEF_CODES_BY_DEVICE_DOCSTRING =
+    "List of deficiency condition codes per device.\n"
+    "- Key: Device ID\n"
+    "- Value: List of deficiency condition codes for that device\n";
+
+typedef struct {
     char *audit_uuid;
     OptionalLong form_id;
     char *form_name;
@@ -205,7 +364,7 @@ typedef struct {
 
 static bool is_valid_uuid(const char *uuid);
 static void handle_options_request(int client_fd);
-static void handle_get_request(int client_fd, PGconn *conn, const char *path);
+static void handle_get_request(int client_fd, PGconn *conn, const char *path, const char *query_string);
 static char *db_fetch_audit_list(PGconn *conn, char **error_out);
 static char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out);
 static void serve_static_file(int client_fd, const char *path);
@@ -214,6 +373,15 @@ static bool path_is_safe(const char *path);
 static bool audit_exists(PGconn *conn, const char *uuid);
 static bool db_update_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool resolved, char **resolved_at_out, char **error_out);
 static char *build_deficiency_key(const char *overlay_code, const char *device_id, const char *equipment, const char *condition, const char *remedy, const char *note);
+static OptionalInt parse_optional_int(const char *text);
+static OptionalDouble parse_optional_double(const char *text);
+static OptionalBool parse_optional_bool(const char *text);
+static int assign_string(char **dest, const char *value);
+static void report_data_init(ReportData *data);
+static void report_data_clear(ReportData *data);
+static void report_device_init(ReportDevice *device);
+static void report_device_clear(ReportDevice *device);
+static int report_device_list_append_move(ReportDeviceList *list, ReportDevice *device);
 
 static void log_error(const char *fmt, ...) {
     va_list args;
@@ -352,6 +520,1305 @@ static const char *resolved_map_get(const ResolvedMap *map, const char *key) {
         }
     }
     return NULL;
+}
+
+static char *strdup_safe(const char *value) {
+    if (!value) {
+        return NULL;
+    }
+    return strdup(value);
+}
+
+static void report_deficiency_list_init(ReportDeficiencyList *list) {
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void report_deficiency_free(ReportDeficiency *def) {
+    if (!def) return;
+    free(def->equipment);
+    free(def->condition);
+    free(def->remedy);
+    free(def->note);
+    free(def->condition_code_raw);
+    free(def->resolved_at);
+    optional_bool_clear(&def->resolved);
+}
+
+static void report_deficiency_list_clear(ReportDeficiencyList *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; ++i) {
+        report_deficiency_free(&list->items[i]);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static int report_deficiency_list_append(ReportDeficiencyList *list,
+                                         const char *equipment,
+                                         const char *condition,
+                                         const char *remedy,
+                                         const char *note,
+                                         const char *condition_raw,
+                                         const char *resolved_at,
+                                         OptionalBool resolved_flag) {
+    if (!list) {
+        return 0;
+    }
+    if (list->count == list->capacity) {
+        size_t new_cap = list->capacity == 0 ? 4 : list->capacity * 2;
+        ReportDeficiency *tmp = realloc(list->items, new_cap * sizeof(ReportDeficiency));
+        if (!tmp) {
+            return 0;
+        }
+        list->items = tmp;
+        list->capacity = new_cap;
+    }
+    ReportDeficiency *def = &list->items[list->count];
+    memset(def, 0, sizeof(*def));
+
+    def->equipment = strdup_safe(equipment);
+    def->condition = strdup_safe(condition);
+    def->remedy = strdup_safe(remedy);
+    def->note = strdup_safe(note);
+    def->condition_code_raw = strdup_safe(condition_raw);
+    def->resolved_at = strdup_safe(resolved_at);
+    def->resolved = resolved_flag;
+
+    if ((equipment && !def->equipment) ||
+        (condition && !def->condition) ||
+        (remedy && !def->remedy) ||
+        (note && !def->note) ||
+        (condition_raw && !def->condition_code_raw) ||
+        (resolved_at && !def->resolved_at)) {
+        report_deficiency_free(def);
+        return 0;
+    }
+
+    list->count++;
+    return 1;
+}
+
+static void key_count_list_init(KeyCountList *list) {
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void key_count_list_clear(KeyCountList *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; ++i) {
+        free(list->items[i].key);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static int key_count_list_increment(KeyCountList *list, const char *key, int delta) {
+    if (!list) return 0;
+    const char *effective = (key && key[0]) ? key : "Unspecified";
+    for (size_t i = 0; i < list->count; ++i) {
+        if (strcmp(list->items[i].key, effective) == 0) {
+            list->items[i].count += delta;
+            return 1;
+        }
+    }
+    if (list->count == list->capacity) {
+        size_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
+        KeyCountEntry *tmp = realloc(list->items, new_cap * sizeof(KeyCountEntry));
+        if (!tmp) {
+            return 0;
+        }
+        list->items = tmp;
+        list->capacity = new_cap;
+    }
+    list->items[list->count].key = strdup(effective);
+    if (!list->items[list->count].key) {
+        return 0;
+    }
+    list->items[list->count].count = delta;
+    list->count++;
+    return 1;
+}
+
+static void device_codes_list_init(DeviceCodesList *list) {
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void device_codes_list_clear(DeviceCodesList *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; ++i) {
+        free(list->items[i].device_id);
+        string_array_clear(&list->items[i].codes);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static StringArray *device_codes_list_get(DeviceCodesList *list, const char *device_id, bool create) {
+    if (!list || !device_id) return NULL;
+    for (size_t i = 0; i < list->count; ++i) {
+        if (strcmp(list->items[i].device_id, device_id) == 0) {
+            return &list->items[i].codes;
+        }
+    }
+    if (!create) {
+        return NULL;
+    }
+    if (list->count == list->capacity) {
+        size_t new_cap = list->capacity == 0 ? 4 : list->capacity * 2;
+        DeviceCodesEntry *tmp = realloc(list->items, new_cap * sizeof(DeviceCodesEntry));
+        if (!tmp) {
+            return NULL;
+        }
+        list->items = tmp;
+        list->capacity = new_cap;
+    }
+    DeviceCodesEntry *entry = &list->items[list->count];
+    entry->device_id = strdup(device_id);
+    if (!entry->device_id) {
+        return NULL;
+    }
+    string_array_init(&entry->codes);
+    list->count++;
+    return &entry->codes;
+}
+
+static int json_text_to_string_array(const char *json_text, StringArray *out) {
+    if (!out) return 0;
+    if (!json_text || json_text[0] == '\0') {
+        return 1;
+    }
+    char *error = NULL;
+    JsonValue *value = json_parse(json_text, &error);
+    if (!value) {
+        if (error) {
+            log_error("Failed to parse JSON array: %s", error);
+            free(error);
+        }
+        return 0;
+    }
+    if (value->type != JSON_ARRAY) {
+        json_free(value);
+        return 1;
+    }
+    for (size_t i = 0; i < value->value.array.count; ++i) {
+        const JsonValue *item = value->value.array.items[i];
+        const char *str = json_as_string(item);
+        if (str && !string_array_append_copy(out, str)) {
+            json_free(value);
+            return 0;
+        }
+    }
+    json_free(value);
+    return 1;
+}
+
+static void assign_optional_int_from_pg(OptionalInt *out, PGresult *res, int row, int col) {
+    if (!out) return;
+    optional_int_clear(out);
+    if (!res || PQgetisnull(res, row, col)) {
+        return;
+    }
+    const char *value = PQgetvalue(res, row, col);
+    OptionalInt parsed = parse_optional_int(value);
+    if (parsed.has_value) {
+        *out = parsed;
+    }
+}
+
+static void assign_optional_double_from_pg(OptionalDouble *out, PGresult *res, int row, int col) {
+    if (!out) return;
+    optional_double_clear(out);
+    if (!res || PQgetisnull(res, row, col)) {
+        return;
+    }
+    const char *value = PQgetvalue(res, row, col);
+    OptionalDouble parsed = parse_optional_double(value);
+    if (parsed.has_value) {
+        *out = parsed;
+    }
+}
+
+static void assign_optional_bool_from_pg(OptionalBool *out, PGresult *res, int row, int col) {
+    if (!out) return;
+    optional_bool_clear(out);
+    if (!res || PQgetisnull(res, row, col)) {
+        return;
+    }
+    const char *value = PQgetvalue(res, row, col);
+    OptionalBool parsed = parse_optional_bool(value);
+    if (!parsed.has_value) {
+        if (strcasecmp(value, "t") == 0) {
+            parsed.has_value = true;
+            parsed.value = true;
+        } else if (strcasecmp(value, "f") == 0) {
+            parsed.has_value = true;
+            parsed.value = false;
+        }
+    }
+    if (parsed.has_value) {
+        *out = parsed;
+    }
+}
+
+static OptionalInt calculate_controller_age_from_year(const OptionalInt *install_year) {
+    OptionalInt result;
+    optional_int_clear(&result);
+    if (!install_year || !install_year->has_value) {
+        return result;
+    }
+    time_t now = time(NULL);
+    struct tm tm_now;
+    if (!localtime_r(&now, &tm_now)) {
+        return result;
+    }
+    int current_year = tm_now.tm_year + 1900;
+    result.has_value = true;
+    result.value = current_year - install_year->value;
+    return result;
+}
+
+static char *clean_deficiency_text(const char *input) {
+    if (!input) {
+        return NULL;
+    }
+    while (isspace((unsigned char)*input)) {
+        input++;
+    }
+    if (*input == '\0') {
+        return strdup("");
+    }
+    const char *start = input;
+    const char *dash = strchr(input, '-');
+    if (dash) {
+        const char *p = input;
+        bool matches = true;
+        while (p < dash) {
+            if (*p == ' ') {
+                p++;
+                continue;
+            }
+            if (!(isupper((unsigned char)*p) || isdigit((unsigned char)*p))) {
+                matches = false;
+                break;
+            }
+            p++;
+        }
+        if (matches) {
+            start = dash + 1;
+            while (isspace((unsigned char)*start)) {
+                start++;
+            }
+        }
+    }
+    char *result = strdup(start);
+    if (!result) {
+        return NULL;
+    }
+    for (size_t i = 0; result[i]; ++i) {
+        result[i] = (char)(i == 0 ? toupper((unsigned char)result[i]) : tolower((unsigned char)result[i]));
+    }
+    return result;
+}
+
+static int assign_string_from_pg(char **dest, PGresult *res, int row, int col) {
+    if (!dest) return 0;
+    if (!res || PQgetisnull(res, row, col)) {
+        return 1;
+    }
+    return assign_string(dest, PQgetvalue(res, row, col));
+}
+
+static int hex_digit_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static char *url_decode(const char *input) {
+    if (!input) return NULL;
+    size_t len = strlen(input);
+    char *output = malloc(len + 1);
+    if (!output) return NULL;
+    char *out_ptr = output;
+    for (size_t i = 0; i < len; ++i) {
+        char c = input[i];
+        if (c == '%' && i + 2 < len) {
+            int hi = hex_digit_value(input[i + 1]);
+            int lo = hex_digit_value(input[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                *out_ptr++ = (char)((hi << 4) | lo);
+                i += 2;
+                continue;
+            }
+        }
+        if (c == '+') {
+            *out_ptr++ = ' ';
+        } else {
+            *out_ptr++ = c;
+        }
+    }
+    *out_ptr = '\0';
+    return output;
+}
+
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+} Buffer;
+
+static int buffer_init(Buffer *buf) {
+    if (!buf) return 0;
+    buf->capacity = 1024;
+    buf->length = 0;
+    buf->data = malloc(buf->capacity);
+    if (!buf->data) {
+        buf->capacity = 0;
+        return 0;
+    }
+    buf->data[0] = '\0';
+    return 1;
+}
+
+static void buffer_free(Buffer *buf) {
+    if (!buf) return;
+    free(buf->data);
+    buf->data = NULL;
+    buf->length = 0;
+    buf->capacity = 0;
+}
+
+static int buffer_reserve(Buffer *buf, size_t extra) {
+    if (!buf) return 0;
+    if (buf->length + extra + 1 <= buf->capacity) {
+        return 1;
+    }
+    size_t new_cap = buf->capacity ? buf->capacity : 1024;
+    while (buf->length + extra + 1 > new_cap) {
+        new_cap *= 2;
+    }
+    char *tmp = realloc(buf->data, new_cap);
+    if (!tmp) {
+        return 0;
+    }
+    buf->data = tmp;
+    buf->capacity = new_cap;
+    return 1;
+}
+
+static int buffer_append(Buffer *buf, const char *data, size_t len) {
+    if (!buf || !data) return 0;
+    if (!buffer_reserve(buf, len)) {
+        return 0;
+    }
+    memcpy(buf->data + buf->length, data, len);
+    buf->length += len;
+    buf->data[buf->length] = '\0';
+    return 1;
+}
+
+static int buffer_append_cstr(Buffer *buf, const char *text) {
+    if (!text) return buffer_append(buf, "", 0);
+    return buffer_append(buf, text, strlen(text));
+}
+
+static int buffer_append_char(Buffer *buf, char c) {
+    if (!buf) return 0;
+    if (!buffer_reserve(buf, 1)) {
+        return 0;
+    }
+    buf->data[buf->length++] = c;
+    buf->data[buf->length] = '\0';
+    return 1;
+}
+
+static int buffer_appendf(Buffer *buf, const char *fmt, ...) {
+    if (!buf || !fmt) return 0;
+    va_list args;
+    va_start(args, fmt);
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int needed = vsnprintf(NULL, 0, fmt, args_copy);
+    va_end(args_copy);
+    if (needed < 0) {
+        va_end(args);
+        return 0;
+    }
+    if (!buffer_reserve(buf, (size_t)needed)) {
+        va_end(args);
+        return 0;
+    }
+    vsnprintf(buf->data + buf->length, buf->capacity - buf->length, fmt, args);
+    buf->length += (size_t)needed;
+    va_end(args);
+    return 1;
+}
+
+static int buffer_append_json_string(Buffer *buf, const char *text) {
+    if (!buf) return 0;
+    if (!text) {
+        return buffer_append_cstr(buf, "null");
+    }
+    if (!buffer_append_char(buf, '"')) {
+        return 0;
+    }
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        unsigned char c = *p;
+        switch (c) {
+            case '"':
+                if (!buffer_append_cstr(buf, "\\\"")) return 0;
+                break;
+            case '\\':
+                if (!buffer_append_cstr(buf, "\\\\")) return 0;
+                break;
+            case '\b':
+                if (!buffer_append_cstr(buf, "\\b")) return 0;
+                break;
+            case '\f':
+                if (!buffer_append_cstr(buf, "\\f")) return 0;
+                break;
+            case '\n':
+                if (!buffer_append_cstr(buf, "\\n")) return 0;
+                break;
+            case '\r':
+                if (!buffer_append_cstr(buf, "\\r")) return 0;
+                break;
+            case '\t':
+                if (!buffer_append_cstr(buf, "\\t")) return 0;
+                break;
+            default:
+                if (c < 0x20) {
+                    char esc[7];
+                    snprintf(esc, sizeof(esc), "\\u%04x", c);
+                    if (!buffer_append_cstr(buf, esc)) return 0;
+                } else {
+                    if (!buffer_append_char(buf, (char)c)) return 0;
+                }
+                break;
+        }
+    }
+    if (!buffer_append_char(buf, '"')) {
+        return 0;
+    }
+    return 1;
+}
+
+static int buffer_append_optional_int(Buffer *buf, const OptionalInt *value) {
+    if (!value || !value->has_value) {
+        return buffer_append_cstr(buf, "null");
+    }
+    return buffer_appendf(buf, "%d", value->value);
+}
+
+static int buffer_append_optional_double(Buffer *buf, const OptionalDouble *value) {
+    if (!value || !value->has_value) {
+        return buffer_append_cstr(buf, "null");
+    }
+    return buffer_appendf(buf, "%g", value->value);
+}
+
+static int buffer_append_optional_bool(Buffer *buf, const OptionalBool *value) {
+    if (!value || !value->has_value) {
+        return buffer_append_cstr(buf, "null");
+    }
+    return buffer_append_cstr(buf, value->value ? "true" : "false");
+}
+
+static int buffer_append_string_array(Buffer *buf, const StringArray *array) {
+    if (!buffer_append_char(buf, '[')) return 0;
+    if (array && array->count > 0) {
+        for (size_t i = 0; i < array->count; ++i) {
+            if (i > 0 && !buffer_append_char(buf, ',')) return 0;
+            if (!buffer_append_json_string(buf, array->values[i])) return 0;
+        }
+    }
+    if (!buffer_append_char(buf, ']')) return 0;
+    return 1;
+}
+
+static int load_deficiencies_for_audit(PGconn *conn,
+                                       const char *audit_uuid,
+                                       ReportData *report,
+                                       ReportDevice *device,
+                                       DeviceCodesList *codes_map,
+                                       char **error_out) {
+    if (!conn || !audit_uuid || !report || !device) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid parameters while loading deficiencies");
+        }
+        return 0;
+    }
+    const char *sql =
+        "SELECT "
+        "  violation_equipment,"
+        "  violation_condition,"
+        "  violation_remedy,"
+        "  violation_note,"
+        "  condition_code,"
+        "  resolved_at"
+        " FROM audit_deficiencies"
+        " WHERE audit_uuid = $1::uuid"
+        " ORDER BY id";
+    const char *params[1] = { audit_uuid };
+    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to query deficiencies");
+        }
+        PQclear(res);
+        return 0;
+    }
+
+    DeviceCodesList local_map;
+    DeviceCodesList *codes_dst = codes_map ? codes_map : &local_map;
+    if (!codes_map) {
+        device_codes_list_init(&local_map);
+    }
+
+    for (int row = 0; row < PQntuples(res); ++row) {
+        const char *raw_equipment = PQgetisnull(res, row, 0) ? NULL : PQgetvalue(res, row, 0);
+        const char *raw_condition = PQgetisnull(res, row, 1) ? NULL : PQgetvalue(res, row, 1);
+        const char *raw_remedy = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
+        const char *raw_note = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
+        const char *raw_condition_code = PQgetisnull(res, row, 4) ? NULL : PQgetvalue(res, row, 4);
+        const char *resolved_at = PQgetisnull(res, row, 5) ? NULL : PQgetvalue(res, row, 5);
+
+        char *clean_equipment = clean_deficiency_text(raw_equipment);
+        char *clean_condition = clean_deficiency_text(raw_condition);
+        char *clean_remedy = clean_deficiency_text(raw_remedy);
+
+        OptionalBool resolved_flag;
+        optional_bool_clear(&resolved_flag);
+        if (resolved_at) {
+            resolved_flag.has_value = true;
+            resolved_flag.value = true;
+        }
+
+        if (!report_deficiency_list_append(&device->deficiencies,
+                                           clean_equipment ? clean_equipment : raw_equipment,
+                                           clean_condition ? clean_condition : raw_condition,
+                                           clean_remedy ? clean_remedy : raw_remedy,
+                                           raw_note,
+                                           raw_condition_code,
+                                           resolved_at,
+                                           resolved_flag)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Failed to append deficiency");
+            }
+            free(clean_equipment);
+            free(clean_condition);
+            free(clean_remedy);
+            if (!codes_map) device_codes_list_clear(&local_map);
+            PQclear(res);
+            return 0;
+        }
+
+        const char *condition_for_summary = clean_condition ? clean_condition : raw_condition;
+        if (!key_count_list_increment(&report->summary.deficiencies_by_code, condition_for_summary, 1)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Failed to update deficiency summary counts");
+            }
+            free(clean_equipment);
+            free(clean_condition);
+            free(clean_remedy);
+            if (!codes_map) device_codes_list_clear(&local_map);
+            PQclear(res);
+            return 0;
+        }
+
+        report->summary.total_deficiencies += 1;
+
+        if (device->device_id) {
+            StringArray *code_list = device_codes_list_get(codes_dst, device->device_id, true);
+            if (!code_list || !string_array_append_copy(code_list, condition_for_summary)) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Failed to record deficiency code list");
+                }
+                free(clean_equipment);
+                free(clean_condition);
+                free(clean_remedy);
+                if (!codes_map) device_codes_list_clear(&local_map);
+                PQclear(res);
+                return 0;
+            }
+        }
+
+        free(clean_equipment);
+        free(clean_condition);
+        free(clean_remedy);
+    }
+
+    if (!codes_map) {
+        device_codes_list_clear(&local_map);
+    }
+    PQclear(res);
+    return 1;
+}
+
+static int load_report_for_building(PGconn *conn, const char *building_address, ReportData *report, char **error_out) {
+    if (!conn || !building_address || !report) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid parameters while loading report");
+        }
+        return 0;
+    }
+
+    const char *sql =
+        "SELECT "
+        "  a.audit_uuid::text,"
+        "  a.building_id,"
+        "  a.device_type,"
+        "  a.bank_name,"
+        "  a.general_notes,"
+        "  a.controller_install_year,"
+        "  a.controller_manufacturer,"
+        "  a.controller_model,"
+        "  a.controller_type,"
+        "  a.controller_power_system,"
+        "  a.machine_manufacturer,"
+        "  a.machine_type,"
+        "  a.roping,"
+        "  a.door_operation,"
+        "  a.door_operation_type,"
+        "  a.number_of_stops,"
+        "  a.number_of_openings,"
+        "  a.capacity,"
+        "  a.car_speed,"
+        "  a.code_data_year,"
+        "  a.cat1_tag_current,"
+        "  a.cat1_tag_date,"
+        "  a.cat5_tag_current,"
+        "  a.cat5_tag_date,"
+        "  a.dlm_compliant,"
+        "  a.maintenance_log_up_to_date,"
+        "  a.code_data_plate_present,"
+        "  a.door_opening_width,"
+        "  a.rating_overall,"
+        "  a.submitted_on,"
+        "  array_to_json(COALESCE(a.cars_in_bank, ARRAY[]::text[]))::text AS cars_in_bank_json,"
+        "  array_to_json(COALESCE(a.total_floor_stop_names, ARRAY[]::text[]))::text AS total_floor_stop_names_json,"
+        "  array_to_json(COALESCE(a.floors_served, ARRAY[]::text[]))::text AS floors_served_json,"
+        "  a.building_address,"
+        "  a.building_owner,"
+        "  a.elevator_contractor,"
+        "  a.city_id,"
+        "  a.is_first_car"
+        " FROM audits a"
+        " WHERE a.building_address = $1"
+        " ORDER BY a.submitted_on NULLS LAST, a.building_id";
+
+    const char *params[1] = { building_address };
+    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to query audits for building");
+        }
+        PQclear(res);
+        return 0;
+    }
+
+    int rows = PQntuples(res);
+    if (rows == 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("No audits found for building address");
+        }
+        PQclear(res);
+        return 0;
+    }
+
+    report_data_clear(report);
+    report_data_init(report);
+
+    for (int row = 0; row < rows; ++row) {
+        ReportDevice device;
+        report_device_init(&device);
+
+        if (!assign_string_from_pg(&device.submission_id, res, row, 0) ||
+            !assign_string_from_pg(&device.device_id, res, row, 1) ||
+            !assign_string_from_pg(&device.device_type, res, row, 2) ||
+            !assign_string_from_pg(&device.bank_name, res, row, 3) ||
+            !assign_string_from_pg(&device.general_notes, res, row, 4) ||
+            !assign_string_from_pg(&device.controller_manufacturer, res, row, 6) ||
+            !assign_string_from_pg(&device.controller_model, res, row, 7) ||
+            !assign_string_from_pg(&device.controller_type, res, row, 8) ||
+            !assign_string_from_pg(&device.controller_power_system, res, row, 9) ||
+            !assign_string_from_pg(&device.machine_manufacturer, res, row, 10) ||
+            !assign_string_from_pg(&device.machine_type, res, row, 11) ||
+            !assign_string_from_pg(&device.roping, res, row, 12) ||
+            !assign_string_from_pg(&device.door_operation, res, row, 13) ||
+            !assign_string_from_pg(&device.door_operation_type, res, row, 14) ||
+            !assign_string_from_pg(&device.cat1_tag_date, res, row, 21) ||
+            !assign_string_from_pg(&device.cat5_tag_date, res, row, 23) ||
+            !assign_string_from_pg(&device.submitted_on_iso, res, row, 29)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory while copying audit fields");
+            }
+            report_device_clear(&device);
+            PQclear(res);
+            return 0;
+        }
+
+        assign_optional_int_from_pg(&device.metrics.controller_install_year, res, row, 5);
+        assign_optional_int_from_pg(&device.metrics.number_of_stops, res, row, 15);
+        assign_optional_int_from_pg(&device.metrics.number_of_openings, res, row, 16);
+        assign_optional_int_from_pg(&device.metrics.capacity, res, row, 17);
+        assign_optional_int_from_pg(&device.metrics.car_speed, res, row, 18);
+        assign_optional_int_from_pg(&device.metrics.code_data_year, res, row, 19);
+        assign_optional_bool_from_pg(&device.metrics.cat1_tag_current, res, row, 20);
+        assign_optional_bool_from_pg(&device.metrics.cat5_tag_current, res, row, 22);
+        assign_optional_bool_from_pg(&device.metrics.dlm_compliant, res, row, 24);
+        assign_optional_bool_from_pg(&device.metrics.maintenance_log_up_to_date, res, row, 25);
+        assign_optional_bool_from_pg(&device.metrics.code_data_plate_present, res, row, 26);
+        assign_optional_double_from_pg(&device.metrics.door_opening_width, res, row, 27);
+        assign_optional_int_from_pg(&device.metrics.ride_quality, res, row, 28);
+        assign_optional_bool_from_pg(&device.metrics.is_first_car, res, row, 37);
+
+        device.metrics.controller_age = calculate_controller_age_from_year(&device.metrics.controller_install_year);
+
+        const char *cars_json = PQgetisnull(res, row, 30) ? NULL : PQgetvalue(res, row, 30);
+        const char *stops_json = PQgetisnull(res, row, 31) ? NULL : PQgetvalue(res, row, 31);
+        const char *floors_json = PQgetisnull(res, row, 32) ? NULL : PQgetvalue(res, row, 32);
+        if (!json_text_to_string_array(cars_json, &device.cars_in_bank) ||
+            !json_text_to_string_array(stops_json, &device.total_floor_stop_names) ||
+            !json_text_to_string_array(floors_json, &device.floors_served)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Failed to parse audit array fields");
+            }
+            report_device_clear(&device);
+            PQclear(res);
+            return 0;
+        }
+
+        if (!report->summary.building_address && !assign_string_from_pg(&report->summary.building_address, res, row, 33)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying building address");
+            }
+            report_device_clear(&device);
+            PQclear(res);
+            return 0;
+        }
+        if (!report->summary.building_owner && !assign_string_from_pg(&report->summary.building_owner, res, row, 34)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying building owner");
+            }
+            report_device_clear(&device);
+            PQclear(res);
+            return 0;
+        }
+        if (!report->summary.elevator_contractor && !assign_string_from_pg(&report->summary.elevator_contractor, res, row, 35)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying elevator contractor");
+            }
+            report_device_clear(&device);
+            PQclear(res);
+            return 0;
+        }
+
+        if (!load_deficiencies_for_audit(conn,
+                                          device.submission_id,
+                                          report,
+                                          &device,
+                                          &report->deficiency_codes_by_device,
+                                          error_out)) {
+            report_device_clear(&device);
+            PQclear(res);
+            return 0;
+        }
+
+        if (!report_device_list_append_move(&report->devices, &device)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Failed to append device to report");
+            }
+            report_device_clear(&device);
+            PQclear(res);
+            return 0;
+        }
+
+        report->summary.total_devices += 1;
+        const char *type = report->devices.items[report->devices.count - 1].device_type;
+        if (type && strcasecmp(type, "escalator") == 0) {
+            report->summary.escalator_count += 1;
+        } else {
+            report->summary.elevator_count += 1;
+        }
+
+        const char *submitted_on = report->devices.items[report->devices.count - 1].submitted_on_iso;
+        if (submitted_on) {
+            if (!report->summary.audit_range.start || strcmp(submitted_on, report->summary.audit_range.start) < 0) {
+                free(report->summary.audit_range.start);
+                report->summary.audit_range.start = strdup(submitted_on);
+            }
+            if (!report->summary.audit_range.end || strcmp(submitted_on, report->summary.audit_range.end) > 0) {
+                free(report->summary.audit_range.end);
+                report->summary.audit_range.end = strdup(submitted_on);
+            }
+        }
+    }
+
+    PQclear(res);
+
+    if (report->summary.total_devices > 0) {
+        report->summary.average_deficiencies_per_device =
+            (double)report->summary.total_deficiencies / (double)report->summary.total_devices;
+    } else {
+        report->summary.average_deficiencies_per_device = 0.0;
+    }
+
+    return 1;
+}
+
+static char *report_data_to_json(const ReportData *report) {
+    if (!report) return NULL;
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        return NULL;
+    }
+
+    if (!buffer_append_char(&buf, '{')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"summary\":{")) goto fail;
+    if (!buffer_append_cstr(&buf, "\"docstring\":")) goto fail;
+    if (!buffer_append_json_string(&buf, report->summary.docstring)) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"building_address\":")) goto fail;
+    if (!buffer_append_json_string(&buf, report->summary.building_address)) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"building_owner\":")) goto fail;
+    if (!buffer_append_json_string(&buf, report->summary.building_owner)) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"elevator_contractor\":")) goto fail;
+    if (!buffer_append_json_string(&buf, report->summary.elevator_contractor)) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"total_devices\":")) goto fail;
+    if (!buffer_appendf(&buf, "%d", report->summary.total_devices)) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"elevator_count\":")) goto fail;
+    if (!buffer_appendf(&buf, "%d", report->summary.elevator_count)) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"escalator_count\":")) goto fail;
+    if (!buffer_appendf(&buf, "%d", report->summary.escalator_count)) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"total_deficiencies\":")) goto fail;
+    if (!buffer_appendf(&buf, "%d", report->summary.total_deficiencies)) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"average_deficiencies_per_device\":")) goto fail;
+    if (!buffer_appendf(&buf, "%0.6f", report->summary.average_deficiencies_per_device)) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"audit_date_range\":")) goto fail;
+    if (report->summary.audit_range.start || report->summary.audit_range.end) {
+        if (!buffer_append_char(&buf, '{')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"start\":")) goto fail;
+        if (!buffer_append_json_string(&buf, report->summary.audit_range.start)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"end\":")) goto fail;
+        if (!buffer_append_json_string(&buf, report->summary.audit_range.end)) goto fail;
+        if (!buffer_append_char(&buf, '}')) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"deficiencies_by_code\":")) goto fail;
+    if (!buffer_append_char(&buf, '{')) goto fail;
+    for (size_t i = 0; i < report->summary.deficiencies_by_code.count; ++i) {
+        if (i > 0 && !buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_json_string(&buf, report->summary.deficiencies_by_code.items[i].key)) goto fail;
+        if (!buffer_append_char(&buf, ':')) goto fail;
+        if (!buffer_appendf(&buf, "%d", report->summary.deficiencies_by_code.items[i].count)) goto fail;
+    }
+    if (!buffer_append_char(&buf, '}')) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"total_deficiencies_per_device\":{")) goto fail;
+    if (!buffer_append_cstr(&buf, "\"docstring\":")) goto fail;
+    if (!buffer_append_json_string(&buf, SUMMARY_DEF_PER_DEVICE_DOCSTRING)) goto fail;
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        const ReportDevice *device = &report->devices.items[i];
+        if (!device->device_id) continue;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_json_string(&buf, device->device_id)) goto fail;
+        if (!buffer_append_char(&buf, ':')) goto fail;
+        if (!buffer_appendf(&buf, "%zu", device->deficiencies.count)) goto fail;
+    }
+    if (!buffer_append_char(&buf, '}')) goto fail;
+    if (!buffer_append_char(&buf, ',')) goto fail;
+
+    if (!buffer_append_cstr(&buf, "\"deficiency_codes_by_device\":{")) goto fail;
+    if (!buffer_append_cstr(&buf, "\"docstring\":")) goto fail;
+    if (!buffer_append_json_string(&buf, SUMMARY_DEF_CODES_BY_DEVICE_DOCSTRING)) goto fail;
+    for (size_t i = 0; i < report->deficiency_codes_by_device.count; ++i) {
+        DeviceCodesEntry *entry = &report->deficiency_codes_by_device.items[i];
+        if (!entry->device_id) continue;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_json_string(&buf, entry->device_id)) goto fail;
+        if (!buffer_append_char(&buf, ':')) goto fail;
+        if (!buffer_append_string_array(&buf, &entry->codes)) goto fail;
+    }
+    if (!buffer_append_char(&buf, '}')) goto fail;
+    if (!buffer_append_char(&buf, '}')) goto fail; // end summary
+
+    if (!buffer_append_cstr(&buf, ",\"devices\":{")) goto fail;
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        const ReportDevice *device = &report->devices.items[i];
+        if (!device->device_id) continue;
+        if (i > 0 && !buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_json_string(&buf, device->device_id)) goto fail;
+        if (!buffer_append_cstr(&buf, ":{")) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"docstring\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->docstring)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"device_id\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->device_id)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"device_type\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->device_type)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"submission_id\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->submission_id)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"bank_name\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->bank_name)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"submitted_on\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->submitted_on_iso)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"general_notes\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->general_notes)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"deficiencies_docstring\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->deficiencies_docstring)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"root_details\":{")) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Device Type\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->device_type)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Capacity\":")) goto fail;
+        if (!buffer_append_optional_int(&buf, &device->metrics.capacity)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Car Speed\":")) goto fail;
+        if (!buffer_append_optional_int(&buf, &device->metrics.car_speed)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Floors Served\":")) goto fail;
+        if (!buffer_append_string_array(&buf, &device->floors_served)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Cars In Bank\":")) goto fail;
+        if (!buffer_append_string_array(&buf, &device->cars_in_bank)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Total Building Floor Stop Names\":")) goto fail;
+        if (!buffer_append_string_array(&buf, &device->total_floor_stop_names)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Controller Manufacturer\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->controller_manufacturer)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Controller Model\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->controller_model)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Controller Installation Year\":")) goto fail;
+        if (!buffer_append_optional_int(&buf, &device->metrics.controller_install_year)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Machine Manufacturer\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->machine_manufacturer)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Machine Type\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->machine_type)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Roping\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->roping)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Door Operation\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->door_operation)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Door Operation Type\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->door_operation_type)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Number of Stops\":")) goto fail;
+        if (!buffer_append_optional_int(&buf, &device->metrics.number_of_stops)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Number of Openings\":")) goto fail;
+        if (!buffer_append_optional_int(&buf, &device->metrics.number_of_openings)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Code Data Year\":")) goto fail;
+        if (!buffer_append_optional_int(&buf, &device->metrics.code_data_year)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Controller Type\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->controller_type)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+        if (!buffer_append_cstr(&buf, "\"Controller Power System\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->controller_power_system)) goto fail;
+        if (!buffer_append_char(&buf, '}')) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"deficiencies\":")) goto fail;
+        if (!buffer_append_char(&buf, '[')) goto fail;
+        for (size_t j = 0; j < device->deficiencies.count; ++j) {
+            const ReportDeficiency *def = &device->deficiencies.items[j];
+            if (j > 0 && !buffer_append_char(&buf, ',')) goto fail;
+            if (!buffer_append_char(&buf, '{')) goto fail;
+            if (!buffer_append_cstr(&buf, "\"equipment\":")) goto fail;
+            if (!buffer_append_json_string(&buf, def->equipment)) goto fail;
+            if (!buffer_append_char(&buf, ',')) goto fail;
+            if (!buffer_append_cstr(&buf, "\"condition\":")) goto fail;
+            if (!buffer_append_json_string(&buf, def->condition)) goto fail;
+            if (!buffer_append_char(&buf, ',')) goto fail;
+            if (!buffer_append_cstr(&buf, "\"remedy\":")) goto fail;
+            if (!buffer_append_json_string(&buf, def->remedy)) goto fail;
+            if (!buffer_append_char(&buf, ',')) goto fail;
+            if (!buffer_append_cstr(&buf, "\"note\":")) goto fail;
+            if (!buffer_append_json_string(&buf, def->note)) goto fail;
+            if (!buffer_append_char(&buf, ',')) goto fail;
+            if (!buffer_append_cstr(&buf, "\"resolved_at\":")) goto fail;
+            if (!buffer_append_json_string(&buf, def->resolved_at)) goto fail;
+            if (!buffer_append_char(&buf, '}')) goto fail;
+        }
+        if (!buffer_append_char(&buf, ']')) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"ride_quality\":")) goto fail;
+        if (!buffer_append_optional_int(&buf, &device->metrics.ride_quality)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"controller_age\":")) goto fail;
+        if (!buffer_append_optional_int(&buf, &device->metrics.controller_age)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"dlm_compliant\":")) goto fail;
+        if (!buffer_append_optional_bool(&buf, &device->metrics.dlm_compliant)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"maintenance_log_up_to_date\":")) goto fail;
+        if (!buffer_append_optional_bool(&buf, &device->metrics.maintenance_log_up_to_date)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"cat1_tag_up_to_date\":")) goto fail;
+        if (!buffer_append_optional_bool(&buf, &device->metrics.cat1_tag_current)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"cat1_tag_date\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->cat1_tag_date)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"cat5_tag_up_to_date\":")) goto fail;
+        if (!buffer_append_optional_bool(&buf, &device->metrics.cat5_tag_current)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"cat5_tag_date\":")) goto fail;
+        if (!buffer_append_json_string(&buf, device->cat5_tag_date)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"code_data_year\":")) goto fail;
+        if (!buffer_append_optional_int(&buf, &device->metrics.code_data_year)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"code_data_plate_present\":")) goto fail;
+        if (!buffer_append_optional_bool(&buf, &device->metrics.code_data_plate_present)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"door_opening_width\":")) goto fail;
+        if (!buffer_append_optional_double(&buf, &device->metrics.door_opening_width)) goto fail;
+        if (!buffer_append_char(&buf, ',')) goto fail;
+
+        if (!buffer_append_cstr(&buf, "\"is_first_car\":")) goto fail;
+        if (!buffer_append_optional_bool(&buf, &device->metrics.is_first_car)) goto fail;
+
+        if (!buffer_append_char(&buf, '}')) goto fail;
+    }
+    if (!buffer_append_char(&buf, '}')) goto fail; // end devices
+
+    if (!buffer_append_char(&buf, '}')) goto fail; // end outer object
+
+    char *json = buf.data;
+    buf.data = NULL;
+    buffer_free(&buf);
+    return json;
+
+fail:
+    buffer_free(&buf);
+    return NULL;
+}
+
+static void report_device_metrics_init(ReportDeviceMetrics *metrics) {
+    optional_int_clear(&metrics->controller_install_year);
+    optional_int_clear(&metrics->controller_age);
+    optional_int_clear(&metrics->capacity);
+    optional_int_clear(&metrics->car_speed);
+    optional_int_clear(&metrics->number_of_stops);
+    optional_int_clear(&metrics->number_of_openings);
+    optional_int_clear(&metrics->code_data_year);
+    optional_int_clear(&metrics->ride_quality);
+    optional_double_clear(&metrics->door_opening_width);
+    optional_bool_clear(&metrics->dlm_compliant);
+    optional_bool_clear(&metrics->maintenance_log_up_to_date);
+    optional_bool_clear(&metrics->cat1_tag_current);
+    optional_bool_clear(&metrics->cat5_tag_current);
+    optional_bool_clear(&metrics->code_data_plate_present);
+    optional_bool_clear(&metrics->is_first_car);
+}
+
+static void report_device_init(ReportDevice *device) {
+    if (!device) return;
+    device->device_id = NULL;
+    device->submission_id = NULL;
+    device->device_type = NULL;
+    device->bank_name = NULL;
+    device->general_notes = NULL;
+    device->controller_manufacturer = NULL;
+    device->controller_model = NULL;
+    device->controller_type = NULL;
+    device->controller_power_system = NULL;
+    device->machine_manufacturer = NULL;
+    device->machine_type = NULL;
+    device->roping = NULL;
+    device->door_operation = NULL;
+    device->door_operation_type = NULL;
+    device->cat1_tag_date = NULL;
+    device->cat5_tag_date = NULL;
+    device->submitted_on_iso = NULL;
+    string_array_init(&device->floors_served);
+    string_array_init(&device->cars_in_bank);
+    string_array_init(&device->total_floor_stop_names);
+    report_device_metrics_init(&device->metrics);
+    report_deficiency_list_init(&device->deficiencies);
+    device->docstring = REPORT_DEVICE_DOCSTRING;
+    device->deficiencies_docstring = REPORT_DEFICIENCIES_DOCSTRING;
+}
+
+static void report_device_clear(ReportDevice *device) {
+    if (!device) return;
+    free(device->device_id);
+    free(device->submission_id);
+    free(device->device_type);
+    free(device->bank_name);
+    free(device->general_notes);
+    free(device->controller_manufacturer);
+    free(device->controller_model);
+    free(device->controller_type);
+    free(device->controller_power_system);
+    free(device->machine_manufacturer);
+    free(device->machine_type);
+    free(device->roping);
+    free(device->door_operation);
+    free(device->door_operation_type);
+    free(device->cat1_tag_date);
+    free(device->cat5_tag_date);
+    free(device->submitted_on_iso);
+    string_array_clear(&device->floors_served);
+    string_array_clear(&device->cars_in_bank);
+    string_array_clear(&device->total_floor_stop_names);
+    report_deficiency_list_clear(&device->deficiencies);
+    report_device_metrics_init(&device->metrics);
+    device->docstring = REPORT_DEVICE_DOCSTRING;
+    device->deficiencies_docstring = REPORT_DEFICIENCIES_DOCSTRING;
+}
+
+static void report_device_list_init(ReportDeviceList *list) {
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static void report_device_list_clear(ReportDeviceList *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; ++i) {
+        report_device_clear(&list->items[i]);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static int report_device_list_append_move(ReportDeviceList *list, ReportDevice *device) {
+    if (!list || !device) return 0;
+    if (list->count == list->capacity) {
+        size_t new_cap = list->capacity == 0 ? 4 : list->capacity * 2;
+        ReportDevice *tmp = realloc(list->items, new_cap * sizeof(ReportDevice));
+        if (!tmp) {
+            return 0;
+        }
+        list->items = tmp;
+        list->capacity = new_cap;
+    }
+    list->items[list->count] = *device;
+    memset(device, 0, sizeof(*device));
+    list->count++;
+    return 1;
+}
+
+static void report_summary_init(ReportSummary *summary) {
+    if (!summary) return;
+    summary->docstring = REPORT_SUMMARY_DOCSTRING;
+    summary->building_address = NULL;
+    summary->building_owner = NULL;
+    summary->elevator_contractor = NULL;
+    summary->audit_range.start = NULL;
+    summary->audit_range.end = NULL;
+    summary->total_devices = 0;
+    summary->elevator_count = 0;
+    summary->escalator_count = 0;
+    summary->total_deficiencies = 0;
+    summary->average_deficiencies_per_device = 0.0;
+    key_count_list_init(&summary->deficiencies_by_code);
+}
+
+static void report_summary_clear(ReportSummary *summary) {
+    if (!summary) return;
+    free(summary->building_address);
+    free(summary->building_owner);
+    free(summary->elevator_contractor);
+    free(summary->audit_range.start);
+    free(summary->audit_range.end);
+    key_count_list_clear(&summary->deficiencies_by_code);
+    summary->total_devices = 0;
+    summary->elevator_count = 0;
+    summary->escalator_count = 0;
+    summary->total_deficiencies = 0;
+    summary->average_deficiencies_per_device = 0.0;
+}
+
+static void report_data_init(ReportData *data) {
+    if (!data) return;
+    report_summary_init(&data->summary);
+    report_device_list_init(&data->devices);
+    device_codes_list_init(&data->deficiency_codes_by_device);
+}
+
+static void report_data_clear(ReportData *data) {
+    if (!data) return;
+    report_device_list_clear(&data->devices);
+    report_summary_clear(&data->summary);
+    device_codes_list_clear(&data->deficiency_codes_by_device);
 }
 
 static void deficiency_list_init(DeficiencyList *list) {
@@ -723,10 +2190,20 @@ static OptionalBool parse_optional_bool(const char *text) {
         free(trimmed);
         return result;
     }
-    if (strcmp(trimmed, "1") == 0 || strcasecmp(trimmed, "true") == 0 || strcasecmp(trimmed, "yes") == 0 || strcasecmp(trimmed, "y") == 0) {
+    if (strcmp(trimmed, "1") == 0 ||
+        strcasecmp(trimmed, "true") == 0 ||
+        strcasecmp(trimmed, "yes") == 0 ||
+        strcasecmp(trimmed, "y") == 0 ||
+        strcasecmp(trimmed, "t") == 0 ||
+        strcasecmp(trimmed, "on") == 0) {
         result.has_value = true;
         result.value = true;
-    } else if (strcmp(trimmed, "0") == 0 || strcasecmp(trimmed, "false") == 0 || strcasecmp(trimmed, "no") == 0 || strcasecmp(trimmed, "n") == 0) {
+    } else if (strcmp(trimmed, "0") == 0 ||
+               strcasecmp(trimmed, "false") == 0 ||
+               strcasecmp(trimmed, "no") == 0 ||
+               strcasecmp(trimmed, "n") == 0 ||
+               strcasecmp(trimmed, "f") == 0 ||
+               strcasecmp(trimmed, "off") == 0) {
         result.has_value = true;
         result.value = false;
     }
@@ -2562,9 +4039,76 @@ static bool db_update_deficiency_status(PGconn *conn, const char *uuid, long def
     return true;
 }
 
-static void handle_get_request(int client_fd, PGconn *conn, const char *path) {
+static void handle_get_request(int client_fd, PGconn *conn, const char *path, const char *query_string) {
     if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0) {
         send_http_json(client_fd, 200, "OK", "{\"status\":\"ok\"}");
+        return;
+    }
+
+    if (strcmp(path, "/reports") == 0) {
+        char *address_value = NULL;
+        if (query_string && *query_string) {
+            char *query_copy = strdup(query_string);
+            if (!query_copy) {
+                char *body = build_error_response("Out of memory");
+                send_http_json(client_fd, 500, "Internal Server Error", body);
+                free(body);
+                return;
+            }
+            char *token = strtok(query_copy, "&");
+            while (token) {
+                char *eq = strchr(token, '=');
+                if (eq) {
+                    *eq = '\0';
+                    const char *key = token;
+                    const char *value = eq + 1;
+                    if (strcmp(key, "address") == 0) {
+                        address_value = url_decode(value);
+                        break;
+                    }
+                }
+                token = strtok(NULL, "&");
+            }
+            free(query_copy);
+        }
+
+        if (!address_value || address_value[0] == '\0') {
+            free(address_value);
+            char *body = build_error_response("address query parameter required");
+            send_http_json(client_fd, 400, "Bad Request", body);
+            free(body);
+            return;
+        }
+
+        ReportData report;
+        report_data_init(&report);
+        char *error = NULL;
+        int ok = load_report_for_building(conn, address_value, &report, &error);
+        free(address_value);
+        if (!ok) {
+            report_data_clear(&report);
+            int status = 500;
+            if (error && strcmp(error, "No audits found for building address") == 0) {
+                status = 404;
+            }
+            char *body = build_error_response(error ? error : "Failed to build report");
+            send_http_json(client_fd, status, status == 404 ? "Not Found" : "Internal Server Error", body);
+            free(body);
+            free(error);
+            return;
+        }
+        free(error);
+
+        char *json = report_data_to_json(&report);
+        report_data_clear(&report);
+        if (!json) {
+            char *body = build_error_response("Failed to serialize report");
+            send_http_json(client_fd, 500, "Internal Server Error", body);
+            free(body);
+            return;
+        }
+        send_http_json(client_fd, 200, "OK", json);
+        free(json);
         return;
     }
 
@@ -2790,8 +4334,10 @@ static void handle_client(int client_fd, PGconn *conn) {
             }
 
             char *query = strchr(path, '?');
+            const char *query_string = NULL;
             if (query) {
                 *query = '\0';
+                query_string = query + 1;
             }
 
             char *header_lines = strstr(header_buffer, "\r\n");
@@ -2827,7 +4373,7 @@ static void handle_client(int client_fd, PGconn *conn) {
 
             if (strcmp(method, "GET") == 0) {
                 if (is_api_path) {
-                    handle_get_request(client_fd, conn, api_path);
+                    handle_get_request(client_fd, conn, api_path, query_string);
                 } else {
                     serve_static_file(client_fd, path);
                 }
@@ -2932,23 +4478,37 @@ static void handle_client(int client_fd, PGconn *conn) {
                 }
                 body_json[content_length] = '\0';
 
-                char *resolved_field = strstr(body_json, "\"resolved\"");
                 bool resolved = false;
                 bool resolved_set = false;
-                if (resolved_field) {
-                    char *colon = strchr(resolved_field, ':');
-                    if (colon) {
-                        char *ptr = colon + 1;
-                        while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n') ptr++;
-                        if (strncmp(ptr, "true", 4) == 0) {
-                            resolved = true;
+                char *parse_error = NULL;
+                JsonValue *body_value = json_parse(body_json, &parse_error);
+                if (body_value && body_value->type == JSON_OBJECT) {
+                    JsonValue *resolved_val = json_object_get(body_value, "resolved");
+                    if (resolved_val) {
+                        if (resolved_val->type == JSON_BOOL) {
+                            resolved = resolved_val->value.boolean;
                             resolved_set = true;
-                        } else if (strncmp(ptr, "false", 5) == 0) {
-                            resolved = false;
+                        } else if (resolved_val->type == JSON_STRING) {
+                            const char *val = resolved_val->value.string;
+                            if (val) {
+                                if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0) {
+                                    resolved = true;
+                                    resolved_set = true;
+                                } else if (strcasecmp(val, "false") == 0 || strcmp(val, "0") == 0) {
+                                    resolved = false;
+                                    resolved_set = true;
+                                }
+                            }
+                        } else if (resolved_val->type == JSON_NUMBER) {
+                            resolved = resolved_val->value.number != 0.0;
                             resolved_set = true;
                         }
                     }
                 }
+                if (parse_error) {
+                    free(parse_error);
+                }
+                json_free(body_value);
                 if (!resolved_set) {
                     free(body_json);
                     char *body = build_error_response("Missing resolved flag");
