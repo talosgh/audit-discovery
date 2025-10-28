@@ -1,17 +1,22 @@
 [Unit]
-Description=Audit Webhook Service
-After=network-online.target
+Description=Audit Webhook Container
+After=network-online.target docker.service
+Requires=docker.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/audit_webhook
-WorkingDirectory=/srv/audit-webhook
+Environment="IMAGE=ghcr.io/OWNER/REPO:main"
 EnvironmentFile=/srv/audit-webhook/.env
+ExecStartPre=-/usr/bin/docker pull ${IMAGE}
+ExecStart=/usr/bin/docker run --rm \
+    --name audit-webhook \
+    --env-file /srv/audit-webhook/.env \
+    -p 8080:8080 \
+    ${IMAGE}
+ExecStop=/usr/bin/docker stop audit-webhook
 Restart=always
 RestartSec=5
-User=audit
-Group=audit
 
 [Install]
 WantedBy=multi-user.target

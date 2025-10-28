@@ -91,30 +91,29 @@ A multi-stage `Dockerfile` is provided.
 docker build -t audit-webhook .
 ```
 
-Run with production secrets via env file:
+Run with production secrets via env file (replace `OWNER/REPO` with your repository path):
 
 ```sh
+docker pull ghcr.io/OWNER/REPO:main
 docker run \
   --env-file ./production.env \
   -p 8080:8080 \
-  ghcr.io/OWNER/REPO:latest
+  ghcr.io/OWNER/REPO:main
 ```
 
 GitHub Actions workflow `.github/workflows/docker.yml` automatically builds and publishes images to GitHub Container Registry (`ghcr.io/<owner>/<repo>`) on pushes to `main`/`master` or version tags.
 
 ## Systemd (Debian)
 
-For VM/bare-metal deployments, a sample unit lives at `systemd/audit-webhook.service`. Install with:
+For VM/bare-metal deployments, a sample unit that runs the container lives at `systemd/audit-webhook.service`. Customize the `IMAGE=ghcr.io/OWNER/REPO:main` line, place your `.env` at `/srv/audit-webhook/.env`, and install with:
 
 ```sh
-sudo useradd --system --home /srv/audit-webhook --shell /usr/sbin/nologin audit
-sudo cp audit_webhook /usr/local/bin/
 sudo mkdir -p /srv/audit-webhook
-sudo cp -r sql README.md .env /srv/audit-webhook/
-sudo chown -R audit:audit /srv/audit-webhook
+sudo cp production.env /srv/audit-webhook/.env
+sudo chmod 600 /srv/audit-webhook/.env
 sudo cp systemd/audit-webhook.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now audit-webhook.service
 ```
 
-Systemd ensures the service starts at boot and restarts after crashes/reboots.
+The unit pulls the latest image, runs it with `--env-file`, binds port `8080`, and restarts automatically after crashes or reboots.
