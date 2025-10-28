@@ -1,0 +1,17 @@
+[Unit]
+Description=Audit Webhook Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/audit_webhook
+WorkingDirectory=/srv/audit-webhook
+EnvironmentFile=/srv/audit-webhook/.env
+Restart=always
+RestartSec=5
+User=audit
+Group=audit
+
+[Install]
+WantedBy=multi-user.target
