@@ -5,6 +5,10 @@
 # Build dirs
 /build/
 /dist/
+node_modules/
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.env
 
 # Archives and extracted data
 *.zip

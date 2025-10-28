@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1
 
+FROM node:20-bullseye-slim AS ui-build
+WORKDIR /dashboard
+COPY dashboard/package.json ./
+RUN npm install
+COPY dashboard/ ./
+RUN npm run build
+
 FROM debian:bookworm-slim AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -19,9 +26,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /srv/audit-webhook
 COPY --from=build /app/audit_webhook ./
-COPY sql ./sql
-COPY README.md .
-USER root
-ENV WEBHOOK_PORT=8080
+COPY --from=build /app/sql ./sql
+COPY --from=build /app/README.md ./
+COPY --from=ui-build /dashboard/dist ./static
+ENV WEBHOOK_PORT=8080 \
+    API_PREFIX=/webhook \
+    STATIC_DIR=/srv/audit-webhook/static
 EXPOSE 8080
 ENTRYPOINT ["./audit_webhook"]

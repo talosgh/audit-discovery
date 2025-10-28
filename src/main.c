@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <libpq-fe.h>
 #include <limits.h>
+#include <sys/sendfile.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -29,6 +30,9 @@
 #define TEMP_FILE_TEMPLATE "/tmp/audit_zip_XXXXXX"
 #define TEMP_DIR_TEMPLATE  "/tmp/audit_unpack_XXXXXX"
 static char *g_api_key = NULL;
+static char *g_api_prefix = NULL;
+static size_t g_api_prefix_len = 0;
+static char *g_static_dir = NULL;
 
 typedef struct {
     bool has_value;
@@ -198,6 +202,15 @@ typedef struct {
     size_t count;
     size_t capacity;
 } AllocationList;
+
+static bool is_valid_uuid(const char *uuid);
+static void handle_options_request(int client_fd);
+static void handle_get_request(int client_fd, PGconn *conn, const char *path);
+static char *db_fetch_audit_list(PGconn *conn, char **error_out);
+static char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out);
+static void serve_static_file(int client_fd, const char *path);
+static const char *mime_type_for(const char *path);
+static bool path_is_safe(const char *path);
 
 static void log_error(const char *fmt, ...) {
     va_list args;
@@ -2222,18 +2235,303 @@ static char *build_error_response(const char *message) {
     return buffer;
 }
 
-static void send_http_response(int client_fd, int status_code, const char *status_text, const char *body) {
+static void send_http_response(int client_fd, int status_code, const char *status_text, const char *content_type, const void *body, size_t body_len) {
     if (!status_text) status_text = "OK";
-    size_t body_len = body ? strlen(body) : 0;
-    char header[256];
+    if (!content_type) content_type = "application/json";
+    char header[512];
     int header_len = snprintf(header, sizeof(header),
-                              "HTTP/1.1 %d %s\r\nContent-Type: application/json\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-                              status_code, status_text, body_len);
+                              "HTTP/1.1 %d %s\r\n"
+                              "Content-Type: %s\r\n"
+                              "Content-Length: %zu\r\n"
+                              "Access-Control-Allow-Origin: *\r\n"
+                              "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                              "Access-Control-Allow-Headers: Content-Type, X-API-Key\r\n"
+                              "Connection: close\r\n\r\n",
+                              status_code, status_text, content_type, body_len);
     if (header_len < 0) return;
     (void)send(client_fd, header, (size_t)header_len, 0);
-    if (body_len > 0) {
+    if (body_len > 0 && body) {
         (void)send(client_fd, body, body_len, 0);
     }
+}
+
+static void send_http_json(int client_fd, int status_code, const char *status_text, const char *json_body) {
+    size_t len = json_body ? strlen(json_body) : 0;
+    send_http_response(client_fd, status_code, status_text, "application/json", json_body, len);
+}
+
+static bool is_valid_uuid(const char *uuid) {
+    if (!uuid) return false;
+    size_t len = strlen(uuid);
+    if (len != 36) {
+        return false;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        char c = uuid[i];
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (c != '-') return false;
+        } else if (!isxdigit((unsigned char)c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void handle_options_request(int client_fd) {
+    send_http_response(client_fd, 204, "No Content", "application/json", NULL, 0);
+}
+
+static char *db_fetch_audit_list(PGconn *conn, char **error_out) {
+    const char *sql =
+        "SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)::text "
+        "FROM ("
+        "  SELECT audit_uuid, building_address, building_owner, device_type, bank_name, city_id, submitted_on, updated_at "
+        "  FROM audits "
+        "  ORDER BY submitted_on DESC NULLS LAST "
+        "  LIMIT 100"
+        ") t;";
+    PGresult *res = PQexec(conn, sql);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Database query failed");
+        }
+        PQclear(res);
+        return NULL;
+    }
+    char *json = NULL;
+    if (PQntuples(res) > 0 && !PQgetisnull(res, 0, 0)) {
+        const char *value = PQgetvalue(res, 0, 0);
+        json = strdup(value ? value : "[]");
+    } else {
+        json = strdup("[]");
+    }
+    PQclear(res);
+    return json;
+}
+
+static char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out) {
+    const char *paramValues[1] = { uuid };
+    const char *sql =
+        "SELECT json_build_object("
+        "  'audit', row_to_json(a),"
+        "  'deficiencies', COALESCE((SELECT json_agg(row_to_json(d)) FROM audit_deficiencies d WHERE d.audit_uuid = a.audit_uuid), '[]'::json),"
+        "  'photos', COALESCE((SELECT json_agg(json_build_object("
+        "     'photo_filename', p.photo_filename,"
+        "     'content_type', p.content_type,"
+        "     'photo_bytes', encode(p.photo_bytes, 'base64')"
+        "  )) FROM audit_photos p WHERE p.audit_uuid = a.audit_uuid), '[]'::json)"
+        ")::text "
+        "FROM audits a "
+        "WHERE audit_uuid = $1::uuid;";
+    PGresult *res = PQexecParams(conn, sql, 1, NULL, paramValues, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Database query failed");
+        }
+        PQclear(res);
+        return NULL;
+    }
+    if (PQntuples(res) == 0 || PQgetisnull(res, 0, 0)) {
+        PQclear(res);
+        return NULL; // not found
+    }
+    const char *value = PQgetvalue(res, 0, 0);
+    char *json = strdup(value ? value : "{}");
+    PQclear(res);
+    return json;
+}
+
+static void handle_get_request(int client_fd, PGconn *conn, const char *path) {
+    if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0) {
+        send_http_json(client_fd, 200, "OK", "{\"status\":\"ok\"}");
+        return;
+    }
+
+    if (strcmp(path, "/audits") == 0) {
+        char *error = NULL;
+        char *json = db_fetch_audit_list(conn, &error);
+        if (!json) {
+            char *body = build_error_response(error ? error : "Failed to fetch audits");
+            send_http_json(client_fd, 500, "Internal Server Error", body);
+            free(body);
+            free(error);
+            return;
+        }
+        send_http_json(client_fd, 200, "OK", json);
+        free(json);
+        return;
+    }
+
+    if (strncmp(path, "/audits/", 8) == 0) {
+        const char *uuid_start = path + 8;
+        if (*uuid_start == '\0') {
+            char *body = build_error_response("Audit ID required");
+            send_http_json(client_fd, 400, "Bad Request", body);
+            free(body);
+            return;
+        }
+        if (strchr(uuid_start, '/')) {
+            char *body = build_error_response("Unknown resource");
+            send_http_json(client_fd, 404, "Not Found", body);
+            free(body);
+            return;
+        }
+        if (!is_valid_uuid(uuid_start)) {
+            char *body = build_error_response("Invalid audit ID");
+            send_http_json(client_fd, 400, "Bad Request", body);
+            free(body);
+            return;
+        }
+        char *error = NULL;
+        char *json = db_fetch_audit_detail(conn, uuid_start, &error);
+        if (!json) {
+            if (error) {
+                char *body = build_error_response(error);
+                send_http_json(client_fd, 500, "Internal Server Error", body);
+                free(body);
+                free(error);
+            } else {
+                char *body = build_error_response("Audit not found");
+                send_http_json(client_fd, 404, "Not Found", body);
+                free(body);
+            }
+            return;
+        }
+        send_http_json(client_fd, 200, "OK", json);
+        free(json);
+        return;
+    }
+
+    char *body = build_error_response("Not Found");
+    send_http_json(client_fd, 404, "Not Found", body);
+    free(body);
+}
+
+static const char *mime_type_for(const char *path) {
+    const char *ext = strrchr(path, '.');
+    if (!ext || ext[1] == '\0') {
+        return "text/plain; charset=utf-8";
+    }
+    ext++;
+    if (strcasecmp(ext, "html") == 0) return "text/html; charset=utf-8";
+    if (strcasecmp(ext, "css") == 0) return "text/css; charset=utf-8";
+    if (strcasecmp(ext, "js") == 0) return "text/javascript; charset=utf-8";
+    if (strcasecmp(ext, "mjs") == 0) return "text/javascript; charset=utf-8";
+    if (strcasecmp(ext, "json") == 0) return "application/json; charset=utf-8";
+    if (strcasecmp(ext, "svg") == 0) return "image/svg+xml";
+    if (strcasecmp(ext, "png") == 0) return "image/png";
+    if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(ext, "webp") == 0) return "image/webp";
+    if (strcasecmp(ext, "ico") == 0) return "image/x-icon";
+    if (strcasecmp(ext, "txt") == 0) return "text/plain; charset=utf-8";
+    if (strcasecmp(ext, "map") == 0) return "application/json; charset=utf-8";
+    if (strcasecmp(ext, "woff2") == 0) return "font/woff2";
+    return "application/octet-stream";
+}
+
+static bool path_is_safe(const char *path) {
+    if (!path) return false;
+    if (strstr(path, "..")) return false;
+    if (strchr(path, '\\')) return false;
+    return true;
+}
+
+static void serve_static_file(int client_fd, const char *path) {
+    if (!g_static_dir) {
+        char *body = build_error_response("Static content unavailable");
+        send_http_json(client_fd, 404, "Not Found", body);
+        free(body);
+        return;
+    }
+
+    char relative[PATH_MAX];
+    const char *requested = path && *path ? path : "/";
+    if (!path_is_safe(requested)) {
+        char *body = build_error_response("Invalid path");
+        send_http_json(client_fd, 400, "Bad Request", body);
+        free(body);
+        return;
+    }
+
+    const char *effective = requested;
+    if (effective[0] == '/') {
+        effective++;
+    }
+
+    if (*effective == '\0') {
+        strncpy(relative, "index.html", sizeof(relative));
+    } else {
+        strncpy(relative, effective, sizeof(relative));
+        relative[sizeof(relative) - 1] = '\0';
+    }
+
+    char full_path[PATH_MAX];
+    int written = snprintf(full_path, sizeof(full_path), "%s/%s", g_static_dir, relative);
+    if (written < 0 || (size_t)written >= sizeof(full_path)) {
+        char *body = build_error_response("Path too long");
+        send_http_json(client_fd, 414, "Request-URI Too Long", body);
+        free(body);
+        return;
+    }
+
+    struct stat st;
+    bool fallback_to_index = false;
+    if (stat(full_path, &st) != 0 || S_ISDIR(st.st_mode)) {
+        const bool looks_like_asset = strchr(relative, '.') != NULL;
+        if (looks_like_asset) {
+            char *body = build_error_response("Not Found");
+            send_http_json(client_fd, 404, "Not Found", body);
+            free(body);
+            return;
+        }
+        fallback_to_index = true;
+    }
+
+    if (fallback_to_index) {
+        written = snprintf(full_path, sizeof(full_path), "%s/index.html", g_static_dir);
+        if (written < 0 || (size_t)written >= sizeof(full_path) || stat(full_path, &st) != 0) {
+            char *body = build_error_response("Static index not found");
+            send_http_json(client_fd, 404, "Not Found", body);
+            free(body);
+            return;
+        }
+    }
+
+    if (!S_ISREG(st.st_mode)) {
+        char *body = build_error_response("Not Found");
+        send_http_json(client_fd, 404, "Not Found", body);
+        free(body);
+        return;
+    }
+
+    int fd = open(full_path, O_RDONLY);
+    if (fd < 0) {
+        char *body = build_error_response("Failed to read static asset");
+        send_http_json(client_fd, 500, "Internal Server Error", body);
+        free(body);
+        return;
+    }
+
+    const char *content_type = mime_type_for(full_path);
+    send_http_response(client_fd, 200, "OK", content_type, NULL, (size_t)st.st_size);
+
+    off_t offset = 0;
+    while (offset < st.st_size) {
+        ssize_t sent = sendfile(client_fd, fd, &offset, (size_t)(st.st_size - offset));
+        if (sent < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (sent == 0) {
+            break;
+        }
+    }
+
+    close(fd);
 }
 static void handle_client(int client_fd, PGconn *conn) {
     char header_buffer[MAX_HEADER_SIZE];
@@ -2249,7 +2547,7 @@ static void handle_client(int client_fd, PGconn *conn) {
         }
         if (header_len + (size_t)nread > sizeof(header_buffer)) {
             char *body = build_error_response("Request headers too large");
-            send_http_response(client_fd, 431, "Request Header Fields Too Large", body);
+            send_http_json(client_fd, 431, "Request Header Fields Too Large", body);
             free(body);
             return;
         }
@@ -2264,30 +2562,76 @@ static void handle_client(int client_fd, PGconn *conn) {
             header_buffer[header_size] = '\0';
 
             char method[8];
-            char path[256];
-            if (sscanf(header_buffer, "%7s %255s", method, path) != 2) {
+            char path[512];
+            if (sscanf(header_buffer, "%7s %511s", method, path) != 2) {
                 char *body = build_error_response("Malformed request line");
-                send_http_response(client_fd, 400, "Bad Request", body);
+                send_http_json(client_fd, 400, "Bad Request", body);
                 free(body);
                 return;
             }
+
+            char *query = strchr(path, '?');
+            if (query) {
+                *query = '\0';
+            }
+
+            char *header_lines = strstr(header_buffer, "\r\n");
+            if (header_lines) header_lines += 2;
+
+            const char *api_path = NULL;
+            bool is_api_path = false;
+            if (g_api_prefix_len > 0) {
+                if (strncmp(path, g_api_prefix, g_api_prefix_len) == 0) {
+                    char next = path[g_api_prefix_len];
+                    if (next == '\0' || next == '/' ) {
+                        is_api_path = true;
+                        api_path = path + g_api_prefix_len;
+                        if (!*api_path) {
+                            api_path = "/";
+                        }
+                    }
+                }
+            } else {
+                if (strcmp(path, "/health") == 0 || strncmp(path, "/audits", 7) == 0) {
+                    is_api_path = true;
+                    api_path = path;
+                } else if (strcmp(path, "/") == 0) {
+                    is_api_path = true;
+                    api_path = path;
+                }
+            }
+
+            if (strcmp(method, "OPTIONS") == 0) {
+                handle_options_request(client_fd);
+                return;
+            }
+
+            if (strcmp(method, "GET") == 0) {
+                if (is_api_path) {
+                    handle_get_request(client_fd, conn, api_path);
+                } else {
+                    serve_static_file(client_fd, path);
+                }
+                return;
+            }
+
             if (strcmp(method, "POST") != 0) {
-                char *body = build_error_response("Only POST supported");
-                send_http_response(client_fd, 405, "Method Not Allowed", body);
+                char *body = build_error_response("Method Not Allowed");
+                send_http_json(client_fd, 405, "Method Not Allowed", body);
                 free(body);
                 return;
             }
-            if (strcmp(path, "/webhook") != 0) {
+
+            // POST is only supported on the ingest endpoint root (e.g. /webhook)
+            if (!is_api_path || !(api_path && (strcmp(api_path, "/") == 0))) {
                 char *body = build_error_response("Not Found");
-                send_http_response(client_fd, 404, "Not Found", body);
+                send_http_json(client_fd, 404, "Not Found", body);
                 free(body);
                 return;
             }
 
             long content_length = -1;
             bool api_key_validated = false;
-            char *header_lines = strstr(header_buffer, "\r\n");
-            if (header_lines) header_lines += 2;
             char *line = header_lines;
             while (line && *line) {
                 char *next = strstr(line, "\r\n");
@@ -2319,13 +2663,13 @@ static void handle_client(int client_fd, PGconn *conn) {
             }
             if (content_length < 0) {
                 char *body = build_error_response("Content-Length required");
-                send_http_response(client_fd, 411, "Length Required", body);
+                send_http_json(client_fd, 411, "Length Required", body);
                 free(body);
                 return;
             }
             if (!api_key_validated) {
                 char *body = build_error_response("Unauthorized");
-                send_http_response(client_fd, 401, "Unauthorized", body);
+                send_http_json(client_fd, 401, "Unauthorized", body);
                 free(body);
                 return;
             }
@@ -2334,7 +2678,7 @@ static void handle_client(int client_fd, PGconn *conn) {
             int temp_fd = mkstemp(temp_path);
             if (temp_fd < 0) {
                 char *body = build_error_response("Failed to create temporary file");
-                send_http_response(client_fd, 500, "Internal Server Error", body);
+                send_http_json(client_fd, 500, "Internal Server Error", body);
                 free(body);
                 return;
             }
@@ -2344,7 +2688,7 @@ static void handle_client(int client_fd, PGconn *conn) {
                     close(temp_fd);
                     unlink(temp_path);
                     char *body = build_error_response("Failed writing request body");
-                    send_http_response(client_fd, 500, "Internal Server Error", body);
+                    send_http_json(client_fd, 500, "Internal Server Error", body);
                     free(body);
                     return;
                 }
@@ -2357,7 +2701,7 @@ static void handle_client(int client_fd, PGconn *conn) {
                     close(temp_fd);
                     unlink(temp_path);
                     char *body = build_error_response("Unexpected end of stream");
-                    send_http_response(client_fd, 400, "Bad Request", body);
+                    send_http_json(client_fd, 400, "Bad Request", body);
                     free(body);
                     return;
                 }
@@ -2365,7 +2709,7 @@ static void handle_client(int client_fd, PGconn *conn) {
                     close(temp_fd);
                     unlink(temp_path);
                     char *body = build_error_response("Failed writing request body");
-                    send_http_response(client_fd, 500, "Internal Server Error", body);
+                    send_http_json(client_fd, 500, "Internal Server Error", body);
                     free(body);
                     return;
                 }
@@ -2376,7 +2720,7 @@ static void handle_client(int client_fd, PGconn *conn) {
             if (total_written != content_length) {
                 unlink(temp_path);
                 char *body = build_error_response("Content-Length mismatch");
-                send_http_response(client_fd, 400, "Bad Request", body);
+                send_http_json(client_fd, 400, "Bad Request", body);
                 free(body);
                 return;
             }
@@ -2386,7 +2730,7 @@ static void handle_client(int client_fd, PGconn *conn) {
             char *process_error = NULL;
             if (!process_zip_file(temp_path, conn, &processed, &process_error)) {
                 char *body = build_error_response(process_error ? process_error : "Processing failed");
-                send_http_response(client_fd, 500, "Internal Server Error", body);
+                send_http_json(client_fd, 500, "Internal Server Error", body);
                 free(body);
                 free(process_error);
                 string_array_clear(&processed);
@@ -2396,10 +2740,10 @@ static void handle_client(int client_fd, PGconn *conn) {
             char *body = build_success_response(&processed);
             if (!body) {
                 body = build_error_response("Failed to build response");
-                send_http_response(client_fd, 500, "Internal Server Error", body);
+                send_http_json(client_fd, 500, "Internal Server Error", body);
                 free(body);
             } else {
-                send_http_response(client_fd, 200, "OK", body);
+                send_http_json(client_fd, 200, "OK", body);
                 free(body);
             }
             string_array_clear(&processed);
@@ -2407,8 +2751,8 @@ static void handle_client(int client_fd, PGconn *conn) {
             return;
         }
     }
-    char *body = build_error_response("Incomplete HTTP request");
-    send_http_response(client_fd, 400, "Bad Request", body);
+char *body = build_error_response("Incomplete HTTP request");
+send_http_json(client_fd, 400, "Bad Request", body);
     free(body);
 }
 
@@ -2486,6 +2830,56 @@ int main(int argc, char **argv) {
     }
     g_api_key = api_key_trimmed;
 
+    char *api_prefix_trimmed = trim_copy(getenv("API_PREFIX"));
+    if (!api_prefix_trimmed || api_prefix_trimmed[0] == '\0') {
+        free(api_prefix_trimmed);
+        api_prefix_trimmed = strdup("/webhook");
+    }
+    if (!api_prefix_trimmed) {
+        log_error("Failed to allocate API prefix");
+        return 1;
+    }
+    if (api_prefix_trimmed[0] != '/') {
+        size_t len = strlen(api_prefix_trimmed);
+        char *prefixed = malloc(len + 2);
+        if (!prefixed) {
+            log_error("Failed to allocate API prefix");
+            free(api_prefix_trimmed);
+            return 1;
+        }
+        prefixed[0] = '/';
+        memcpy(prefixed + 1, api_prefix_trimmed, len + 1);
+        free(api_prefix_trimmed);
+        api_prefix_trimmed = prefixed;
+    }
+    size_t prefix_len = strlen(api_prefix_trimmed);
+    while (prefix_len > 1 && api_prefix_trimmed[prefix_len - 1] == '/') {
+        api_prefix_trimmed[--prefix_len] = '\0';
+    }
+    if (strcmp(api_prefix_trimmed, "/") == 0) {
+        g_api_prefix = strdup("");
+        free(api_prefix_trimmed);
+        if (!g_api_prefix) {
+            log_error("Failed to allocate API prefix");
+            return 1;
+        }
+        g_api_prefix_len = 0;
+    } else {
+        g_api_prefix = api_prefix_trimmed;
+        g_api_prefix_len = strlen(g_api_prefix);
+    }
+
+    char *static_dir_trimmed = trim_copy(getenv("STATIC_DIR"));
+    if (!static_dir_trimmed || static_dir_trimmed[0] == '\0') {
+        free(static_dir_trimmed);
+        static_dir_trimmed = strdup("./static");
+    }
+    if (!static_dir_trimmed) {
+        log_error("Failed to allocate static directory");
+        return 1;
+    }
+    g_static_dir = static_dir_trimmed;
+
     PGconn *conn = PQconnectdb(dsn);
     if (PQstatus(conn) != CONNECTION_OK) {
         log_error("Failed to connect to database: %s", PQerrorMessage(conn));
@@ -2506,5 +2900,7 @@ int main(int argc, char **argv) {
     int ok = run_server(conn, port);
     PQfinish(conn);
     free(g_api_key);
+    free(g_api_prefix);
+    free(g_static_dir);
     return ok ? 0 : 1;
 }

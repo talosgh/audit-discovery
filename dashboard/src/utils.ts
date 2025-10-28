@@ -1,0 +1,37 @@
+export function formatDateTime(value: string | null | undefined): string {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short'
+  }).format(parsed);
+}
+
+export function formatArray(values: (string | null)[] | null | undefined, fallback = '—'): string {
+  if (!values || values.length === 0) {
+    return fallback;
+  }
+  const filtered = values.map((value) => value?.trim()).filter((value): value is string => Boolean(value && value.length > 0));
+  return filtered.length > 0 ? filtered.join(', ') : fallback;
+}
+
+export function formatBoolean(value: boolean | null | undefined): string {
+  if (value === null || value === undefined) {
+    return '—';
+  }
+  return value ? 'Yes' : 'No';
+}
+
+export function formatNumber(value: number | null | undefined, options?: Intl.NumberFormatOptions): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return '—';
+  }
+  return new Intl.NumberFormat(undefined, options).format(value);
+}
+
+export function dataUrl(contentType: string, base64: string): string {
+  return `data:${contentType};base64,${base64}`;
+}
