@@ -77,35 +77,46 @@ const AuditList: Component<AuditListProps> = (props) => {
                   <th scope="col">Device</th>
                   <th scope="col">Bank</th>
                   <th scope="col">City ID</th>
+                  <th scope="col">Open Deficiencies</th>
                   <th scope="col">Submitted</th>
                   <th scope="col">Updated</th>
                 </tr>
               </thead>
               <tbody>
                 <For each={filteredAudits()}>
-                  {(audit: AuditSummary) => (
-                    <tr
-                      class="table-row"
-                      role="link"
-                      tabIndex={0}
-                      aria-label={`View audit ${audit.building_address ?? audit.audit_uuid}`}
-                      onClick={() => props.onSelect(audit.audit_uuid)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' || event.key === ' ') {
-                          event.preventDefault();
-                          props.onSelect(audit.audit_uuid);
-                        }
-                      }}
-                    >
-                      <td>{audit.building_address ?? '—'}</td>
-                      <td>{audit.building_owner ?? '—'}</td>
-                      <td>{audit.device_type ?? '—'}</td>
-                      <td>{audit.bank_name ?? '—'}</td>
-                      <td>{audit.city_id ?? '—'}</td>
-                      <td>{formatDateTime(audit.submitted_on)}</td>
-                      <td>{formatDateTime(audit.updated_at)}</td>
-                    </tr>
-                  )}
+                  {(audit: AuditSummary) => {
+                    const openCount = audit.deficiency_count ?? 0;
+
+                    return (
+                      <tr
+                        class="table-row"
+                        role="link"
+                        tabIndex={0}
+                        aria-label={`View audit ${audit.building_address ?? audit.audit_uuid}`}
+                        onClick={() => props.onSelect(audit.audit_uuid)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            props.onSelect(audit.audit_uuid);
+                          }
+                        }}
+                      >
+                        <td>{audit.building_address ?? '—'}</td>
+                        <td>{audit.building_owner ?? '—'}</td>
+                        <td>{audit.device_type ?? '—'}</td>
+                        <td>{audit.bank_name ?? '—'}</td>
+                        <td>{audit.city_id ?? '—'}</td>
+                        <td>
+                          <span class="deficiency-count">{openCount}</span>
+                          <Show when={openCount > 0}>
+                            <span class="deficiency-indicator" aria-hidden="true" title="Open deficiencies" />
+                          </Show>
+                        </td>
+                        <td>{formatDateTime(audit.submitted_on)}</td>
+                        <td>{formatDateTime(audit.updated_at)}</td>
+                      </tr>
+                    );
+                  }}
                 </For>
               </tbody>
             </table>

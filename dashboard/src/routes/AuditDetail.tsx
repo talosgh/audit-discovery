@@ -1,6 +1,6 @@
 import type { Component } from 'solid-js';
 import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
-import { fetchAuditDetail } from '../api';
+import { fetchAuditDetail, updateDeficiencyStatus } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
 import type { AuditDetailResponse, Deficiency, PhotoAsset } from '../types';
@@ -50,6 +50,8 @@ const AuditDetail: Component<AuditDetailProps> = (props) => {
   const deficiencies = createMemo<Deficiency[]>(() => auditDetail()?.deficiencies ?? []);
   const photos = createMemo<PhotoAsset[]>(() => auditDetail()?.photos ?? []);
   const [previewIndex, setPreviewIndex] = createSignal<number | null>(null);
+  const [actionError, setActionError] = createSignal<string | null>(null);
+  const [updatingId, setUpdatingId] = createSignal<number | null>(null);
 
   const closePreview = () => setPreviewIndex(null);
   const openPreview = (index: number) => setPreviewIndex(index);
@@ -63,22 +65,24 @@ const AuditDetail: Component<AuditDetailProps> = (props) => {
     });
   };
 
-  createEffect(() => {
-    if (previewIndex() === null) return;
-    const handleKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        closePreview();
-      } else if (event.key === 'ArrowLeft') {
-        event.preventDefault();
-        navigatePreview(-1);
-      } else if (event.key === 'ArrowRight') {
-        event.preventDefault();
-        navigatePreview(1);
-      }
-    };
-    window.addEventListener('keydown', handleKey);
-    onCleanup(() => window.removeEventListener('keydown', handleKey));
-  });
+  if (typeof window !== 'undefined') {
+    createEffect(() => {
+      if (previewIndex() === null) return;
+      const handleKey = (event: KeyboardEvent) => {
+        if (event.key === 'Escape') {
+          closePreview();
+        } else if (event.key === 'ArrowLeft') {
+          event.preventDefault();
+          navigatePreview(-1);
+        } else if (event.key === 'ArrowRight') {
+          event.preventDefault();
+          navigatePreview(1);
+        }
+      };
+      window.addEventListener('keydown', handleKey);
+      onCleanup(() => window.removeEventListener('keydown', handleKey));
+    });
+  }
 
   const previewPhoto = createMemo<PhotoAsset | null>(() => {
     const index = previewIndex();
@@ -280,6 +284,13 @@ const AuditDetail: Component<AuditDetailProps> = (props) => {
 
           <section class="page-section" style={{ background: 'rgba(15,23,42,0.6)' }} aria-labelledby="deficiency-heading">
             <h2 id="deficiency-heading">Deficiencies</h2>
+            <Show when={actionError()}>
+              {(message) => (
+                <div class="error-box" role="alert">
+                  {message()}
+                </div>
+              )}
+            </Show>
             <Show when={deficiencies().length > 0} fallback={<div class="empty-state">No deficiencies recorded.</div>}>
               <div class="table-wrapper">
                 <table>
@@ -289,18 +300,58 @@ const AuditDetail: Component<AuditDetailProps> = (props) => {
                       <th scope="col">Condition</th>
                       <th scope="col">Remedy</th>
                       <th scope="col">Note</th>
+                      <th scope="col">Status</th>
+                      <th scope="col">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     <For each={deficiencies()}>
-                      {(item) => (
-                        <tr>
-                          <td>{item.violation_equipment ?? item.equipment_code ?? '—'}</td>
-                          <td>{item.violation_condition ?? item.condition_code ?? '—'}</td>
-                          <td>{item.violation_remedy ?? item.remedy_code ?? '—'}</td>
-                          <td>{item.violation_note ?? '—'}</td>
-                        </tr>
-                      )}
+                      {(item) => {
+                        const resolved = Boolean(item.resolved_at);
+                        const resolvedTimestamp = item.resolved_at ? formatDateTime(item.resolved_at) : null;
+
+                        const handleToggle = async (nextResolved: boolean) => {
+                          if (!item.id) return;
+                          setUpdatingId(item.id);
+                          setActionError(null);
+                          try {
+                            await updateDeficiencyStatus(props.auditId, item.id, nextResolved);
+                            await refetch();
+                          } catch (err) {
+                            setActionError((err as Error).message);
+                          } finally {
+                            setUpdatingId(null);
+                          }
+                        };
+
+                        return (
+                          <tr classList={{ 'deficiency-row': true, resolved }}>
+                            <td>{item.violation_equipment ?? item.equipment_code ?? '—'}</td>
+                            <td>{item.violation_condition ?? item.condition_code ?? '—'}</td>
+                            <td>{item.violation_remedy ?? item.remedy_code ?? '—'}</td>
+                            <td>{item.violation_note ?? '—'}</td>
+                            <td>
+                              <span class={`status-pill ${resolved ? 'resolved' : 'open'}`}>
+                                {resolved ? (resolvedTimestamp ? `Closed (${resolvedTimestamp})` : 'Closed') : 'Open'}
+                              </span>
+                            </td>
+                            <td>
+                              <Show when={item.id}>
+                                <div class="deficiency-actions">
+                                  <button
+                                    type="button"
+                                    class="action-button"
+                                    disabled={updatingId() === item.id}
+                                    onClick={() => handleToggle(!resolved)}
+                                  >
+                                    {resolved ? 'Reopen' : 'Mark Closed'}
+                                  </button>
+                                </div>
+                              </Show>
+                            </td>
+                          </tr>
+                        );
+                      }}
                     </For>
                   </tbody>
                 </table>

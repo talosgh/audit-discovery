@@ -7,6 +7,7 @@ export interface AuditSummary {
   city_id: string | null;
   submitted_on: string | null;
   updated_at: string | null;
+  deficiency_count?: number | null;
 }
 
 export interface AuditRecord extends AuditSummary {
@@ -95,6 +96,7 @@ export interface AuditRecord extends AuditSummary {
 }
 
 export interface Deficiency {
+  id?: number;
   section_counter: number | null;
   violation_device_id: string | null;
   equipment_code: string | null;
@@ -105,6 +107,7 @@ export interface Deficiency {
   violation_condition: string | null;
   violation_remedy: string | null;
   violation_note: string | null;
+  resolved_at?: string | null;
 }
 
 export interface PhotoAsset {

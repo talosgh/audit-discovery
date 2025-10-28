@@ -121,8 +121,12 @@ CREATE TABLE IF NOT EXISTS audit_deficiencies (
     violation_equipment TEXT,
     violation_condition TEXT,
     violation_remedy TEXT,
-    violation_note TEXT
+    violation_note TEXT,
+    resolved_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_photos_audit_uuid ON audit_photos (audit_uuid);
 CREATE INDEX IF NOT EXISTS idx_audit_deficiencies_audit_uuid ON audit_deficiencies (audit_uuid);
+
+ALTER TABLE audit_deficiencies
+    ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;

@@ -212,6 +212,8 @@ static void serve_static_file(int client_fd, const char *path);
 static const char *mime_type_for(const char *path);
 static bool path_is_safe(const char *path);
 static bool audit_exists(PGconn *conn, const char *uuid);
+static bool db_update_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool resolved, char **resolved_at_out, char **error_out);
+static char *build_deficiency_key(const char *overlay_code, const char *device_id, const char *equipment, const char *condition, const char *remedy, const char *note);
 
 static void log_error(const char *fmt, ...) {
     va_list args;
@@ -274,6 +276,82 @@ static void string_array_clear(StringArray *array) {
     array->values = NULL;
     array->count = 0;
     array->capacity = 0;
+}
+
+typedef struct {
+    char *key;
+    char *resolved_at;
+} ResolvedEntry;
+
+typedef struct {
+    ResolvedEntry *entries;
+    size_t count;
+    size_t capacity;
+} ResolvedMap;
+
+static void resolved_map_init(ResolvedMap *map) {
+    map->entries = NULL;
+    map->count = 0;
+    map->capacity = 0;
+}
+
+static void resolved_map_clear(ResolvedMap *map) {
+    if (!map) return;
+    for (size_t i = 0; i < map->count; ++i) {
+        free(map->entries[i].key);
+        free(map->entries[i].resolved_at);
+    }
+    free(map->entries);
+    map->entries = NULL;
+    map->count = 0;
+    map->capacity = 0;
+}
+
+static int resolved_map_put(ResolvedMap *map, const char *key, const char *resolved_at) {
+    if (!key) {
+        return 1;
+    }
+    for (size_t i = 0; i < map->count; ++i) {
+        if (strcmp(map->entries[i].key, key) == 0) {
+            if (!map->entries[i].resolved_at && resolved_at) {
+                map->entries[i].resolved_at = strdup(resolved_at);
+                if (!map->entries[i].resolved_at) {
+                    return 0;
+                }
+            }
+            return 1;
+        }
+    }
+    if (map->count == map->capacity) {
+        size_t new_cap = map->capacity == 0 ? 8 : map->capacity * 2;
+        ResolvedEntry *tmp = realloc(map->entries, new_cap * sizeof(ResolvedEntry));
+        if (!tmp) {
+            return 0;
+        }
+        map->entries = tmp;
+        map->capacity = new_cap;
+    }
+    map->entries[map->count].key = strdup(key);
+    map->entries[map->count].resolved_at = resolved_at ? strdup(resolved_at) : NULL;
+    if (!map->entries[map->count].key || (resolved_at && !map->entries[map->count].resolved_at)) {
+        free(map->entries[map->count].key);
+        free(map->entries[map->count].resolved_at);
+        return 0;
+    }
+    map->count++;
+    return 1;
+}
+
+static const char *resolved_map_get(const ResolvedMap *map, const char *key) {
+    if (!map || !key) {
+        return NULL;
+    }
+    for (size_t i = 0; i < map->count; ++i) {
+        if (strcmp(map->entries[i].key, key) == 0) {
+            return map->entries[i].resolved_at;
+        }
+    }
+    return NULL;
 }
 
 static void deficiency_list_init(DeficiencyList *list) {
@@ -1876,6 +1954,45 @@ static int db_replace_photos(PGconn *conn, const char *audit_uuid, const PhotoCo
 }
 
 static int db_replace_deficiencies(PGconn *conn, const char *audit_uuid, const DeficiencyList *deficiencies, char **error_out) {
+    ResolvedMap resolved_map;
+    resolved_map_init(&resolved_map);
+
+    const char *existing_sql =
+        "SELECT overlay_code, violation_device_id, violation_equipment, violation_condition, violation_remedy, violation_note, resolved_at "
+        "FROM audit_deficiencies WHERE audit_uuid = $1";
+    const char *paramAudit[1] = { audit_uuid };
+    PGresult *existing_res = PQexecParams(conn, existing_sql, 1, NULL, paramAudit, NULL, NULL, 0);
+    if (PQresultStatus(existing_res) == PGRES_TUPLES_OK) {
+        int rows = PQntuples(existing_res);
+        for (int i = 0; i < rows; ++i) {
+            const char *overlay = PQgetisnull(existing_res, i, 0) ? NULL : PQgetvalue(existing_res, i, 0);
+            const char *device = PQgetisnull(existing_res, i, 1) ? NULL : PQgetvalue(existing_res, i, 1);
+            const char *equipment = PQgetisnull(existing_res, i, 2) ? NULL : PQgetvalue(existing_res, i, 2);
+            const char *condition = PQgetisnull(existing_res, i, 3) ? NULL : PQgetvalue(existing_res, i, 3);
+            const char *remedy = PQgetisnull(existing_res, i, 4) ? NULL : PQgetvalue(existing_res, i, 4);
+            const char *note = PQgetisnull(existing_res, i, 5) ? NULL : PQgetvalue(existing_res, i, 5);
+            const char *resolved = PQgetisnull(existing_res, i, 6) ? NULL : PQgetvalue(existing_res, i, 6);
+            char *key = build_deficiency_key(overlay, device, equipment, condition, remedy, note);
+            if (!key) {
+                resolved_map_clear(&resolved_map);
+                PQclear(existing_res);
+                if (error_out) *error_out = strdup("Out of memory");
+                return 0;
+            }
+            if (!resolved_map_put(&resolved_map, key, resolved)) {
+                free(key);
+                resolved_map_clear(&resolved_map);
+                PQclear(existing_res);
+                if (error_out) *error_out = strdup("Out of memory");
+                return 0;
+            }
+            free(key);
+        }
+    } else {
+        log_error("Failed reading existing deficiencies: %s", PQresultErrorMessage(existing_res));
+    }
+    PQclear(existing_res);
+
     const char *delete_sql = "DELETE FROM audit_deficiencies WHERE audit_uuid = $1";
     const char *del_params[1] = { audit_uuid };
     PGresult *del_res = PQexecParams(conn, delete_sql, 1, NULL, del_params, NULL, NULL, 0);
@@ -1885,25 +2002,31 @@ static int db_replace_deficiencies(PGconn *conn, const char *audit_uuid, const D
             *error_out = strdup(errmsg ? errmsg : "Failed clearing existing deficiencies");
         }
         PQclear(del_res);
+        resolved_map_clear(&resolved_map);
         return 0;
     }
     PQclear(del_res);
 
     if (!deficiencies || deficiencies->count == 0) {
+        resolved_map_clear(&resolved_map);
         return 1;
     }
 
     const char *insert_sql =
-        "INSERT INTO audit_deficiencies (audit_uuid, section_counter, violation_device_id, equipment_code, condition_code, remedy_code, overlay_code, violation_equipment, violation_condition, violation_remedy, violation_note) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)";
+        "INSERT INTO audit_deficiencies (audit_uuid, section_counter, violation_device_id, equipment_code, condition_code, remedy_code, overlay_code, violation_equipment, violation_condition, violation_remedy, violation_note, resolved_at) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)";
 
     for (size_t i = 0; i < deficiencies->count; ++i) {
         const Deficiency *d = &deficiencies->items[i];
-        const char *params[11];
-        int lengths[11] = {0};
-        int formats[11] = {0};
+        const char *params[12];
+        int lengths[12] = {0};
+        int formats[12] = {0};
         char section_buf[32];
         snprintf(section_buf, sizeof(section_buf), "%d", d->section_counter);
+
+        char *key = build_deficiency_key(d->overlay_code, d->violation_device_id, d->violation_equipment, d->violation_condition, d->violation_remedy, d->violation_note);
+        const char *resolved_existing = resolved_map_get(&resolved_map, key);
+        free(key);
 
         params[0] = audit_uuid;
         params[1] = section_buf;
@@ -1916,18 +2039,22 @@ static int db_replace_deficiencies(PGconn *conn, const char *audit_uuid, const D
         params[8] = d->violation_condition;
         params[9] = d->violation_remedy;
         params[10] = d->violation_note;
+        params[11] = resolved_existing;
 
-        PGresult *res = PQexecParams(conn, insert_sql, 11, NULL, params, lengths, formats, 0);
+        PGresult *res = PQexecParams(conn, insert_sql, 12, NULL, params, lengths, formats, 0);
         if (PQresultStatus(res) != PGRES_COMMAND_OK) {
             if (error_out) {
                 const char *errmsg = PQresultErrorMessage(res);
                 *error_out = strdup(errmsg ? errmsg : "Failed inserting deficiency record");
             }
             PQclear(res);
+            resolved_map_clear(&resolved_map);
             return 0;
         }
         PQclear(res);
     }
+
+    resolved_map_clear(&resolved_map);
     return 1;
 }
 
@@ -2291,9 +2418,18 @@ static char *db_fetch_audit_list(PGconn *conn, char **error_out) {
     const char *sql =
         "SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)::text "
         "FROM ("
-        "  SELECT audit_uuid, building_address, building_owner, device_type, bank_name, city_id, submitted_on, updated_at "
-        "  FROM audits "
-        "  ORDER BY submitted_on DESC NULLS LAST "
+        "  SELECT "
+        "    a.audit_uuid,"
+        "    a.building_address,"
+        "    a.building_owner,"
+        "    a.device_type,"
+        "    a.bank_name,"
+        "    a.city_id,"
+        "    a.submitted_on,"
+        "    a.updated_at,"
+        "    COALESCE((SELECT COUNT(*) FROM audit_deficiencies d WHERE d.audit_uuid = a.audit_uuid AND d.resolved_at IS NULL), 0) AS deficiency_count "
+        "  FROM audits a "
+        "  ORDER BY a.submitted_on DESC NULLS LAST "
         "  LIMIT 100"
         ") t;";
     PGresult *res = PQexec(conn, sql);
@@ -2364,6 +2500,66 @@ static bool audit_exists(PGconn *conn, const char *uuid) {
     bool exists = PQntuples(res) > 0;
     PQclear(res);
     return exists;
+}
+
+static char *build_deficiency_key(const char *overlay_code, const char *device_id, const char *equipment, const char *condition, const char *remedy, const char *note) {
+    const char *parts[6] = {
+        overlay_code && overlay_code[0] ? overlay_code : "",
+        device_id && device_id[0] ? device_id : "",
+        equipment && equipment[0] ? equipment : "",
+        condition && condition[0] ? condition : "",
+        remedy && remedy[0] ? remedy : "",
+        note && note[0] ? note : ""
+    };
+    size_t total = 0;
+    for (size_t i = 0; i < 6; ++i) {
+        total += strlen(parts[i]);
+    }
+    total += 5; // delimiters
+    char *key = malloc(total + 1);
+    if (!key) {
+        return NULL;
+    }
+    snprintf(key, total + 1, "%s|%s|%s|%s|%s|%s",
+             parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]);
+    return key;
+}
+
+static bool db_update_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool resolved, char **resolved_at_out, char **error_out) {
+    const char *sql =
+        "UPDATE audit_deficiencies "
+        "SET resolved_at = CASE WHEN $3::boolean THEN COALESCE(resolved_at, NOW()) ELSE NULL END "
+        "WHERE audit_uuid = $1::uuid AND id = $2 "
+        "RETURNING resolved_at";
+    char id_buf[32];
+    snprintf(id_buf, sizeof(id_buf), "%ld", deficiency_id);
+    const char *params[3] = { uuid, id_buf, resolved ? "true" : "false" };
+    PGresult *res = PQexecParams(conn, sql, 3, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed updating deficiency");
+        }
+        PQclear(res);
+        return false;
+    }
+    if (PQntuples(res) == 0) {
+        PQclear(res);
+        if (error_out) {
+            *error_out = strdup("Deficiency not found");
+        }
+        return false;
+    }
+    if (resolved_at_out) {
+        if (PQgetisnull(res, 0, 0)) {
+            *resolved_at_out = NULL;
+        } else {
+            const char *value = PQgetvalue(res, 0, 0);
+            *resolved_at_out = value ? strdup(value) : NULL;
+        }
+    }
+    PQclear(res);
+    return true;
 }
 
 static void handle_get_request(int client_fd, PGconn *conn, const char *path) {
@@ -2635,6 +2831,158 @@ static void handle_client(int client_fd, PGconn *conn) {
                 } else {
                     serve_static_file(client_fd, path);
                 }
+                return;
+            }
+
+            if (strcmp(method, "PATCH") == 0) {
+                if (!is_api_path || strncmp(api_path, "/audits/", 8) != 0) {
+                    char *body = build_error_response("Not Found");
+                    send_http_json(client_fd, 404, "Not Found", body);
+                    free(body);
+                    return;
+                }
+
+                const char *rest = api_path + 8;
+                const char *slash = strchr(rest, '/');
+                if (!slash) {
+                    char *body = build_error_response("Invalid deficiency path");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    return;
+                }
+                size_t uuid_len = (size_t)(slash - rest);
+                if (uuid_len == 0 || uuid_len >= 64) {
+                    char *body = build_error_response("Invalid audit id");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    return;
+                }
+                char target_uuid[64];
+                memcpy(target_uuid, rest, uuid_len);
+                target_uuid[uuid_len] = '\0';
+                const char *def_path = slash;
+                if (strncmp(def_path, "/deficiencies/", 14) != 0) {
+                    char *body = build_error_response("Invalid deficiency path");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    return;
+                }
+                const char *id_part = def_path + 14;
+                if (*id_part == '\0') {
+                    char *body = build_error_response("Deficiency id required");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    return;
+                }
+                char *endptr = NULL;
+                long deficiency_id = strtol(id_part, &endptr, 10);
+                if (deficiency_id <= 0 || (endptr && *endptr != '\0')) {
+                    char *body = build_error_response("Invalid deficiency id");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    return;
+                }
+
+                long content_length = -1;
+                char *line = header_lines;
+                while (line && *line) {
+                    char *next = strstr(line, "\r\n");
+                    if (!next) break;
+                    if (next == line) {
+                        break;
+                    }
+                    size_t len = (size_t)(next - line);
+                    if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
+                        const char *value = line + 15;
+                        while (*value == ' ' || *value == '\t') value++;
+                        content_length = strtol(value, NULL, 10);
+                    }
+                    line = next + 2;
+                }
+                if (content_length < 0 || content_length > 65536) {
+                    char *body = build_error_response("Invalid request body length");
+                    send_http_json(client_fd, 411, "Length Required", body);
+                    free(body);
+                    return;
+                }
+
+                char *body_json = malloc((size_t)content_length + 1);
+                if (!body_json) {
+                    char *body = build_error_response("Out of memory");
+                    send_http_json(client_fd, 500, "Internal Server Error", body);
+                    free(body);
+                    return;
+                }
+                size_t offset = 0;
+                if (leftover > 0) {
+                    size_t copy_len = leftover > (size_t)content_length ? (size_t)content_length : leftover;
+                    memcpy(body_json, end_ptr + 4, copy_len);
+                    offset += copy_len;
+                }
+                while ((long)offset < content_length) {
+                    ssize_t read_bytes = recv(client_fd, body_json + offset, (size_t)content_length - offset, 0);
+                    if (read_bytes <= 0) {
+                        free(body_json);
+                        char *body = build_error_response("Unexpected end of stream");
+                        send_http_json(client_fd, 400, "Bad Request", body);
+                        free(body);
+                        return;
+                    }
+                    offset += (size_t)read_bytes;
+                }
+                body_json[content_length] = '\0';
+
+                char *resolved_field = strstr(body_json, "\"resolved\"");
+                bool resolved = false;
+                bool resolved_set = false;
+                if (resolved_field) {
+                    char *colon = strchr(resolved_field, ':');
+                    if (colon) {
+                        char *ptr = colon + 1;
+                        while (*ptr == ' ' || *ptr == '\t' || *ptr == '\r' || *ptr == '\n') ptr++;
+                        if (strncmp(ptr, "true", 4) == 0) {
+                            resolved = true;
+                            resolved_set = true;
+                        } else if (strncmp(ptr, "false", 5) == 0) {
+                            resolved = false;
+                            resolved_set = true;
+                        }
+                    }
+                }
+                if (!resolved_set) {
+                    free(body_json);
+                    char *body = build_error_response("Missing resolved flag");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    return;
+                }
+
+                char *resolved_at = NULL;
+                char *update_error = NULL;
+                bool success = db_update_deficiency_status(conn, target_uuid, deficiency_id, resolved, &resolved_at, &update_error);
+                free(body_json);
+                if (!success) {
+                    int status = 500;
+                    if (update_error && strcmp(update_error, "Deficiency not found") == 0) {
+                        status = 404;
+                    }
+                    char *body = build_error_response(update_error ? update_error : "Update failed");
+                    send_http_json(client_fd, status, status == 404 ? "Not Found" : "Internal Server Error", body);
+                    free(body);
+                    free(update_error);
+                    free(resolved_at);
+                    return;
+                }
+                free(update_error);
+
+                char response[256];
+                if (resolved_at) {
+                    snprintf(response, sizeof(response), "{\"status\":\"ok\",\"resolved\":%s,\"resolved_at\":\"%s\"}", resolved ? "true" : "false", resolved_at);
+                } else {
+                    snprintf(response, sizeof(response), "{\"status\":\"ok\",\"resolved\":%s,\"resolved_at\":null}", resolved ? "true" : "false");
+                }
+                free(resolved_at);
+                send_http_json(client_fd, 200, "OK", response);
                 return;
             }
 

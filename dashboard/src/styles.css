@@ -182,6 +182,21 @@ tbody tr:hover {
   outline-offset: 2px;
 }
 
+.deficiency-count {
+  font-weight: 600;
+  color: rgba(226, 232, 240, 0.85);
+  margin-right: 0.5rem;
+}
+
+.deficiency-indicator {
+  display: inline-block;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: #f97316;
+  box-shadow: 0 0 8px rgba(249, 115, 22, 0.6);
+}
+
 .status-pill {
   border-radius: 999px;
   padding: 0.25rem 0.75rem;
@@ -344,6 +359,29 @@ tbody tr:hover {
   justify-content: center;
   padding: 2rem;
   z-index: 1000;
+}
+
+.deficiency-row.resolved {
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.deficiency-row.resolved td {
+  color: rgba(226, 232, 240, 0.85);
+}
+
+.deficiency-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.status-pill.resolved {
+  background: rgba(34, 197, 94, 0.2);
+  color: #34d399;
+}
+
+.status-pill.open {
+  background: rgba(248, 113, 113, 0.2);
+  color: #f87171;
 }
 
 .photo-modal-content {
