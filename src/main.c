@@ -6674,6 +6674,7 @@ static void handle_client(int client_fd, PGconn *conn) {
                     free(body);
                     return;
                 }
+                log_info("/reports content-length=%ld leftover=%zu", content_length, leftover);
                 size_t offset = 0;
                 if (leftover > 0) {
                     size_t copy_len = leftover > (size_t)content_length ? (size_t)content_length : leftover;
