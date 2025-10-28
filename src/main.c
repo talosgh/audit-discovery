@@ -6696,6 +6696,11 @@ static void handle_client(int client_fd, PGconn *conn) {
                 char *parse_error = NULL;
                 JsonValue *root = json_parse(body_json, &parse_error);
                 if (!root || root->type != JSON_OBJECT) {
+                    const char *reason = parse_error ? parse_error : "parser returned non-object";
+                    log_error("/reports payload parse failure: %s", reason);
+                    if (body_json) {
+                        log_error("/reports raw payload: %.*s", (int)content_length, body_json);
+                    }
                     free(body_json);
                     char *body = build_error_response("Invalid JSON payload");
                     send_http_json(client_fd, 400, "Bad Request", body);
