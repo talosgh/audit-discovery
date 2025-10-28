@@ -1,15 +1,19 @@
-import { A, useParams } from '@solidjs/router';
-import { Component, For, Match, Show, Switch, createMemo, createResource } from 'solid-js';
+import type { Component } from 'solid-js';
+import { For, Match, Show, Switch, createMemo, createResource } from 'solid-js';
 import { fetchAuditDetail } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
 import type { AuditDetailResponse, Deficiency, PhotoAsset } from '../types';
 import { dataUrl, formatArray, formatBoolean, formatDateTime, formatNumber } from '../utils';
 
-const AuditDetail: Component = () => {
-  const params = useParams();
+interface AuditDetailProps {
+  auditId: string;
+  onBack(): void;
+}
+
+const AuditDetail: Component<AuditDetailProps> = (props) => {
   const [auditDetail, { refetch }] = createResource<AuditDetailResponse, string>(
-    () => params.id,
+    () => props.auditId,
     fetchAuditDetail
   );
 
@@ -21,14 +25,16 @@ const AuditDetail: Component = () => {
     <section class="page-section" aria-live="polite">
       <div class="section-header">
         <div>
-          <A href="/" class="back-link">← Back to list</A>
+          <button type="button" class="action-button back-link" onClick={props.onBack}>
+            ← Back to list
+          </button>
           <h1 style={{ margin: '0.75rem 0 0' }}>{audit()?.building_address ?? 'Audit detail'}</h1>
           <p class="section-subtitle">
             Explore the captured metadata, maintenance notes, deficiencies, and media attached to this elevator audit.
           </p>
         </div>
         <div class="section-actions">
-          <button type="button" class="refresh-button" onClick={() => refetch()}>
+          <button type="button" class="action-button refresh-button" onClick={() => refetch()}>
             Refresh
           </button>
         </div>

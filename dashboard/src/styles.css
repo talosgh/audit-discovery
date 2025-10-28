@@ -34,10 +34,13 @@ body {
 }
 
 .brand {
+  background: none;
+  border: none;
   font-size: 1.25rem;
   font-weight: 700;
   color: #38bdf8;
   text-decoration: none;
+  cursor: pointer;
 }
 
 .nav-links {
@@ -45,16 +48,18 @@ body {
   gap: 1rem;
 }
 
-.nav-links a {
+.nav-links button {
+  background: none;
+  border: none;
   color: #cbd5f5;
-  text-decoration: none;
   padding: 0.5rem 0.75rem;
   border-radius: 6px;
   transition: background 0.2s ease, color 0.2s ease;
+  cursor: pointer;
 }
 
-.nav-links a:hover,
-.nav-links a.active {
+.nav-links button:hover,
+.nav-links button.active {
   background: rgba(56, 189, 248, 0.15);
   color: #38bdf8;
 }
@@ -116,9 +121,7 @@ input[type='search']::placeholder {
   color: rgba(148, 163, 184, 0.6);
 }
 
-button,
-.refresh-button,
-.back-link {
+.action-button {
   border: none;
   border-radius: 10px;
   padding: 0.6rem 1.1rem;
@@ -133,9 +136,7 @@ button,
   gap: 0.4rem;
 }
 
-button:hover,
-.refresh-button:hover,
-.back-link:hover {
+.action-button:hover {
   transform: translateY(-1px);
   box-shadow: 0 10px 20px rgba(37, 99, 235, 0.35);
 }

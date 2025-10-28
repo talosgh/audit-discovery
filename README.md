@@ -176,3 +176,4 @@ Routes:
 Production builds emit to `dashboard/dist/` via Vite.
 
 When hosting both API and UI on the same domain (e.g., `audit-webhook.citywideportal.io`), serve the static bundle at the root path and forward `/webhook/*` to the webhook container so browser requests hit `/webhook/audits…` transparently.
+The dashboard uses the History API, so ensure that all non-API routes (e.g., `/audits/<id>`) fall back to `index.html` when served by your reverse proxy.

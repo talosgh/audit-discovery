@@ -1,15 +1,18 @@
-import { useNavigate } from '@solidjs/router';
-import { Component, For, Match, Show, Switch, createMemo, createResource, createSignal } from 'solid-js';
+import type { Component } from 'solid-js';
+import { For, Match, Show, Switch, createMemo, createResource, createSignal } from 'solid-js';
 import { fetchAudits } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
 import { formatDateTime } from '../utils';
 import type { AuditSummary } from '../types';
 
-const AuditList: Component = () => {
+interface AuditListProps {
+  onSelect(id: string): void;
+}
+
+const AuditList: Component<AuditListProps> = (props) => {
   const [search, setSearch] = createSignal('');
   const [audits, { refetch }] = createResource(fetchAudits);
-  const navigate = useNavigate();
 
   const filteredAudits = createMemo(() => {
     const list = audits() ?? [];
@@ -48,7 +51,7 @@ const AuditList: Component = () => {
             onInput={handleSearchInput}
             autoFocus
           />
-          <button type="button" class="refresh-button" onClick={() => refetch()}>
+          <button type="button" class="action-button refresh-button" onClick={() => refetch()}>
             Refresh
           </button>
         </div>
@@ -86,11 +89,11 @@ const AuditList: Component = () => {
                       role="link"
                       tabIndex={0}
                       aria-label={`View audit ${audit.building_address ?? audit.audit_uuid}`}
-                      onClick={() => navigate(`/audits/${audit.audit_uuid}`)}
+                      onClick={() => props.onSelect(audit.audit_uuid)}
                       onKeyDown={(event) => {
                         if (event.key === 'Enter' || event.key === ' ') {
                           event.preventDefault();
-                          navigate(`/audits/${audit.audit_uuid}`);
+                          props.onSelect(audit.audit_uuid);
                         }
                       }}
                     >

@@ -3,6 +3,7 @@
 FROM node:20-bullseye-slim AS ui-build
 WORKDIR /dashboard
 COPY dashboard/package.json ./
+COPY dashboard/package-lock.json ./
 RUN npm install
 COPY dashboard/ ./
 RUN npm run build

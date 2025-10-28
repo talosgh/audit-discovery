@@ -5,10 +5,7 @@ const rawPath = import.meta.env.VITE_API_PATH?.trim() ?? '/webhook';
 
 const API_BASE = rawBase.replace(/\/$/, '');
 
-let normalizedPath = rawPath;
-if (normalizedPath === '') {
-  normalizedPath = '/webhook';
-}
+let normalizedPath = rawPath === '' ? '/webhook' : rawPath;
 if (!normalizedPath.startsWith('/')) {
   normalizedPath = `/${normalizedPath}`;
 }
@@ -16,8 +13,9 @@ normalizedPath = normalizedPath.replace(/\/$/, '');
 const API_PATH = normalizedPath === '/' ? '' : normalizedPath;
 
 function buildUrl(path: string): string {
-  const endpoint = `${API_BASE}${API_PATH}${path}`;
-  return endpoint.replace('//', '/').replace(':/', '://');
+  const segments = [API_BASE, API_PATH, path].filter((segment) => segment && segment.length > 0);
+  const joined = segments.join('');
+  return joined.replace(/([^:]\/)(\/)+/g, '$1');
 }
 
 async function fetchJSON<T>(path: string): Promise<T> {
