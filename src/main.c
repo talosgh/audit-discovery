@@ -5057,7 +5057,7 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
         goto cleanup;
     }
 
-    const char *system_prompt = "You are an expert vertical transportation safety consultant. Provide concise, professional narrative text suitable for a building owner. Do not include LaTeX syntax or markdown.";
+    const char *system_prompt = "You are an expert vertical transportation safety consultant. Provide concise, professional narrative text suitable for a building owner. Use plain ASCII punctuation (no smart quotes or em dashes). Do not include LaTeX syntax or markdown.";
 
     struct {
         const char *title;
@@ -6126,7 +6126,13 @@ static int build_report_latex(const ReportData *report,
     }
 
     if (!buffer_appendf(&buf,
-        "\\begin{center}\n{\\Large\\textbf{Audit Report}}\\[0.6em]\n%s\\\\\\[0.4em]\n{\\normalsize %s}\\[1em]\n\\end{center}\n\\hrule\\n\\vspace{1em}\n",
+        "\\begin{center}\n"
+        "{\\Large\\textbf{Audit Report}}\\[0.6em]\n"
+        "%s\\\\[0.4em]\n"
+        "{\\normalsize %s}\\[1em]\n"
+        "\\end{center}\n"
+        "\\hrule\n"
+        "\\vspace{1em}\n",
         address_tex,
         date_range_tex)) {
         goto cleanup;
@@ -6247,7 +6253,7 @@ static int build_report_latex(const ReportData *report,
         if (!buffer_appendf(&buf, "Maintenance Log Up to Date & %s \\\\ \n", maint_tex)) goto device_cleanup;
         if (!buffer_append_cstr(&buf, "\\end{tabular}\n\n")) goto device_cleanup;
 
-        if (!buffer_appendf(&buf, "\\textbf{General Notes:}~%s\\[0.5em]\n", general_notes_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "\\textbf{General Notes:}~%s\\\\[0.5em]\n", general_notes_tex)) goto device_cleanup;
 
         size_t deficiency_count = device->deficiencies.count;
         if (deficiency_count == 0) {
@@ -6276,7 +6282,7 @@ static int build_report_latex(const ReportData *report,
                 }
                 free(equipment_tex); free(condition_tex); free(remedy_tex); free(note_tex); free(status_tex);
             }
-            if (!buffer_append_cstr(&buf, "\\bottomrule\\n\\end{tabularx}\\n\\n")) goto device_cleanup;
+            if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabularx}\n\n")) goto device_cleanup;
         }
 
 device_cleanup:
@@ -6289,6 +6295,58 @@ device_cleanup:
             goto cleanup;
         }
     }
+
+    if (!buffer_append_cstr(&buf, "\\section*{Location Deficiencies Overview}\n")) goto cleanup;
+
+    bool any_rows = false;
+    if (!buffer_append_cstr(&buf,
+        "\\begin{tabularx}{\\textwidth}{p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} X}\\toprule\n"
+        "Device & Equipment & Condition & Remedy & Note (Status) \\\\ \\midrule\n")) goto cleanup;
+
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        ReportDevice *device = &report->devices.items[i];
+        if (device->deficiencies.count == 0) {
+            continue;
+        }
+        char *device_id_tex = latex_escape(device->device_id ? device->device_id : (device->submission_id ? device->submission_id : device->audit_uuid));
+        if (!device_id_tex) goto cleanup;
+        for (size_t j = 0; j < device->deficiencies.count; ++j) {
+            ReportDeficiency *def = &device->deficiencies.items[j];
+            char *equip_tex = latex_escape(def->equipment ? def->equipment : "—");
+            char *cond_tex = latex_escape(def->condition ? def->condition : "—");
+            char *remedy_tex = latex_escape(def->remedy ? def->remedy : "—");
+            const char *note_src = def->note ? def->note : "—";
+            const char *status_text = (def->resolved.has_value && def->resolved.value) ? "Closed" : "Open";
+            char *note_augmented = NULL;
+            if (asprintf(&note_augmented, "%s%s(Status: %s)",
+                         (note_src && note_src[0]) ? note_src : "—",
+                         (note_src && note_src[0]) ? " " : "",
+                         status_text) < 0) {
+                free(device_id_tex);
+                free(equip_tex); free(cond_tex); free(remedy_tex);
+                goto cleanup;
+            }
+            char *note_tex = latex_escape(note_augmented);
+            free(note_augmented);
+            if (!equip_tex || !cond_tex || !remedy_tex || !note_tex) {
+                free(device_id_tex);
+                free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
+                goto cleanup;
+            }
+            if (!buffer_appendf(&buf, "%s & %s & %s & %s & %s \\\\ \n", device_id_tex, equip_tex, cond_tex, remedy_tex, note_tex)) {
+                free(device_id_tex); free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
+                goto cleanup;
+            }
+            free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
+            any_rows = true;
+        }
+        free(device_id_tex);
+    }
+
+    if (!any_rows) {
+        if (!buffer_append_cstr(&buf, "\\multicolumn{5}{c}{No deficiencies recorded.}\\\\\n")) goto cleanup;
+    }
+    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabularx}\n\n")) goto cleanup;
 
     if (!buffer_append_cstr(&buf, "\\end{document}\n")) {
         goto cleanup;
