@@ -1,0 +1,13 @@
+.git
+.gitignore
+Dockerfile
+.github/
+audit_webhook
+*.o
+build/
+dist/
+extracted/
+*.zip
+.env
+.env.*
+*.env

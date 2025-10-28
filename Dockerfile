@@ -7,7 +7,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY Makefile README.md sql src ./
+COPY Makefile README.md env.example ./
+COPY src/ src/
+COPY sql/ sql/
 RUN make && strip audit_webhook
 
 FROM debian:bookworm-slim AS runtime
