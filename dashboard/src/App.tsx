@@ -1,4 +1,4 @@
-import { Router, Routes, Route, A } from '@solidjs/router';
+import { Router, Route, A } from '@solidjs/router';
 import AuditList from './routes/AuditList';
 import AuditDetail from './routes/AuditDetail';
 
@@ -15,10 +15,8 @@ const App = () => {
           </nav>
         </header>
         <main class="app-main">
-          <Routes>
-            <Route path="/" component={AuditList} />
-            <Route path="/audits/:id" component={AuditDetail} />
-          </Routes>
+          <Route path="/" component={AuditList} />
+          <Route path="/audits/:id" component={AuditDetail} />
         </main>
       </div>
     </Router>
