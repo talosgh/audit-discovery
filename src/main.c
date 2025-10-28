@@ -211,6 +211,7 @@ static char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_
 static void serve_static_file(int client_fd, const char *path);
 static const char *mime_type_for(const char *path);
 static bool path_is_safe(const char *path);
+static bool audit_exists(PGconn *conn, const char *uuid);
 
 static void log_error(const char *fmt, ...) {
     va_list args;
@@ -2116,6 +2117,11 @@ static int process_zip_file(const char *zip_path, PGconn *conn, StringArray *pro
             return 0;
         }
 
+        bool existed_before = audit_exists(conn, record.audit_uuid);
+        if (existed_before) {
+            log_info("Audit %s already exists; overwriting with new data", record.audit_uuid);
+        }
+
         char *upsert_error = NULL;
         if (!db_upsert_audit(conn, &record, &photos, &photo_order, &deficiency_list, &upsert_error)) {
             if (upsert_error) {
@@ -2341,6 +2347,23 @@ static char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_
     char *json = strdup(value ? value : "{}");
     PQclear(res);
     return json;
+}
+
+static bool audit_exists(PGconn *conn, const char *uuid) {
+    if (!uuid || !*uuid) {
+        return false;
+    }
+    const char *sql = "SELECT 1 FROM audits WHERE audit_uuid = $1::uuid LIMIT 1";
+    const char *params[1] = { uuid };
+    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        log_error("Failed to check for existing audit %s: %s", uuid, PQresultErrorMessage(res));
+        PQclear(res);
+        return false;
+    }
+    bool exists = PQntuples(res) > 0;
+    PQclear(res);
+    return exists;
 }
 
 static void handle_get_request(int client_fd, PGconn *conn, const char *path) {
