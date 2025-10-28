@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libpq-dev \
     libcurl4-openssl-dev \
+    ca-certificates \
     unzip \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
@@ -25,6 +26,7 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     libcurl4 \
+    ca-certificates \
     texlive-latex-recommended \
     texlive-fonts-recommended \
     texlive-latex-extra \
