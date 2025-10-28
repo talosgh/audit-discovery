@@ -444,6 +444,7 @@ static void narrative_set_clear(NarrativeSet *set);
 static int build_report_latex(const ReportData *report, const NarrativeSet *narratives, const ReportJob *job, const char *output_path, char **error_out);
 static int run_pdflatex(const char *working_dir, const char *tex_filename, char **error_out);
 static char *latex_escape(const char *text);
+static char *sanitize_ascii(const char *text);
 
 static void log_error(const char *fmt, ...) {
     va_list args;
@@ -1340,6 +1341,84 @@ static int buffer_append_string_array(Buffer *buf, const StringArray *array) {
     }
     if (!buffer_append_char(buf, ']')) return 0;
     return 1;
+}
+
+static const char *const CP1252_REPLACEMENTS[32] = {
+    "EUR",  NULL,   ",",    "f",    "\"",   "...",  "+",    "++",
+    "^",    "%",    "S",    "<",    "OE",   NULL,   "Z",    NULL,
+    NULL,   "'",    "'",    "\"",   "--",   "*",    "-",    "--",
+    "~",    "(TM)", "s",    ">",    "oe",   NULL,   "z",    "Y"
+};
+
+static char *sanitize_ascii(const char *text) {
+    if (!text) return NULL;
+    size_t len = strlen(text);
+    char *out = malloc(len * 4 + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t o = 0;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '\r') {
+            continue;
+        }
+        if (c < 0x80) {
+            if (c >= 0x20 || c == '\n' || c == '\t') {
+                out[o++] = (char)c;
+            }
+            continue;
+        }
+        if ((c & 0xE0) == 0xC0 && i + 1 < len) {
+            unsigned char c1 = (unsigned char)text[i + 1];
+            if ((c1 & 0xC0) == 0x80) {
+                out[o++] = (char)c;
+                out[o++] = (char)c1;
+                i += 1;
+                continue;
+            }
+        }
+        if ((c & 0xF0) == 0xE0 && i + 2 < len) {
+            unsigned char c1 = (unsigned char)text[i + 1];
+            unsigned char c2 = (unsigned char)text[i + 2];
+            if (((c1 & 0xC0) == 0x80) && ((c2 & 0xC0) == 0x80)) {
+                out[o++] = (char)c;
+                out[o++] = (char)c1;
+                out[o++] = (char)c2;
+                i += 2;
+                continue;
+            }
+        }
+        if ((c & 0xF8) == 0xF0 && i + 3 < len) {
+            unsigned char c1 = (unsigned char)text[i + 1];
+            unsigned char c2 = (unsigned char)text[i + 2];
+            unsigned char c3 = (unsigned char)text[i + 3];
+            if (((c1 & 0xC0) == 0x80) && ((c2 & 0xC0) == 0x80) && ((c3 & 0xC0) == 0x80)) {
+                out[o++] = (char)c;
+                out[o++] = (char)c1;
+                out[o++] = (char)c2;
+                out[o++] = (char)c3;
+                i += 3;
+                continue;
+            }
+        }
+        if (c >= 0x80 && c <= 0x9F) {
+            const char *replacement = CP1252_REPLACEMENTS[c - 0x80];
+            if (replacement) {
+                size_t rlen = strlen(replacement);
+                memcpy(out + o, replacement, rlen);
+                o += rlen;
+            }
+            continue;
+        }
+        out[o++] = '?';
+    }
+    out[o] = '\0';
+    char *shrunk = realloc(out, o + 1);
+    if (shrunk) {
+        out = shrunk;
+    }
+    return out;
 }
 
 static char *build_location_detail_json(const ReportData *report) {
@@ -5920,6 +5999,12 @@ static int generate_grok_completion(const char *system_prompt, const char *user_
         return 0;
     }
 
+    char *sanitized = sanitize_ascii(content_copy);
+    if (sanitized) {
+        free(content_copy);
+        content_copy = sanitized;
+    }
+
     *response_out = content_copy;
     return 1;
 }
@@ -6033,8 +6118,13 @@ static int append_narrative_section(Buffer *buf, const char *title, const char *
     if (!buf || !title) {
         return 0;
     }
-    char *title_tex = latex_escape(title);
-    char *body_tex = latex_escape(content && content[0] ? content : "Narrative unavailable.");
+    char *title_clean = sanitize_ascii(title);
+    char *title_tex = latex_escape(title_clean ? title_clean : (title ? title : ""));
+    free(title_clean);
+    const char *body_source = (content && content[0]) ? content : "Narrative unavailable.";
+    char *body_clean = sanitize_ascii(body_source);
+    char *body_tex = latex_escape(body_clean ? body_clean : body_source);
+    free(body_clean);
     if (!title_tex || !body_tex) {
         free(title_tex);
         free(body_tex);
@@ -6073,10 +6163,24 @@ static int build_report_latex(const ReportData *report,
     int success = 0;
 
     const char *address_src = report->summary.building_address ? report->summary.building_address : job->address;
-    char *address_tex = latex_escape(address_src ? address_src : "Unknown address");
-    char *owner_tex = latex_escape(report->summary.building_owner ? report->summary.building_owner : "Unknown owner");
-    char *contractor_tex = latex_escape(report->summary.elevator_contractor ? report->summary.elevator_contractor : "Unknown contractor");
-    char *city_tex = latex_escape(report->summary.city_id ? report->summary.city_id : "—");
+    char *address_clean = sanitize_ascii(address_src);
+    char *address_tex = latex_escape(address_clean ? address_clean : (address_src ? address_src : "Unknown address"));
+    free(address_clean);
+
+    const char *owner_src = report->summary.building_owner ? report->summary.building_owner : "Unknown owner";
+    char *owner_clean = sanitize_ascii(owner_src);
+    char *owner_tex = latex_escape(owner_clean ? owner_clean : owner_src);
+    free(owner_clean);
+
+    const char *contractor_src = report->summary.elevator_contractor ? report->summary.elevator_contractor : "Unknown contractor";
+    char *contractor_clean = sanitize_ascii(contractor_src);
+    char *contractor_tex = latex_escape(contractor_clean ? contractor_clean : contractor_src);
+    free(contractor_clean);
+
+    const char *city_src = report->summary.city_id ? report->summary.city_id : "—";
+    char *city_clean = sanitize_ascii(city_src);
+    char *city_tex = latex_escape(city_clean ? city_clean : city_src);
+    free(city_clean);
 
     char date_range_buf[256];
     if (report->summary.audit_range.start && report->summary.audit_range.end) {
@@ -6180,9 +6284,15 @@ static int build_report_latex(const ReportData *report,
         char *controller_manufacturer_tex = latex_escape(device->controller_manufacturer ? device->controller_manufacturer : "—");
         char *controller_model_tex = latex_escape(device->controller_model ? device->controller_model : "—");
         char *machine_type_tex = latex_escape(device->machine_type ? device->machine_type : "—");
-        char *general_notes_tex = latex_escape(device->general_notes ? device->general_notes : "No general notes.");
+        const char *general_source = (device->general_notes && device->general_notes[0]) ? device->general_notes : "No general notes.";
+        char *general_clean = sanitize_ascii(general_source);
+        char *general_notes_tex = latex_escape(general_clean ? general_clean : general_source);
+        free(general_clean);
         char *floors_join = string_array_join(&device->floors_served, ", ");
-        char *floors_tex = latex_escape(floors_join ? floors_join : "—");
+        const char *floors_src = floors_join ? floors_join : "—";
+        char *floors_clean = sanitize_ascii(floors_src);
+        char *floors_tex = latex_escape(floors_clean ? floors_clean : floors_src);
+        free(floors_clean);
         free(floors_join);
 
         char int_buffer[64];
@@ -6253,7 +6363,7 @@ static int build_report_latex(const ReportData *report,
         if (!buffer_appendf(&buf, "Maintenance Log Up to Date & %s \\\\ \n", maint_tex)) goto device_cleanup;
         if (!buffer_append_cstr(&buf, "\\end{tabular}\n\n")) goto device_cleanup;
 
-        if (!buffer_appendf(&buf, "\\textbf{General Notes:}~%s\\\\[0.5em]\n", general_notes_tex)) goto device_cleanup;
+        if (!buffer_appendf(&buf, "\\textbf{General Notes:}~%s\\\\\\\\[0.5em]\n", general_notes_tex)) goto device_cleanup;
 
         size_t deficiency_count = device->deficiencies.count;
         if (deficiency_count == 0) {
@@ -6265,10 +6375,22 @@ static int build_report_latex(const ReportData *report,
 
             for (size_t j = 0; j < deficiency_count; ++j) {
                 ReportDeficiency *def = &device->deficiencies.items[j];
-                char *equipment_tex = latex_escape(def->equipment ? def->equipment : "—");
-                char *condition_tex = latex_escape(def->condition ? def->condition : "—");
-                char *remedy_tex = latex_escape(def->remedy ? def->remedy : "—");
-                char *note_tex = latex_escape(def->note ? def->note : "—");
+                const char *equip_src = def->equipment ? def->equipment : "—";
+                const char *cond_src = def->condition ? def->condition : "—";
+                const char *remedy_src = def->remedy ? def->remedy : "—";
+                const char *note_src = def->note ? def->note : "—";
+                char *equip_clean = sanitize_ascii(equip_src);
+                char *cond_clean = sanitize_ascii(cond_src);
+                char *remedy_clean = sanitize_ascii(remedy_src);
+                char *note_clean = sanitize_ascii(note_src);
+                char *equipment_tex = latex_escape(equip_clean ? equip_clean : equip_src);
+                char *condition_tex = latex_escape(cond_clean ? cond_clean : cond_src);
+                char *remedy_tex = latex_escape(remedy_clean ? remedy_clean : remedy_src);
+                char *note_tex = latex_escape(note_clean ? note_clean : note_src);
+                free(equip_clean);
+                free(cond_clean);
+                free(remedy_clean);
+                free(note_clean);
                 const char *status_text = (def->resolved.has_value && def->resolved.value) ? "Closed" : "Open";
                 char *status_tex = latex_escape(status_text);
                 if (!equipment_tex || !condition_tex || !remedy_tex || !note_tex || !status_tex) {
@@ -6308,25 +6430,44 @@ device_cleanup:
         if (device->deficiencies.count == 0) {
             continue;
         }
-        char *device_id_tex = latex_escape(device->device_id ? device->device_id : (device->submission_id ? device->submission_id : device->audit_uuid));
+        const char *device_id_src = device->device_id ? device->device_id : (device->submission_id ? device->submission_id : device->audit_uuid);
+        char *device_id_clean = sanitize_ascii(device_id_src);
+        char *device_id_tex = latex_escape(device_id_clean ? device_id_clean : (device_id_src ? device_id_src : "Device"));
+        free(device_id_clean);
         if (!device_id_tex) goto cleanup;
         for (size_t j = 0; j < device->deficiencies.count; ++j) {
             ReportDeficiency *def = &device->deficiencies.items[j];
-            char *equip_tex = latex_escape(def->equipment ? def->equipment : "—");
-            char *cond_tex = latex_escape(def->condition ? def->condition : "—");
-            char *remedy_tex = latex_escape(def->remedy ? def->remedy : "—");
+            const char *equip_src = def->equipment ? def->equipment : "—";
+            const char *cond_src = def->condition ? def->condition : "—";
+            const char *remedy_src = def->remedy ? def->remedy : "—";
             const char *note_src = def->note ? def->note : "—";
+            char *equip_clean = sanitize_ascii(equip_src);
+            char *cond_clean = sanitize_ascii(cond_src);
+            char *remedy_clean = sanitize_ascii(remedy_src);
+            char *equip_tex = latex_escape(equip_clean ? equip_clean : equip_src);
+            char *cond_tex = latex_escape(cond_clean ? cond_clean : cond_src);
+            char *remedy_tex = latex_escape(remedy_clean ? remedy_clean : remedy_src);
+            free(equip_clean);
+            free(cond_clean);
+            free(remedy_clean);
             const char *status_text = (def->resolved.has_value && def->resolved.value) ? "Closed" : "Open";
-            char *note_augmented = NULL;
-            if (asprintf(&note_augmented, "%s%s(Status: %s)",
-                         (note_src && note_src[0]) ? note_src : "—",
-                         (note_src && note_src[0]) ? " " : "",
-                         status_text) < 0) {
+            size_t note_len = note_src ? strlen(note_src) : 0;
+            size_t status_len = strlen(status_text);
+            size_t total = (note_len ? note_len + 10 : 8) + status_len + 1;
+            char *note_augmented = malloc(total);
+            if (!note_augmented) {
                 free(device_id_tex);
                 free(equip_tex); free(cond_tex); free(remedy_tex);
                 goto cleanup;
             }
-            char *note_tex = latex_escape(note_augmented);
+            if (note_len) {
+                snprintf(note_augmented, total, "%s (Status: %s)", note_src, status_text);
+            } else {
+                snprintf(note_augmented, total, "Status: %s", status_text);
+            }
+            char *note_clean = sanitize_ascii(note_augmented);
+            char *note_tex = latex_escape(note_clean ? note_clean : note_augmented);
+            free(note_clean);
             free(note_augmented);
             if (!equip_tex || !cond_tex || !remedy_tex || !note_tex) {
                 free(device_id_tex);
