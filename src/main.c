@@ -417,6 +417,7 @@ static void narrative_set_init(NarrativeSet *set);
 static void narrative_set_clear(NarrativeSet *set);
 static int build_report_latex(const ReportData *report, const NarrativeSet *narratives, const ReportJob *job, const char *output_path, char **error_out);
 static int run_pdflatex(const char *working_dir, const char *tex_filename, char **error_out);
+static void normalize_heading_text(char *text);
 static bool read_request_body(int client_fd,
                               const char *header_lines,
                               char *body_start,
@@ -6411,25 +6412,63 @@ static int append_narrative_block(Buffer *buf, const char *content) {
             hash_count++;
         }
         if (hash_count > 0 && (p[hash_count] == ' ' || p[hash_count] == '\t')) {
-            if (in_list) {
-                ok = buffer_append_cstr(buf, "\\end{itemize}\n\n");
-                in_list = false;
+            const char *heading_start = trimmed + hash_count;
+            while (*heading_start == ' ' || *heading_start == '\t') {
+                heading_start++;
             }
-            if (ok) {
-                const char *heading_start = p + hash_count;
-                while (*heading_start == ' ' || *heading_start == '\t') {
-                    heading_start++;
+            if (hash_count >= 3) {
+                if (!in_list) {
+                    ok = buffer_append_cstr(buf, "\\begin{itemize}\n");
+                    in_list = true;
                 }
-                if (*heading_start != '\0') {
-                    char *escaped = latex_escape_with_markdown(heading_start);
-                    if (!escaped) {
+                if (ok && *heading_start != '\0') {
+                    char *heading_buf = sanitize_ascii(heading_start);
+                    if (!heading_buf) {
+                        heading_buf = strdup(heading_start);
+                    }
+                    if (!heading_buf) {
                         ok = false;
                     } else {
-                        const char *format = (hash_count == 1)
-                            ? "\\subsection*{%s}\n\n"
-                            : "\\subsubsection*{%s}\n\n";
-                        ok = buffer_appendf(buf, format, escaped);
-                        free(escaped);
+                        normalize_heading_text(heading_buf);
+                        if (heading_buf[0] != '\0') {
+                            char *escaped = latex_escape(heading_buf);
+                            if (!escaped) {
+                                ok = false;
+                            } else {
+                                ok = buffer_appendf(buf, "  \\item \\textbf{%s}\n", escaped);
+                                free(escaped);
+                            }
+                        }
+                        free(heading_buf);
+                    }
+                }
+            } else {
+                if (in_list) {
+                    ok = buffer_append_cstr(buf, "\\end{itemize}\n\n");
+                    in_list = false;
+                }
+                if (ok && *heading_start != '\0') {
+                    char *heading_buf = sanitize_ascii(heading_start);
+                    if (!heading_buf) {
+                        heading_buf = strdup(heading_start);
+                    }
+                    if (!heading_buf) {
+                        ok = false;
+                    } else {
+                        normalize_heading_text(heading_buf);
+                        if (heading_buf[0] != '\0') {
+                            char *escaped = latex_escape_with_markdown(heading_buf);
+                            if (!escaped) {
+                                ok = false;
+                            } else {
+                                const char *format = (hash_count == 1)
+                                    ? "\\subsection*{%s}\n\n"
+                                    : "\\subsubsection*{%s}\n\n";
+                                ok = buffer_appendf(buf, format, escaped);
+                                free(escaped);
+                            }
+                        }
+                        free(heading_buf);
                     }
                 }
             }
@@ -6524,6 +6563,45 @@ static void narrative_task_execute(NarrativeTask *task) {
     }
     *(task->slot) = response;
     task->success = 1;
+}
+
+static void normalize_heading_text(char *text) {
+    if (!text) {
+        return;
+    }
+    size_t len = strlen(text);
+    while (len > 0 && isspace((unsigned char)text[len - 1])) {
+        text[--len] = '\0';
+    }
+    size_t start = 0;
+    while (text[start] && isspace((unsigned char)text[start])) {
+        start++;
+    }
+    if (start > 0) {
+        memmove(text, text + start, strlen(text + start) + 1);
+        len = strlen(text);
+    }
+
+    const char suffix[] = " of This Traction";
+    size_t suffix_len = sizeof(suffix) - 1;
+    if (len >= suffix_len) {
+        bool match = true;
+        for (size_t i = 0; i < suffix_len; ++i) {
+            unsigned char a = (unsigned char)tolower((unsigned char)text[len - suffix_len + i]);
+            unsigned char b = (unsigned char)tolower((unsigned char)suffix[i]);
+            if (a != b) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            text[len - suffix_len] = '\0';
+            len -= suffix_len;
+            while (len > 0 && isspace((unsigned char)text[len - 1])) {
+                text[--len] = '\0';
+            }
+        }
+    }
 }
 
 static void *narrative_thread_main(void *arg) {
@@ -6862,7 +6940,7 @@ static int build_report_latex(const ReportData *report,
         "    \\fancyhf{}%\n"
         "    \\fancyhead[R]{\\includegraphics[width=0.045\\textwidth]{square.png}}%\n"
         "    \\fancyfoot[L]{%\n"
-        "        \\scriptsize\n"
+        "        \\tiny\\color[HTML]{46A6B3}%\n"
         "        \\clientname\\\\\n"
         "        \\clientaddress\n"
         "    }%\n"

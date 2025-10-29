@@ -67,6 +67,7 @@ char *sanitize_ascii(const char *text) {
             switch (codepoint) {
                 case 0x00A0: single[0] = ' '; replacement = single; break;
                 case 0x00B0: replacement = "deg"; break;
+                case 0x2015: replacement = "--"; break;
                 case 0x2018:
                 case 0x2019:
                 case 0x2032: single[0] = '\''; replacement = single; break;
@@ -79,6 +80,10 @@ char *sanitize_ascii(const char *text) {
                 case 0x2013: single[0] = '-'; replacement = single; break;
                 case 0x2014:
                     replacement = "--";
+                    break;
+                case 0x2212:
+                    single[0] = '-';
+                    replacement = single;
                     break;
                 case 0x2022: single[0] = '*'; replacement = single; break;
                 case 0x2026: replacement = "..."; break;
