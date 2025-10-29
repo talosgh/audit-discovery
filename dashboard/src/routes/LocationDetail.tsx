@@ -144,6 +144,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setNarrativeSeed('');
     setRecommendationsSeed('');
     setReportMode('full');
+    setShowDeficiencySection(false);
+    setShowResolvedDeficiencies(false);
   });
 
   createEffect(() => {

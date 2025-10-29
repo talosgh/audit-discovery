@@ -297,7 +297,7 @@ int db_complete_report_job(PGconn *conn,
 
     const char *sql =
         "WITH target AS ("
-        "        SELECT id, address "
+        "        SELECT id, address, deficiency_only "
         "        FROM report_jobs "
         "        WHERE job_id = $1::uuid"
         "    ), version_calc AS ("
@@ -306,7 +306,8 @@ int db_complete_report_job(PGconn *conn,
         "                    COALESCE(("
         "                        SELECT MAX(artifact_version) "
         "                        FROM report_jobs "
-        "                        WHERE address = target.address"
+        "                        WHERE address = target.address "
+        "                          AND deficiency_only = target.deficiency_only"
         "                    ), 0) + 1 "
         "               ELSE NULL END AS next_version "
         "        FROM target"

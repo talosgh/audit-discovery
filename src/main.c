@@ -7193,23 +7193,32 @@ static int build_report_latex(const ReportData *report,
         "    \\renewcommand{\\headrulewidth}{0pt}%\n"
         "    \\renewcommand{\\footrulewidth}{0pt}%\n"
         "    \\setlength{\\headsep}{0.4in}%\n"
-        "}\n"
-        "\\AtBeginDocument{%\n"
-        "    \\normalsize\n"
-        "    \\thispagestyle{empty}%\n"
-        "    \\coverpage\n"
-        "    \\newpage\n"
-        "    \\pagestyle{mainstyle}%\n"
-        "    \\pagenumbering{arabic}%\n"
-        "    \\hypersetup{pdfborder = {0 0 0}}%\n"
-        "    \\tableofcontents\n"
-        "    \\newpage\n"
-        "}\n"
-        "\\AtEndDocument{}\n")) goto cleanup;
+        "}\n")) goto cleanup;
 
     if (job->deficiency_only) {
-        if (!buffer_append_cstr(&buf, "\\AtBeginDocument{\\applydeficiencywatermark}\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf,
+            "\\AtBeginDocument{%\n"
+            "    \\pagestyle{mainstyle}%\n"
+            "    \\pagenumbering{arabic}%\n"
+            "    \\hypersetup{pdfborder = {0 0 0}}%\n"
+            "    \\applydeficiencywatermark%\n"
+            "}\n")) goto cleanup;
+    } else {
+        if (!buffer_append_cstr(&buf,
+            "\\AtBeginDocument{%\n"
+            "    \\normalsize\n"
+            "    \\thispagestyle{empty}%\n"
+            "    \\coverpage\n"
+            "    \\newpage\n"
+            "    \\pagestyle{mainstyle}%\n"
+            "    \\pagenumbering{arabic}%\n"
+            "    \\hypersetup{pdfborder = {0 0 0}}%\n"
+            "    \\tableofcontents\n"
+            "    \\newpage\n"
+            "}\n")) goto cleanup;
     }
+
+    if (!buffer_append_cstr(&buf, "\\AtEndDocument{}\n")) goto cleanup;
 
     if (!buffer_append_cstr(&buf, "\\begin{document}\n\n")) goto cleanup;
 
