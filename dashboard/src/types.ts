@@ -204,6 +204,7 @@ export interface ReportJobCreateRequest {
   coverZip?: string;
   coverContactName?: string;
   coverContactEmail?: string;
+  deficiencyOnly?: boolean;
 }
 
 export interface ReportJobCreateResponse {
@@ -221,6 +222,7 @@ export interface ReportJobStatus {
   completed_at: string | null;
   error: string | null;
   download_ready: boolean;
+  deficiency_only: boolean;
   artifact_filename?: string | null;
   artifact_size?: number | null;
   version?: number | null;

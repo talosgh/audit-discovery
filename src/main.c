@@ -406,7 +406,7 @@ static char *report_data_to_json(const ReportData *report);
 static char *build_location_detail_payload(PGconn *conn, const char *address, int *status_out, char **error_out);
 static char *build_report_json_payload(PGconn *conn, const char *address, int *status_out, char **error_out);
 static char *build_download_url(const char *job_id);
-static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url);
+static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url, bool deficiency_only);
 static int generate_uuid_v4(char out[37]);
 static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char **pdf_bytes_out, size_t *pdf_size_out, char **error_out);
 static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownloadArtifact *artifact, char **error_out);
@@ -449,6 +449,7 @@ static const char *determine_consultant_type(const ReportSummary *summary);
 static char *build_device_system_prompt(const char *consultant_type);
 static char *build_device_prompt(const ReportData *report, const ReportDevice *device, const ReportJob *job, const char *consultant_type);
 static char *build_device_narrative_fallback(const ReportDevice *device);
+static int append_device_deficiencies(Buffer *buf, const ReportDevice *device, bool omit_heading, bool include_summary);
 typedef enum {
     NARRATIVE_TASK_SECTION,
     NARRATIVE_TASK_DEVICE
@@ -1698,7 +1699,7 @@ static char *build_location_detail_payload(PGconn *conn, const char *address, in
         "       artifact_size, "
         "       artifact_version "
         "FROM report_jobs "
-        "WHERE address = $1 AND status = 'completed' AND artifact_size IS NOT NULL "
+        "WHERE address = $1 AND deficiency_only = false AND status = 'completed' AND artifact_size IS NOT NULL "
         "ORDER BY completed_at DESC NULLS LAST, created_at DESC";
     const char *report_params[1] = { address };
     PGresult *reports_res = PQexecParams(conn, reports_sql, 1, NULL, report_params, NULL, NULL, 0);
@@ -1936,7 +1937,7 @@ static char *build_download_url(const char *job_id) {
     return url;
 }
 
-static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url) {
+static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url, bool deficiency_only) {
     Buffer buf;
     if (!buffer_init(&buf)) {
         char *body = build_error_response("Out of memory");
@@ -1962,6 +1963,8 @@ static void send_report_job_response(int client_fd, int http_status, const char 
     } else {
         if (!buffer_append_cstr(&buf, "null")) goto fail;
     }
+    if (!buffer_append_cstr(&buf, ",\"deficiency_only\":")) goto fail;
+    if (!buffer_append_cstr(&buf, deficiency_only ? "true" : "false")) goto fail;
     if (!buffer_append_cstr(&buf, "}")) goto fail;
 
     {
@@ -5007,7 +5010,6 @@ static int create_report_archive(PGconn *conn, const ReportJob *job, const Repor
     if (zip_path_out) {
         *zip_path_out = NULL;
     }
-    (void)job;
     if (!conn || !job_dir || !pdf_path) {
         if (error_out && !*error_out) {
             *error_out = strdup("Invalid archive parameters");
@@ -5023,7 +5025,8 @@ static int create_report_archive(PGconn *conn, const ReportJob *job, const Repor
         return 0;
     }
 
-    char *pdf_copy_path = join_path(package_dir, "audit_report.pdf");
+    const char *pdf_filename = (job && job->deficiency_only) ? "deficiency_list.pdf" : "audit_report.pdf";
+    char *pdf_copy_path = join_path(package_dir, pdf_filename);
     if (!pdf_copy_path || copy_file_contents(pdf_path, pdf_copy_path) != 0) {
         if (error_out && !*error_out) {
             *error_out = strdup("Failed to prepare report PDF");
@@ -5034,22 +5037,25 @@ static int create_report_archive(PGconn *conn, const ReportJob *job, const Repor
         return 0;
     }
 
-    char *photo_error = NULL;
-    if (!export_building_photos(conn, report, package_dir, &photo_error)) {
-        if (error_out && !*error_out) {
-            *error_out = photo_error ? photo_error : strdup("Failed to export photos");
-        } else {
-            free(photo_error);
+    if (!job || !job->deficiency_only) {
+        char *photo_error = NULL;
+        if (!export_building_photos(conn, report, package_dir, &photo_error)) {
+            if (error_out && !*error_out) {
+                *error_out = photo_error ? photo_error : strdup("Failed to export photos");
+            } else {
+                free(photo_error);
+            }
+            free(pdf_copy_path);
+            remove_directory_recursive(package_dir);
+            free(package_dir);
+            return 0;
         }
-        free(pdf_copy_path);
-        remove_directory_recursive(package_dir);
-        free(package_dir);
-        return 0;
+        free(photo_error);
     }
-    free(photo_error);
     free(pdf_copy_path);
 
-    char *zip_path = join_path(job_dir, "audit_report_package.zip");
+    const char *zip_filename = (job && job->deficiency_only) ? "deficiency_list_package.zip" : "audit_report_package.zip";
+    char *zip_path = join_path(job_dir, zip_filename);
     if (!zip_path) {
         if (error_out && !*error_out) {
             *error_out = strdup("Out of memory creating zip path");
@@ -5127,7 +5133,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
 
     const char *params[1] = { job_id };
     const char *sql =
-        "SELECT address, status, artifact_filename, artifact_mime, artifact_bytes, artifact_size, artifact_version "
+        "SELECT address, status, artifact_filename, artifact_mime, artifact_bytes, artifact_size, artifact_version, deficiency_only "
         "FROM report_jobs "
         "WHERE job_id = $1::uuid";
 
@@ -5149,7 +5155,9 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
     const char *address_val = PQgetisnull(res, 0, 0) ? NULL : PQgetvalue(res, 0, 0);
     const char *status_val = PQgetisnull(res, 0, 1) ? NULL : PQgetvalue(res, 0, 1);
     const char *artifact_filename_val = PQgetisnull(res, 0, 2) ? NULL : PQgetvalue(res, 0, 2);
+    const char *artifact_bytes_val = PQgetisnull(res, 0, 4) ? NULL : PQgetvalue(res, 0, 4);
     const char *artifact_version_val = PQgetisnull(res, 0, 6) ? NULL : PQgetvalue(res, 0, 6);
+    const char *deficiency_only_val = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
 
     if (!status_val || strcmp(status_val, "completed") != 0) {
         if (error_out && !*error_out) {
@@ -5157,13 +5165,15 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
         }
         goto cleanup;
     }
-    if (PQgetisnull(res, 0, 4)) {
+    bool deficiency_only = deficiency_only_val && (strcmp(deficiency_only_val, "t") == 0 || strcmp(deficiency_only_val, "true") == 0 || strcmp(deficiency_only_val, "1") == 0);
+
+    if (!artifact_bytes_val) {
         if (error_out && !*error_out) {
             *error_out = strdup("Report not ready");
         }
         goto cleanup;
     }
-    pdf_data = PQunescapeBytea((const unsigned char *)PQgetvalue(res, 0, 4), &pdf_size);
+    pdf_data = PQunescapeBytea((const unsigned char *)artifact_bytes_val, &pdf_size);
     if (!pdf_data || pdf_size == 0) {
         if (error_out && !*error_out) {
             *error_out = strdup("Report artifact missing");
@@ -5196,7 +5206,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
         goto cleanup;
     }
 
-    pdf_temp_path = join_path(job_dir, "audit_report.pdf");
+    pdf_temp_path = join_path(job_dir, deficiency_only ? "deficiency_list.pdf" : "audit_report.pdf");
     if (!pdf_temp_path) {
         if (error_out && !*error_out) {
             *error_out = strdup("Out of memory preparing download");
@@ -5223,7 +5233,10 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
     close(fd);
 
     char *archive_error = NULL;
-    if (!create_report_archive(conn, NULL, &report, job_dir, pdf_temp_path, &zip_path, &archive_error)) {
+    ReportJob archive_job;
+    report_job_init(&archive_job);
+    archive_job.deficiency_only = deficiency_only;
+    if (!create_report_archive(conn, &archive_job, &report, job_dir, pdf_temp_path, &zip_path, &archive_error)) {
         if (error_out && !*error_out) {
             *error_out = archive_error ? archive_error : strdup("Failed to package report");
         } else {
@@ -5231,6 +5244,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
         }
         goto cleanup;
     }
+    report_job_clear(&archive_job);
     free(archive_error);
     archive_error = NULL;
 
@@ -5243,9 +5257,9 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
     int version_number = artifact_version_val ? atoi(artifact_version_val) : 0;
     char download_name[160];
     if (version_number > 0) {
-        snprintf(download_name, sizeof(download_name), "audit-report-%s-v%d.zip", job_id, version_number);
+        snprintf(download_name, sizeof(download_name), deficiency_only ? "deficiency-list-%s-v%d.zip" : "audit-report-%s-v%d.zip", job_id, version_number);
     } else {
-        snprintf(download_name, sizeof(download_name), "audit-report-%s.zip", job_id);
+        snprintf(download_name, sizeof(download_name), deficiency_only ? "deficiency-list-%s.zip" : "audit-report-%s.zip", job_id);
     }
 
     artifact->path = zip_path;
@@ -5422,160 +5436,162 @@ static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char 
         goto cleanup;
     }
 
-    report_json = report_data_to_json(&report);
-    if (!report_json) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Failed to serialize report data");
-        }
-        goto cleanup;
-    }
-
-    const char *system_prompt = "You are an expert vertical transportation safety consultant. Provide concise, professional narrative text suitable for a building owner. Use plain ASCII punctuation (no smart quotes or em dashes). Do not include LaTeX syntax or markdown.";
-
-    struct {
-        const char *title;
-        char **slot;
-        const char *instructions;
-        bool include_notes;
-        bool include_recommendations;
-    } sections[] = {
-        {"Executive Summary", &narratives.executive_summary,
-         "Write an executive summary highlighting equipment condition, total device count, total deficiencies, and the most critical safety issues.\nProvide actionable context appropriate for ownership decisions.", true, false},
-        {"Key Findings", &narratives.key_findings,
-         "List the top findings from the audit with concise explanations. Focus on safety, compliance, and maintenance trends across devices.", true, false},
-        {"Methodology", &narratives.methodology,
-         "Describe the inspection methodology, standards referenced, and scope of the audit. Mention any limitations or assumptions.", false, false},
-        {"Maintenance Performance", &narratives.maintenance_performance,
-         "Analyze maintenance performance and recurring issues observed in the audit. Discuss patterns tied to equipment age, usage, or contractor performance.", true, false},
-        {"Recommendations", &narratives.recommendations,
-         "Provide prioritized recommendations for remediation, including immediate safety concerns, short-term actions, and long-term planning guidance.", true, true},
-        {"Conclusion", &narratives.conclusion,
-         "Deliver a closing narrative summarizing risk outlook, benefits of addressing recommendations, and next steps for maintaining compliance.", false, false}
-    };
-
-    section_count = sizeof(sections) / sizeof(sections[0]);
-    total_task_slots = section_count + report.devices.count;
-    if (total_task_slots == 0) {
-        narrative_build_error = strdup("No narrative tasks to execute");
-        goto cleanup;
-    }
-
-    tasks = calloc(total_task_slots, sizeof(NarrativeTask));
-    if (!tasks) {
-        narrative_build_error = strdup("Out of memory");
-        goto cleanup;
-    }
-
-    for (size_t i = 0; i < section_count; ++i) {
-        Buffer prompt;
-        if (!buffer_init(&prompt)) {
-            if (!narrative_build_error) {
-                narrative_build_error = strdup("Out of memory");
+    if (!job->deficiency_only) {
+        report_json = report_data_to_json(&report);
+        if (!report_json) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Failed to serialize report data");
             }
-            goto narrative_join;
+            goto cleanup;
         }
 
-        if (!buffer_appendf(&prompt, "%s\n\nAudit Data:\n%s", sections[i].instructions, report_json)) {
+        const char *system_prompt = "You are an expert vertical transportation safety consultant. Provide concise, professional narrative text suitable for a building owner. Use plain ASCII punctuation (no smart quotes or em dashes). Do not include LaTeX syntax or markdown.";
+
+        struct {
+            const char *title;
+            char **slot;
+            const char *instructions;
+            bool include_notes;
+            bool include_recommendations;
+        } sections[] = {
+            {"Executive Summary", &narratives.executive_summary,
+             "Write an executive summary highlighting equipment condition, total device count, total deficiencies, and the most critical safety issues.\nProvide actionable context appropriate for ownership decisions.", true, false},
+            {"Key Findings", &narratives.key_findings,
+             "List the top findings from the audit with concise explanations. Focus on safety, compliance, and maintenance trends across devices.", true, false},
+            {"Methodology", &narratives.methodology,
+             "Describe the inspection methodology, standards referenced, and scope of the audit. Mention any limitations or assumptions.", false, false},
+            {"Maintenance Performance", &narratives.maintenance_performance,
+             "Analyze maintenance performance and recurring issues observed in the audit. Discuss patterns tied to equipment age, usage, or contractor performance.", true, false},
+            {"Recommendations", &narratives.recommendations,
+             "Provide prioritized recommendations for remediation, including immediate safety concerns, short-term actions, and long-term planning guidance.", true, true},
+            {"Conclusion", &narratives.conclusion,
+             "Deliver a closing narrative summarizing risk outlook, benefits of addressing recommendations, and next steps for maintaining compliance.", false, false}
+        };
+
+        section_count = sizeof(sections) / sizeof(sections[0]);
+        total_task_slots = section_count + report.devices.count;
+        if (total_task_slots == 0) {
+            narrative_build_error = strdup("No narrative tasks to execute");
+            goto cleanup;
+        }
+
+        tasks = calloc(total_task_slots, sizeof(NarrativeTask));
+        if (!tasks) {
+            narrative_build_error = strdup("Out of memory");
+            goto cleanup;
+        }
+
+        for (size_t i = 0; i < section_count; ++i) {
+            Buffer prompt;
+            if (!buffer_init(&prompt)) {
+                if (!narrative_build_error) {
+                    narrative_build_error = strdup("Out of memory");
+                }
+                goto narrative_join;
+            }
+
+            if (!buffer_appendf(&prompt, "%s\n\nAudit Data:\n%s", sections[i].instructions, report_json)) {
+                buffer_free(&prompt);
+                if (!narrative_build_error) {
+                    narrative_build_error = strdup("Out of memory");
+                }
+                goto narrative_join;
+            }
+
+            if (sections[i].include_notes && job->notes && job->notes[0]) {
+                if (!buffer_appendf(&prompt, "\n\nInspector Notes:\n%s", job->notes)) {
+                    buffer_free(&prompt);
+                    if (!narrative_build_error) {
+                        narrative_build_error = strdup("Out of memory");
+                    }
+                    goto narrative_join;
+                }
+            }
+            if (sections[i].include_recommendations && job->recommendations && job->recommendations[0]) {
+                if (!buffer_appendf(&prompt, "\n\nClient Guidance:\n%s", job->recommendations)) {
+                    buffer_free(&prompt);
+                    if (!narrative_build_error) {
+                        narrative_build_error = strdup("Out of memory");
+                    }
+                    goto narrative_join;
+                }
+            }
+
+            char *prompt_str = prompt.data;
+            prompt.data = NULL;
             buffer_free(&prompt);
-            if (!narrative_build_error) {
-                narrative_build_error = strdup("Out of memory");
-            }
-            goto narrative_join;
-        }
-
-        if (sections[i].include_notes && job->notes && job->notes[0]) {
-            if (!buffer_appendf(&prompt, "\n\nInspector Notes:\n%s", job->notes)) {
-                buffer_free(&prompt);
+            if (!prompt_str) {
                 if (!narrative_build_error) {
                     narrative_build_error = strdup("Out of memory");
                 }
                 goto narrative_join;
             }
+
+            NarrativeTask *task = &tasks[tasks_created];
+            task->system_prompt = system_prompt;
+            task->prompt = prompt_str;
+            task->slot = sections[i].slot;
+            task->error = NULL;
+            task->success = 0;
+            task->thread_started = false;
+            task->kind = NARRATIVE_TASK_SECTION;
+            task->device = NULL;
+            task->system_prompt_owned = NULL;
+
+            if (pthread_create(&task->thread, NULL, narrative_thread_main, task) == 0) {
+                task->thread_started = true;
+            } else {
+                narrative_task_execute(task);
+            }
+            tasks_created += 1;
         }
-        if (sections[i].include_recommendations && job->recommendations && job->recommendations[0]) {
-            if (!buffer_appendf(&prompt, "\n\nClient Guidance:\n%s", job->recommendations)) {
-                buffer_free(&prompt);
+
+        const char *consultant_type = determine_consultant_type(&report.summary);
+        for (size_t i = 0; i < report.devices.count; ++i) {
+            ReportDevice *device = &report.devices.items[i];
+            char *prompt_str = build_device_prompt(&report, device, job, consultant_type);
+            if (!prompt_str) {
                 if (!narrative_build_error) {
                     narrative_build_error = strdup("Out of memory");
                 }
                 goto narrative_join;
             }
-        }
-
-        char *prompt_str = prompt.data;
-        prompt.data = NULL;
-        buffer_free(&prompt);
-        if (!prompt_str) {
-            if (!narrative_build_error) {
-                narrative_build_error = strdup("Out of memory");
+            char *system_prompt_device = build_device_system_prompt(consultant_type);
+            if (!system_prompt_device) {
+                free(prompt_str);
+                if (!narrative_build_error) {
+                    narrative_build_error = strdup("Out of memory");
+                }
+                goto narrative_join;
             }
-            goto narrative_join;
-        }
 
-        NarrativeTask *task = &tasks[tasks_created];
-        task->system_prompt = system_prompt;
-        task->prompt = prompt_str;
-        task->slot = sections[i].slot;
-        task->error = NULL;
-        task->success = 0;
-        task->thread_started = false;
-        task->kind = NARRATIVE_TASK_SECTION;
-        task->device = NULL;
-        task->system_prompt_owned = NULL;
-
-        if (pthread_create(&task->thread, NULL, narrative_thread_main, task) == 0) {
-            task->thread_started = true;
-        } else {
-            narrative_task_execute(task);
-        }
-        tasks_created += 1;
-    }
-
-    const char *consultant_type = determine_consultant_type(&report.summary);
-    for (size_t i = 0; i < report.devices.count; ++i) {
-        ReportDevice *device = &report.devices.items[i];
-        char *prompt_str = build_device_prompt(&report, device, job, consultant_type);
-        if (!prompt_str) {
-            if (!narrative_build_error) {
-                narrative_build_error = strdup("Out of memory");
+            if (tasks_created >= total_task_slots) {
+                free(prompt_str);
+                free(system_prompt_device);
+                if (!narrative_build_error) {
+                    narrative_build_error = strdup("Task overflow");
+                }
+                goto narrative_join;
             }
-            goto narrative_join;
-        }
-        char *system_prompt_device = build_device_system_prompt(consultant_type);
-        if (!system_prompt_device) {
-            free(prompt_str);
-            if (!narrative_build_error) {
-                narrative_build_error = strdup("Out of memory");
+
+            NarrativeTask *task = &tasks[tasks_created];
+            task->system_prompt = system_prompt_device;
+            task->system_prompt_owned = system_prompt_device;
+            task->prompt = prompt_str;
+            task->slot = &device->narrative;
+            task->error = NULL;
+            task->success = 0;
+            task->thread_started = false;
+            task->kind = NARRATIVE_TASK_DEVICE;
+            task->device = device;
+
+            if (pthread_create(&task->thread, NULL, narrative_thread_main, task) == 0) {
+                task->thread_started = true;
+            } else {
+                narrative_task_execute(task);
             }
-            goto narrative_join;
+            tasks_created += 1;
         }
-
-        if (tasks_created >= total_task_slots) {
-            free(prompt_str);
-            free(system_prompt_device);
-            if (!narrative_build_error) {
-                narrative_build_error = strdup("Task overflow");
-            }
-            goto narrative_join;
-        }
-
-        NarrativeTask *task = &tasks[tasks_created];
-        task->system_prompt = system_prompt_device;
-        task->system_prompt_owned = system_prompt_device;
-        task->prompt = prompt_str;
-        task->slot = &device->narrative;
-        task->error = NULL;
-        task->success = 0;
-        task->thread_started = false;
-        task->kind = NARRATIVE_TASK_DEVICE;
-        task->device = device;
-
-        if (pthread_create(&task->thread, NULL, narrative_thread_main, task) == 0) {
-            task->thread_started = true;
-        } else {
-            narrative_task_execute(task);
-        }
-        tasks_created += 1;
     }
 
 narrative_join:
@@ -5795,11 +5811,12 @@ static void *report_worker_main(void *arg) {
         int success = process_report_job(conn, &job, &pdf_data, &pdf_size, &process_error);
         char *update_error = NULL;
         if (success) {
+            const char *artifact_name = job.deficiency_only ? "deficiency-list.pdf" : "audit_report.pdf";
             if (!db_complete_report_job(conn,
                                         job.job_id,
                                         "completed",
                                         NULL,
-                                        "audit_report.pdf",
+                                        artifact_name,
                                         "application/pdf",
                                         pdf_data,
                                         pdf_size,
@@ -6106,6 +6123,125 @@ static int append_controller_age_chart(Buffer *buf, const ReportData *report) {
     return ok;
 }
 
+static int append_device_deficiencies(Buffer *buf, const ReportDevice *device, bool omit_heading, bool include_summary) {
+    if (!buf || !device) {
+        return 0;
+    }
+
+    int open_count = 0;
+    int closed_count = 0;
+    for (size_t j = 0; j < device->deficiencies.count; ++j) {
+        const ReportDeficiency *def = &device->deficiencies.items[j];
+        bool closed = def->resolved.has_value && def->resolved.value;
+        if (closed) {
+            closed_count++;
+        } else {
+            open_count++;
+        }
+    }
+
+    if (!omit_heading) {
+        if (!buffer_append_cstr(buf, "\\subsubsection*{Documented Deficiencies}\\n\\n")) {
+            return 0;
+        }
+    }
+
+    if (device->deficiencies.count == 0) {
+        const char *none_text = "\\textit{No deficiencies recorded for this device.}\\n\\n";
+        if (omit_heading) {
+            none_text = "\\textit{No deficiencies recorded for this device.}\\par\\medskip\\n";
+        }
+        return buffer_append_cstr(buf, none_text);
+    }
+
+    if (include_summary) {
+        if (!buffer_appendf(buf, "\\textit{Open: %d \\hspace{1em} Closed: %d}\\par\\medskip\\n", open_count, closed_count)) {
+            return 0;
+        }
+    }
+
+    if (!buffer_append_cstr(buf,
+            "{\\small\\rowcolors{2}{DeviceRow}{white}\\n"
+            "\\begin{tabularx}{\\textwidth}{@{}p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} X@{}}\\toprule\\n"
+            "\\textbf{Equipment} & \\textbf{Condition} & \\textbf{Remedy} & \\textbf{Note} \\\\ \\midrule\\n")) {
+        return 0;
+    }
+
+    for (size_t j = 0; j < device->deficiencies.count; ++j) {
+        ReportDeficiency *def = &device->deficiencies.items[j];
+        const char *equip_src = def->equipment ? def->equipment : "—";
+        const char *cond_src = def->condition ? def->condition : "—";
+        const char *remedy_src = def->remedy ? def->remedy : "—";
+        const char *note_src = def->note ? def->note : "—";
+        bool closed = def->resolved.has_value && def->resolved.value;
+
+        char *equip_clean = sanitize_ascii(equip_src);
+        char *cond_clean = sanitize_ascii(cond_src);
+        char *remedy_clean = sanitize_ascii(remedy_src);
+        char *note_clean = sanitize_ascii(note_src);
+
+        const char *equip_text = equip_clean ? equip_clean : equip_src;
+        const char *cond_text = cond_clean ? cond_clean : cond_src;
+        const char *remedy_text = remedy_clean ? remedy_clean : remedy_src;
+        const char *note_text = note_clean ? note_clean : note_src;
+
+        char *equip_tex = latex_escape(equip_text);
+        char *cond_tex = latex_escape(cond_text);
+        char *remedy_tex = latex_escape(remedy_text);
+        char *note_tex = latex_escape(note_text);
+
+        free(equip_clean);
+        free(cond_clean);
+        free(remedy_clean);
+        free(note_clean);
+
+        if (!equip_tex || !cond_tex || !remedy_tex || !note_tex) {
+            free(equip_tex);
+            free(cond_tex);
+            free(remedy_tex);
+            free(note_tex);
+            return 0;
+        }
+
+        const char *note_suffix = closed ? "\\ClosedMarker" : NULL;
+        char *equip_cell = format_closed_cell(equip_tex, closed, NULL);
+        char *cond_cell = format_closed_cell(cond_tex, closed, NULL);
+        char *remedy_cell = format_closed_cell(remedy_tex, closed, NULL);
+        char *note_cell = format_closed_cell(note_tex, closed, note_suffix);
+
+        free(equip_tex);
+        free(cond_tex);
+        free(remedy_tex);
+        free(note_tex);
+
+        if (!equip_cell || !cond_cell || !remedy_cell || !note_cell) {
+            free(equip_cell);
+            free(cond_cell);
+            free(remedy_cell);
+            free(note_cell);
+            return 0;
+        }
+
+        if (!buffer_appendf(buf, "%s & %s & %s & %s \\\\ \n", equip_cell, cond_cell, remedy_cell, note_cell)) {
+            free(equip_cell);
+            free(cond_cell);
+            free(remedy_cell);
+            free(note_cell);
+            return 0;
+        }
+
+        free(equip_cell);
+        free(cond_cell);
+        free(remedy_cell);
+        free(note_cell);
+    }
+
+    if (!buffer_append_cstr(buf, "\\bottomrule\\n\\end{tabularx}}\\n\\n")) {
+        return 0;
+    }
+    return 1;
+}
+
 static int append_device_sections(Buffer *buf, const ReportData *report) {
     if (!buf || !report) {
         return 0;
@@ -6155,7 +6291,7 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
         free(device_type_tex);
         free(device_id_tex);
 
-        if (!buffer_append_cstr(buf, "\\begin{tabularx}{\\textwidth}{@{}lX@{}}\\toprule\n")) {
+        if (!buffer_append_cstr(buf, "{\\small\\rowcolors{2}{DeviceRow}{white}\n\\begin{tabularx}{\\textwidth}{@{}lX@{}}\\toprule\n")) {
             return 0;
         }
 
@@ -6279,7 +6415,7 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
             free(value_tex);
         }
 
-        if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabularx}\n\n")) {
+        if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabularx}}\n\n")) {
             return 0;
         }
 
@@ -6298,82 +6434,8 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
             }
         }
 
-        if (device->deficiencies.count > 0) {
-            if (!buffer_append_cstr(buf, "\\subsubsection*{Documented Deficiencies}\n\n")) {
-                return 0;
-            }
-            if (!buffer_append_cstr(buf,
-                "\\begin{tabularx}{\\textwidth}{@{}p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} X@{}}\\toprule\n"
-                "\\textbf{Equipment} & \\textbf{Condition} & \\textbf{Remedy} & \\textbf{Note} \\\\ \\midrule\n")) {
-                return 0;
-            }
-            for (size_t j = 0; j < device->deficiencies.count; ++j) {
-                ReportDeficiency *def = &device->deficiencies.items[j];
-                const char *equip_src = def->equipment ? def->equipment : "—";
-                const char *cond_src = def->condition ? def->condition : "—";
-                const char *remedy_src = def->remedy ? def->remedy : "—";
-                const char *note_src = def->note ? def->note : "—";
-
-                bool closed = def->resolved.has_value && def->resolved.value;
-
-                char *equip_clean = sanitize_ascii(equip_src);
-                char *cond_clean = sanitize_ascii(cond_src);
-                char *remedy_clean = sanitize_ascii(remedy_src);
-                char *note_clean = sanitize_ascii(note_src);
-
-                const char *equip_text = equip_clean ? equip_clean : equip_src;
-                const char *cond_text = cond_clean ? cond_clean : cond_src;
-                const char *remedy_text = remedy_clean ? remedy_clean : remedy_src;
-                const char *note_text = note_clean ? note_clean : note_src;
-
-                char *equip_tex = latex_escape(equip_text);
-                char *cond_tex = latex_escape(cond_text);
-                char *remedy_tex = latex_escape(remedy_text);
-                char *note_tex = latex_escape(note_text);
-
-                free(equip_clean);
-                free(cond_clean);
-                free(remedy_clean);
-                free(note_clean);
-
-                if (!equip_tex || !cond_tex || !remedy_tex || !note_tex) {
-                    free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
-                    return 0;
-                }
-
-                const char *note_suffix = closed ? "\\ClosedMarker" : NULL;
-                char *equip_cell = format_closed_cell(equip_tex, closed, NULL);
-                char *cond_cell = format_closed_cell(cond_tex, closed, NULL);
-                char *remedy_cell = format_closed_cell(remedy_tex, closed, NULL);
-                char *note_cell = format_closed_cell(note_tex, closed, note_suffix);
-
-                free(equip_tex);
-                free(cond_tex);
-                free(remedy_tex);
-                free(note_tex);
-
-                if (!equip_cell || !cond_cell || !remedy_cell || !note_cell) {
-                    free(equip_cell); free(cond_cell); free(remedy_cell); free(note_cell);
-                    return 0;
-                }
-
-                if (!buffer_appendf(buf, "%s & %s & %s & %s \\\\ \n", equip_cell, cond_cell, remedy_cell, note_cell)) {
-                    free(equip_cell); free(cond_cell); free(remedy_cell); free(note_cell);
-                    return 0;
-                }
-
-                free(equip_cell);
-                free(cond_cell);
-                free(remedy_cell);
-                free(note_cell);
-            }
-            if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabularx}\n\n")) {
-                return 0;
-            }
-        } else {
-            if (!buffer_append_cstr(buf, "\\subsubsection*{Documented Deficiencies}\n\n\\textit{No deficiencies recorded for this device.}\n\n")) {
-                return 0;
-            }
+        if (!append_device_deficiencies(buf, device, false, false)) {
+            return 0;
         }
     }
     return 1;
@@ -6933,7 +6995,7 @@ static int build_report_latex(const ReportData *report,
         "\\usepackage{pgfplots}\n"
         "\\usepackage{tikz}\n"
         "\\usepackage{lmodern}\n"
-        "\\usepackage{xcolor}\n"
+        "\\usepackage[table]{xcolor}\n"
         "\\usepackage[normalem]{ulem}\n"
         "\\usepackage{float}\n"
         "\\geometry{a4paper, left=0.5in, right=0.5in, top=1in, bottom=1in}\n"
@@ -6967,6 +7029,7 @@ static int build_report_latex(const ReportData *report,
         "\\pagestyle{empty}\n"
         "\\setlength{\\parskip}{0.5\\baselineskip}\n"
         "\\setlength{\\parindent}{0pt}\n"
+        "\\definecolor{DeviceRow}{HTML}{EEF2F7}\n"
         "\\newcommand{\\ClosedText}[1]{\\textcolor{gray}{\\sout{#1}}}\n"
         "\\newcommand{\\ClosedMarker}{\\textcolor{gray}{(Closed)}}\n"
         "\\newcommand{\\coverpage}{%\n"
@@ -7014,6 +7077,71 @@ static int build_report_latex(const ReportData *report,
         "}\n"
         "\\AtEndDocument{}\n"
         "\\begin{document}\n\n")) goto cleanup;
+
+    if (job->deficiency_only) {
+        if (!buffer_append_cstr(&buf, "\\section{Deficiency Summary}\n\n")) goto cleanup;
+        size_t device_count = report->devices.count;
+        int total_open = 0;
+        int total_closed = 0;
+        for (size_t i = 0; i < report->devices.count; ++i) {
+            const ReportDevice *device = &report->devices.items[i];
+            for (size_t j = 0; j < device->deficiencies.count; ++j) {
+                const ReportDeficiency *def = &device->deficiencies.items[j];
+                bool closed = def->resolved.has_value && def->resolved.value;
+                if (closed) {
+                    total_closed++;
+                } else {
+                    total_open++;
+                }
+            }
+        }
+
+        if (device_count == 0) {
+            if (!buffer_append_cstr(&buf, "\\textit{No devices found for this location.}\n\n")) goto cleanup;
+        } else {
+            if (!buffer_appendf(&buf,
+                    "\\textbf{Devices evaluated}: %zu \\\\ \n"
+                    "\\textbf{Open deficiencies}: %d \\\\ \n"
+                    "\\textbf{Closed deficiencies}: %d\\n\\n",
+                    device_count,
+                    total_open,
+                    total_closed)) goto cleanup;
+
+            for (size_t i = 0; i < report->devices.count; ++i) {
+                ReportDevice *device = &report->devices.items[i];
+                const char *device_type = device->device_type ? device->device_type : "Device";
+                char *device_type_clean = sanitize_ascii(device_type);
+                const char *device_type_text = device_type_clean ? device_type_clean : device_type;
+                char *device_type_tex = latex_escape(device_type_text);
+                free(device_type_clean);
+
+                const char *id_src = device->device_id ? device->device_id :
+                                    (device->submission_id ? device->submission_id : device->audit_uuid);
+                char *device_id_clean = sanitize_ascii(id_src);
+                const char *device_id_text = device_id_clean ? device_id_clean : (id_src ? id_src : "Device");
+                char *device_id_tex = latex_escape(device_id_text);
+                free(device_id_clean);
+
+                if (!device_type_tex || !device_id_tex) {
+                    free(device_type_tex);
+                    free(device_id_tex);
+                    goto cleanup;
+                }
+
+                if (!buffer_appendf(&buf, "\\subsection*{%s %s}\n\n", device_type_tex, device_id_tex)) {
+                    free(device_type_tex);
+                    free(device_id_tex);
+                    goto cleanup;
+                }
+                free(device_type_tex);
+                free(device_id_tex);
+
+                if (!append_device_deficiencies(&buf, device, true, true)) goto cleanup;
+            }
+        }
+
+        goto finalize;
+    }
 
     if (!buffer_append_cstr(&buf, "\\section{Executive Summary}\n\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\subsection{Overview}\n")) goto cleanup;
@@ -7064,6 +7192,7 @@ static int build_report_latex(const ReportData *report,
     if (!append_narrative_section(&buf, "Recommendations", narratives->recommendations)) goto cleanup;
     if (!append_narrative_section(&buf, "Conclusion", narratives->conclusion)) goto cleanup;
 
+finalize:
     if (!buffer_append_cstr(&buf, "\\end{document}\n")) goto cleanup;
 
     if (write_buffer_to_file(output_path, buf.data, buf.length) != 0) {
@@ -7302,6 +7431,7 @@ static void handle_client(int client_fd, void *ctx) {
                 char *cover_zip_value = NULL;
                 char *cover_contact_name_value = NULL;
                 char *cover_contact_email_value = NULL;
+                bool deficiency_only = json_as_bool_default(json_object_get(root, "deficiency_only"), false);
 
                 const struct {
                     const char *key;
@@ -7365,12 +7495,13 @@ static void handle_client(int client_fd, void *ctx) {
                 cover_contact_name_value = NULL;
                 request.cover_contact_email = cover_contact_email_value;
                 cover_contact_email_value = NULL;
+                request.deficiency_only = deficiency_only;
 
                 char *existing_job_id = NULL;
                 char *existing_status = NULL;
                 bool existing_artifact_ready = false;
                 char *lookup_error = NULL;
-                int existing = db_find_existing_report_job(conn, request.address, &existing_job_id, &existing_status, &existing_artifact_ready, &lookup_error);
+                int existing = db_find_existing_report_job(conn, request.address, request.deficiency_only, &existing_job_id, &existing_status, &existing_artifact_ready, &lookup_error);
                 if (existing < 0) {
                     char *body = build_error_response(lookup_error ? lookup_error : "Failed to check existing reports");
                     send_http_json(client_fd, 500, "Internal Server Error", body);
@@ -7403,7 +7534,8 @@ static void handle_client(int client_fd, void *ctx) {
                                              existing_status ? existing_status : (artifact_ready ? "completed" : "queued"),
                                              existing_job_id,
                                              request.address,
-                                             download_url);
+                                             download_url,
+                                             request.deficiency_only);
                     free(download_url);
                     free(existing_job_id);
                     free(existing_status);
@@ -7434,7 +7566,7 @@ static void handle_client(int client_fd, void *ctx) {
                 }
                 free(insert_error);
 
-                send_report_job_response(client_fd, 202, "queued", job_id, request.address, NULL);
+                send_report_job_response(client_fd, 202, "queued", job_id, request.address, NULL, request.deficiency_only);
                 report_job_clear(&request);
                 signal_report_worker();
                 return;

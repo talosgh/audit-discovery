@@ -19,7 +19,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [jobId, setJobId] = createSignal<string | null>(null);
   const [jobStatus, setJobStatus] = createSignal<ReportJobStatus | null>(null);
   const [statusMessage, setStatusMessage] = createSignal<string | null>(null);
-  const [lastDownload, setLastDownload] = createSignal<{ jobId: string; filename: string } | null>(null);
+  const [lastDownload, setLastDownload] = createSignal<{ jobId: string; filename: string; label: string } | null>(null);
+  const [reportMode, setReportMode] = createSignal<'full' | 'deficiency'>('full');
   const [showReportModal, setShowReportModal] = createSignal(false);
   const [coverOwner, setCoverOwner] = createSignal('');
   const [coverStreet, setCoverStreet] = createSignal('');
@@ -49,29 +50,33 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
   const updateStatusFromPoll = (status: ReportJobStatus) => {
     setJobStatus(status);
+    const isDeficiency = Boolean(status.deficiency_only);
+    const label = isDeficiency ? 'Deficiency list' : 'Report';
     if (status.status === 'failed') {
       setStatusMessage(null);
-      setErrorMessage(status.error ?? 'Report generation failed');
+      setErrorMessage(status.error ?? `${label} generation failed`);
       setIsGenerating(false);
       stopPolling();
       return;
     }
     if (status.status === 'completed' && status.download_ready) {
       setStatusMessage(null);
-      setMessage('Report ready for download.');
+      setMessage(`${label} ready for download.`);
       setIsGenerating(false);
       stopPolling();
       setLastDownload(null);
-      void refetch();
+      if (!isDeficiency) {
+        void refetch();
+      }
       return;
     }
     setMessage(null);
     if (status.status === 'processing') {
-      setStatusMessage('Report generation in progress…');
+      setStatusMessage(`${label} generation in progress…`);
     } else if (status.status === 'queued') {
-      setStatusMessage('Report queued for generation…');
+      setStatusMessage(`${label} queued for generation…`);
     } else {
-      setStatusMessage(`Status: ${status.status}`);
+      setStatusMessage(`${label} status: ${status.status}`);
     }
   };
 
@@ -117,6 +122,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setCoverContactEmail('');
     setNarrativeSeed('');
     setRecommendationsSeed('');
+    setReportMode('full');
   });
 
   createEffect(() => {
@@ -145,10 +151,11 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     });
   });
 
-  const openReportModal = () => {
+  const openReportModal = (mode: 'full' | 'deficiency') => {
     if (isGenerating()) {
       return;
     }
+    setReportMode(mode);
     setMessage(null);
     setErrorMessage(null);
     setFormError(null);
@@ -177,6 +184,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       return;
     }
     setFormError(null);
+
+    const mode = reportMode();
+    const isDeficiency = mode === 'deficiency';
+    const label = isDeficiency ? 'Deficiency list' : 'Report';
 
     const owner = coverOwner().trim();
     const street = coverStreet().trim();
@@ -217,7 +228,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
     try {
       setIsGenerating(true);
-      setStatusMessage('Report queued for generation…');
+      setStatusMessage(`${label} queued for generation…`);
       setLastDownload(null);
       const response = await createReportJob({
         address: props.address,
@@ -229,7 +240,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
         coverContactName: contactName,
         coverContactEmail: contactEmail,
         notes: notesSeed,
-        recommendations: recsSeed
+        recommendations: recsSeed,
+        deficiencyOnly: isDeficiency
       });
       setJobId(response.job_id);
       setShowReportModal(false);
@@ -238,13 +250,13 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     } catch (error) {
       setIsGenerating(false);
       setStatusMessage(null);
-      const message = error instanceof Error ? error.message : 'Failed to queue report';
+      const message = error instanceof Error ? error.message : `Failed to queue ${label.toLowerCase()}`;
       setErrorMessage(message);
       setFormError(message);
     }
   };
 
-  const downloadReportFor = async (targetJobId: string) => {
+  const downloadReportFor = async (targetJobId: string, label: string) => {
     setErrorMessage(null);
     setMessage(null);
     setStatusMessage(null);
@@ -271,9 +283,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
-      setLastDownload({ jobId: targetJobId, filename });
+      setMessage(`${label} downloaded as ${filename}`);
+      setLastDownload({ jobId: targetJobId, filename, label });
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Failed to download report';
+      const message = error instanceof Error ? error.message : `Failed to download ${label.toLowerCase()}`;
       setErrorMessage(message);
     }
   };
@@ -281,11 +294,14 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const handleDownloadReport = async () => {
     const id = jobId();
     if (!id) return;
-    await downloadReportFor(id);
+    const status = jobStatus();
+    const isDeficiency = Boolean(status?.deficiency_only);
+    const label = isDeficiency ? 'Deficiency list' : 'Report';
+    await downloadReportFor(id, label);
   };
 
   const handleDownloadExisting = async (id: string) => {
-    await downloadReportFor(id);
+    await downloadReportFor(id, 'Report');
   };
 
   const topDeficiencyCodes = createMemo(() => {
@@ -323,14 +339,24 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
             type="button"
             class="action-button"
             disabled={isGenerating()}
-            onClick={openReportModal}
+            onClick={() => openReportModal('full')}
           >
-            {isGenerating() ? 'Generating…' : 'Generate Report'}
+            {isGenerating() && reportMode() === 'full' ? 'Generating…' : 'Generate Report'}
+          </button>
+          <button
+            type="button"
+            class="action-button"
+            disabled={isGenerating()}
+            onClick={() => openReportModal('deficiency')}
+          >
+            {isGenerating() && reportMode() === 'deficiency' ? 'Generating…' : 'Generate Deficiency List'}
           </button>
           <Show when={jobStatus()?.download_ready}>
-            <button type="button" class="action-button" onClick={handleDownloadReport}>
-              Download Report
-            </button>
+            {(status) => (
+              <button type="button" class="action-button" onClick={handleDownloadReport}>
+                {status().deficiency_only ? 'Download Deficiency List' : 'Download Report'}
+              </button>
+            )}
           </Show>
         </div>
       </div>
@@ -435,8 +461,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
             <Show when={lastDownload()}>
               {(info) => (
                 <div class="success-banner" role="status">
-                  <span>Report downloaded as {info().filename}</span>
-                  <button type="button" class="link-button" onClick={() => void handleDownloadExisting(info().jobId)}>
+                  <span>{info().label} downloaded as {info().filename}</span>
+                  <button type="button" class="link-button" onClick={() => void downloadReportFor(info().jobId, info().label)}>
                     Download again
                   </button>
                 </div>

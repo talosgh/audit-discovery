@@ -115,6 +115,10 @@ export async function createReportJob(request: ReportJobCreateRequest): Promise<
     payload.cover_contact_email = contactEmail;
   }
 
+  if (request.deficiencyOnly) {
+    payload.deficiency_only = true;
+  }
+
   const response = await fetch(buildUrl('/reports'), {
     method: 'POST',
     headers: {
