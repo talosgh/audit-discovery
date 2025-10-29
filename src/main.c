@@ -24,6 +24,10 @@
 #include <curl/curl.h>
 #include <math.h>
 
+#ifndef TEXTOID
+#define TEXTOID 25
+#endif
+
 #include "buffer.h"
 #include "config.h"
 #include "csv.h"
@@ -2307,7 +2311,7 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
     }
 
     const char *params[4] = { location_code, street_trim, city_trim, state_trim };
-
+    const Oid param_types[4] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID };
     const char *sql_summary =
         "SELECT COUNT(*)::bigint AS total_tickets, "
         "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS total_hours, "
@@ -2341,7 +2345,7 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
         "ORDER BY COUNT(*) DESC "
         "LIMIT 5";
 
-    PGresult *summary_res = PQexecParams(conn, sql_summary, 4, NULL, params, NULL, NULL, 0);
+    PGresult *summary_res = PQexecParams(conn, sql_summary, 4, param_types, params, NULL, NULL, 0);
     if (!summary_res || PQresultStatus(summary_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = summary_res ? PQresultErrorMessage(summary_res) : PQerrorMessage(conn);
@@ -2354,7 +2358,7 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
         goto cleanup;
     }
 
-    PGresult *problem_res = PQexecParams(conn, sql_top_problems, 4, NULL, params, NULL, NULL, 0);
+    PGresult *problem_res = PQexecParams(conn, sql_top_problems, 4, param_types, params, NULL, NULL, 0);
     if (!problem_res || PQresultStatus(problem_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = problem_res ? PQresultErrorMessage(problem_res) : PQerrorMessage(conn);
@@ -2367,7 +2371,7 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
         goto cleanup_summary;
     }
 
-    PGresult *trend_res = PQexecParams(conn, sql_trend, 4, NULL, params, NULL, NULL, 0);
+    PGresult *trend_res = PQexecParams(conn, sql_trend, 4, param_types, params, NULL, NULL, 0);
     if (!trend_res || PQresultStatus(trend_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = trend_res ? PQresultErrorMessage(trend_res) : PQerrorMessage(conn);
@@ -2380,7 +2384,7 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
         goto cleanup_problem;
     }
 
-    PGresult *vendor_res = PQexecParams(conn, sql_vendor, 4, NULL, params, NULL, NULL, 0);
+    PGresult *vendor_res = PQexecParams(conn, sql_vendor, 4, param_types, params, NULL, NULL, 0);
     if (!vendor_res || PQresultStatus(vendor_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = vendor_res ? PQresultErrorMessage(vendor_res) : PQerrorMessage(conn);
@@ -5705,6 +5709,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
     char *state_trim = (profile && profile->state) ? trim_copy(profile->state) : NULL;
 
     const char *params[4] = { location_code, street_trim, city_trim, state_trim };
+    const Oid param_types[4] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID };
     const char *sql_summary =
         "SELECT COUNT(*)::bigint AS total_tickets, "
         "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS total_hours, "
@@ -5712,7 +5717,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         "FROM esa_in_progress "
         "WHERE " SERVICE_FILTER;
 
-    PGresult *res = PQexecParams(conn, sql_summary, 4, NULL, params, NULL, NULL, 0);
+    PGresult *res = PQexecParams(conn, sql_summary, 4, param_types, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(res);
@@ -5750,7 +5755,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         "GROUP BY sd_problem_desc "
         "ORDER BY COUNT(*) DESC "
         "LIMIT 5";
-    PGresult *problem_res = PQexecParams(conn, sql_top_problems, 4, NULL, params, NULL, NULL, 0);
+    PGresult *problem_res = PQexecParams(conn, sql_top_problems, 4, param_types, params, NULL, NULL, 0);
     if (PQresultStatus(problem_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(problem_res);
@@ -5773,7 +5778,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         "GROUP BY bucket "
         "ORDER BY bucket DESC "
         "LIMIT 12";
-    PGresult *trend_res = PQexecParams(conn, sql_trend, 4, NULL, params, NULL, NULL, 0);
+    PGresult *trend_res = PQexecParams(conn, sql_trend, 4, param_types, params, NULL, NULL, 0);
     if (PQresultStatus(trend_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(trend_res);
@@ -5796,7 +5801,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         "GROUP BY vendor "
         "ORDER BY COUNT(*) DESC "
         "LIMIT 5";
-    PGresult *vendor_res = PQexecParams(conn, sql_vendor_breakdown, 4, NULL, params, NULL, NULL, 0);
+    PGresult *vendor_res = PQexecParams(conn, sql_vendor_breakdown, 4, param_types, params, NULL, NULL, 0);
     if (PQresultStatus(vendor_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(vendor_res);
