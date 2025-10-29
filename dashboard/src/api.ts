@@ -119,6 +119,14 @@ export async function createReportJob(request: ReportJobCreateRequest): Promise<
     payload.deficiency_only = true;
   }
 
+  if (request.visitIds && request.visitIds.length > 0) {
+    payload.visit_ids = request.visitIds;
+  }
+
+  if (request.auditIds && request.auditIds.length > 0) {
+    payload.audit_ids = request.auditIds;
+  }
+
   const response = await fetch(buildUrl('/reports'), {
     method: 'POST',
     headers: {

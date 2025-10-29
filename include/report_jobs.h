@@ -3,8 +3,9 @@
 
 #include <libpq-fe.h>
 #include <stdbool.h>
-#include <stdbool.h>
 #include <stddef.h>
+
+#include "util.h"
 
 typedef struct {
     char job_id[37];
@@ -19,6 +20,10 @@ typedef struct {
     char *cover_contact_name;
     char *cover_contact_email;
     bool deficiency_only;
+    bool include_all;
+    bool has_location_id;
+    int location_id;
+    StringArray audit_ids;
 } ReportJob;
 
 void report_job_init(ReportJob *job);
@@ -39,6 +44,7 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
 int db_find_existing_report_job(PGconn *conn,
                                 const char *address,
                                 bool deficiency_only,
+                                bool include_all,
                                 char **job_id_out,
                                 char **status_out,
                                 bool *artifact_ready_out,

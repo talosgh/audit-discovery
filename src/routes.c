@@ -138,18 +138,34 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
 
     if (strcmp(path, "/locations") == 0) {
         char *address_value = http_extract_query_param(query_string, "address");
-        if (address_value && address_value[0] != '\0') {
+        char *location_id_value = http_extract_query_param(query_string, "location_id");
+        char *visit_ids_value = http_extract_query_param(query_string, "visit_ids");
+        char *audit_ids_value = http_extract_query_param(query_string, "audit_ids");
+        bool has_detail = (address_value && address_value[0] != '\0') || (location_id_value && location_id_value[0] != '\0');
+        if (has_detail) {
             if (!g_route_helpers.build_location_detail) {
                 free(address_value);
+                free(location_id_value);
+                free(visit_ids_value);
+                free(audit_ids_value);
                 char *body = build_error_response("Location helper not configured");
                 send_http_json(client_fd, 500, "Internal Server Error", body);
                 free(body);
                 return;
             }
+            LocationDetailRequest request = {
+                .address = address_value,
+                .location_id = location_id_value,
+                .visit_ids = visit_ids_value,
+                .audit_ids = audit_ids_value
+            };
             int status = 500;
             char *error = NULL;
-            char *json = g_route_helpers.build_location_detail(conn, address_value, &status, &error);
+            char *json = g_route_helpers.build_location_detail(conn, &request, &status, &error);
             free(address_value);
+            free(location_id_value);
+            free(visit_ids_value);
+            free(audit_ids_value);
             if (!json) {
                 char *body = build_error_response(error ? error : "Failed to load location detail");
                 send_http_json(client_fd, status, status == 404 ? "Not Found" : "Internal Server Error", body);
@@ -163,6 +179,9 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
             return;
         }
         free(address_value);
+        free(location_id_value);
+        free(visit_ids_value);
+        free(audit_ids_value);
 
         char *error = NULL;
         char *json = db_fetch_location_list(conn, &error);
@@ -180,9 +199,16 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
 
     if (strcmp(path, "/reports") == 0) {
         char *address_value = http_extract_query_param(query_string, "address");
-        if (!address_value || address_value[0] == '\0') {
+        char *location_id_value = http_extract_query_param(query_string, "location_id");
+        char *visit_ids_value = http_extract_query_param(query_string, "visit_ids");
+        char *audit_ids_value = http_extract_query_param(query_string, "audit_ids");
+        bool has_key = (address_value && address_value[0] != '\0') || (location_id_value && location_id_value[0] != '\0');
+        if (!has_key) {
             free(address_value);
-            char *body = build_error_response("address query parameter required");
+            free(location_id_value);
+            free(visit_ids_value);
+            free(audit_ids_value);
+            char *body = build_error_response("address or location_id query parameter required");
             send_http_json(client_fd, 400, "Bad Request", body);
             free(body);
             return;
@@ -190,16 +216,29 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
 
         if (!g_route_helpers.build_report_json) {
             free(address_value);
+            free(location_id_value);
+            free(visit_ids_value);
+            free(audit_ids_value);
             char *body = build_error_response("Report helper not configured");
             send_http_json(client_fd, 500, "Internal Server Error", body);
             free(body);
             return;
         }
 
+        LocationDetailRequest request = {
+            .address = address_value,
+            .location_id = location_id_value,
+            .visit_ids = visit_ids_value,
+            .audit_ids = audit_ids_value
+        };
+
         int status = 500;
         char *error = NULL;
-        char *json = g_route_helpers.build_report_json(conn, address_value, &status, &error);
+        char *json = g_route_helpers.build_report_json(conn, &request, &status, &error);
         free(address_value);
+        free(location_id_value);
+        free(visit_ids_value);
+        free(audit_ids_value);
         if (!json) {
             char *body = build_error_response(error ? error : "Failed to build report");
             send_http_json(client_fd, status, status == 404 ? "Not Found" : "Internal Server Error", body);

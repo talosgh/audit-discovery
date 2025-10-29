@@ -1,3 +1,5 @@
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 CREATE TABLE IF NOT EXISTS audits (
     audit_uuid UUID PRIMARY KEY,
     form_id BIGINT,
@@ -99,6 +101,22 @@ CREATE TABLE IF NOT EXISTS audits (
     mobile_memory_mb BIGINT
 );
 
+CREATE TABLE IF NOT EXISTS audit_visits (
+    visit_id UUID PRIMARY KEY,
+    location_id INTEGER REFERENCES locations(id),
+    building_address TEXT NOT NULL,
+    street TEXT,
+    city TEXT,
+    state TEXT,
+    zip_code TEXT,
+    visit_label TEXT,
+    source_filename TEXT,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS audit_photos (
     id BIGSERIAL PRIMARY KEY,
     audit_uuid UUID NOT NULL REFERENCES audits(audit_uuid) ON DELETE CASCADE,
@@ -127,9 +145,15 @@ CREATE TABLE IF NOT EXISTS audit_deficiencies (
 
 CREATE INDEX IF NOT EXISTS idx_audit_photos_audit_uuid ON audit_photos (audit_uuid);
 CREATE INDEX IF NOT EXISTS idx_audit_deficiencies_audit_uuid ON audit_deficiencies (audit_uuid);
+CREATE INDEX IF NOT EXISTS idx_audit_visits_location_id ON audit_visits (location_id);
+CREATE INDEX IF NOT EXISTS idx_audit_visits_started_at ON audit_visits (started_at);
 
 ALTER TABLE audit_deficiencies
     ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+
+ALTER TABLE audits
+    ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id),
+    ADD COLUMN IF NOT EXISTS visit_id UUID REFERENCES audit_visits(visit_id);
 
 CREATE TABLE IF NOT EXISTS report_jobs (
     id BIGSERIAL PRIMARY KEY,
@@ -156,7 +180,9 @@ CREATE TABLE IF NOT EXISTS report_jobs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at TIMESTAMPTZ,
-    completed_at TIMESTAMPTZ
+    completed_at TIMESTAMPTZ,
+    location_id INTEGER REFERENCES locations(id),
+    include_all BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_report_jobs_job_id ON report_jobs (job_id);
@@ -175,4 +201,12 @@ ALTER TABLE report_jobs
     ADD COLUMN IF NOT EXISTS cover_state TEXT,
     ADD COLUMN IF NOT EXISTS cover_zip TEXT,
     ADD COLUMN IF NOT EXISTS cover_contact_name TEXT,
-    ADD COLUMN IF NOT EXISTS cover_contact_email TEXT;
+    ADD COLUMN IF NOT EXISTS cover_contact_email TEXT,
+    ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id),
+    ADD COLUMN IF NOT EXISTS include_all BOOLEAN NOT NULL DEFAULT TRUE;
+
+CREATE TABLE IF NOT EXISTS report_job_audits (
+    job_id UUID NOT NULL REFERENCES report_jobs(job_id) ON DELETE CASCADE,
+    audit_uuid UUID NOT NULL REFERENCES audits(audit_uuid) ON DELETE CASCADE,
+    PRIMARY KEY (job_id, audit_uuid)
+);

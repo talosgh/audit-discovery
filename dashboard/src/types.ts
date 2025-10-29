@@ -167,6 +167,86 @@ export interface LocationDevice {
   deficiencies: LocationDeviceDeficiency[];
 }
 
+export interface LocationProfileInfo {
+  location_code: string | null;
+  site_name: string | null;
+  street: string | null;
+  city: string | null;
+  state: string | null;
+  zip: string | null;
+  address_label: string | null;
+  owner: {
+    name: string | null;
+    id: string | null;
+  };
+  operator: {
+    name: string | null;
+    id: string | null;
+  };
+  vendor: {
+    name: string | null;
+    id: string | null;
+  };
+}
+
+export interface ServiceProblem {
+  problem: string | null;
+  count: number;
+}
+
+export interface ServiceTrendPoint {
+  month: string | null;
+  spend?: number; // compatibility
+  tickets?: number;
+  hours?: number;
+}
+
+export interface ServiceVendorMix {
+  vendor: string | null;
+  tickets: number;
+}
+
+export interface ServiceSummary {
+  total_tickets: number;
+  total_hours: number;
+  last_service: string | null;
+  top_problems: ServiceProblem[];
+  monthly_trend: ServiceTrendPoint[];
+  vendor_mix: ServiceVendorMix[];
+}
+
+export interface FinancialTrendPoint {
+  month: string | null;
+  spend: number;
+}
+
+export interface FinancialBreakdownItem {
+  category?: string | null;
+  status?: string | null;
+  spend: number;
+}
+
+export interface FinancialSummary {
+  total_records: number;
+  total_spend: number;
+  approved_spend: number;
+  open_spend: number;
+  last_statement: string | null;
+  monthly_trend: FinancialTrendPoint[];
+  category_breakdown: FinancialBreakdownItem[];
+  status_breakdown: FinancialBreakdownItem[];
+}
+
+export interface VisitSummary {
+  visit_id: string | null;
+  label: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  audit_count: number;
+  device_count: number;
+  open_deficiencies: number;
+}
+
 export interface ReportVersion {
   job_id: string;
   version: number | null;
@@ -175,6 +255,8 @@ export interface ReportVersion {
   filename: string | null;
   size_bytes: number | null;
   download_url: string | null;
+   include_all?: boolean;
+   selected_count?: number;
 }
 
 export interface LocationDetail {
@@ -192,6 +274,10 @@ export interface LocationDetail {
     deficiencies_by_code: Record<string, number>;
   };
   devices: LocationDevice[];
+  profile: LocationProfileInfo;
+  service: ServiceSummary;
+  financial: FinancialSummary;
+  visits: VisitSummary[];
   reports: ReportVersion[];
   deficiency_reports: ReportVersion[];
 }
@@ -208,6 +294,8 @@ export interface ReportJobCreateRequest {
   coverContactName?: string;
   coverContactEmail?: string;
   deficiencyOnly?: boolean;
+  visitIds?: string[];
+  auditIds?: string[];
 }
 
 export interface ReportJobCreateResponse {
@@ -226,8 +314,11 @@ export interface ReportJobStatus {
   error: string | null;
   download_ready: boolean;
   deficiency_only: boolean;
+  include_all: boolean;
+  location_id?: string | null;
   artifact_filename?: string | null;
   artifact_size?: number | null;
   version?: number | null;
   download_url?: string | null;
+  selected_audit_count?: number;
 }

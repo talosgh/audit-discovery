@@ -1,7 +1,7 @@
 CC ?= gcc
 CFLAGS ?= -std=c11 -Wall -Wextra -pedantic -O2 -D_DEFAULT_SOURCE -D_XOPEN_SOURCE=700
 CPPFLAGS ?= -Iinclude -I/usr/include/postgresql
-LDFLAGS ?= -lpq -lpthread -lcurl
+LDFLAGS ?= -lpq -lpthread -lcurl -lm
 
 SRC := src/main.c \
        src/csv.c \

@@ -24,6 +24,10 @@ void report_job_init(ReportJob *job) {
     job->cover_contact_name = NULL;
     job->cover_contact_email = NULL;
     job->deficiency_only = false;
+    job->include_all = true;
+    job->has_location_id = false;
+    job->location_id = 0;
+    string_array_init(&job->audit_ids);
 }
 
 void report_job_clear(ReportJob *job) {
@@ -40,6 +44,7 @@ void report_job_clear(ReportJob *job) {
     free(job->cover_zip);
     free(job->cover_contact_name);
     free(job->cover_contact_email);
+    string_array_clear(&job->audit_ids);
     job->address = NULL;
     job->notes = NULL;
     job->recommendations = NULL;
@@ -52,6 +57,44 @@ void report_job_clear(ReportJob *job) {
     job->cover_contact_email = NULL;
     job->job_id[0] = '\0';
     job->deficiency_only = false;
+    job->include_all = true;
+    job->has_location_id = false;
+    job->location_id = 0;
+}
+
+static int db_insert_job_audits(PGconn *conn, const char *job_id, const StringArray *audits, char **error_out) {
+    if (!audits || audits->count == 0) {
+        return 1;
+    }
+    if (!conn || !job_id || job_id[0] == '\0') {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid parameters inserting report job audits");
+        }
+        return 0;
+    }
+
+    const char *sql = "INSERT INTO report_job_audits (job_id, audit_uuid) VALUES ($1::uuid, $2::uuid)";
+    for (size_t i = 0; i < audits->count; ++i) {
+        const char *audit_id = audits->values[i];
+        if (!audit_id || !is_valid_uuid(audit_id)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Invalid audit identifier in job selection");
+            }
+            return 0;
+        }
+        const char *params[2] = { job_id, audit_id };
+        PGresult *res = PQexecParams(conn, sql, 2, NULL, params, NULL, NULL, 0);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            if (error_out && !*error_out) {
+                const char *msg = PQresultErrorMessage(res);
+                *error_out = strdup(msg ? msg : "Failed to insert report job audit selection");
+            }
+            PQclear(res);
+            return 0;
+        }
+        PQclear(res);
+    }
+    return 1;
 }
 
 int db_insert_report_job(PGconn *conn, const char *job_id, const ReportJob *job, char **error_out) {
@@ -61,11 +104,19 @@ int db_insert_report_job(PGconn *conn, const char *job_id, const ReportJob *job,
         }
         return 0;
     }
+    bool include_all = job->include_all || job->audit_ids.count == 0;
+
     const char *sql =
         "INSERT INTO report_jobs (job_id, address, notes, recommendations, "
-        "cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email, deficiency_only) "
-        "VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
-    const char *params[12] = {
+        "cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email, deficiency_only, location_id, include_all) "
+        "VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)";
+    char location_buf[32];
+    const char *location_param = NULL;
+    if (job->has_location_id) {
+        snprintf(location_buf, sizeof(location_buf), "%d", job->location_id);
+        location_param = location_buf;
+    }
+    const char *params[14] = {
         job_id,
         job->address,
         job->notes,
@@ -77,9 +128,12 @@ int db_insert_report_job(PGconn *conn, const char *job_id, const ReportJob *job,
         job->cover_zip,
         job->cover_contact_name,
         job->cover_contact_email,
-        job->deficiency_only ? "true" : "false"
+        job->deficiency_only ? "true" : "false",
+        location_param,
+        include_all ? "true" : "false"
     };
-    PGresult *res = PQexecParams(conn, sql, 12, NULL, params, NULL, NULL, 0);
+    int param_count = location_param ? 14 : 13;
+    PGresult *res = PQexecParams(conn, sql, param_count, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(res);
@@ -89,6 +143,25 @@ int db_insert_report_job(PGconn *conn, const char *job_id, const ReportJob *job,
         return 0;
     }
     PQclear(res);
+
+    if (job->audit_ids.count > 0) {
+        char *audit_error = NULL;
+        if (!db_insert_job_audits(conn, job_id, &job->audit_ids, &audit_error)) {
+            const char *del_params[1] = { job_id };
+            PGresult *del_res = PQexecParams(conn, "DELETE FROM report_jobs WHERE job_id = $1::uuid", 1, NULL, del_params, NULL, NULL, 0);
+            if (del_res) {
+                PQclear(del_res);
+            }
+            if (error_out && !*error_out) {
+                *error_out = audit_error ? audit_error : strdup("Failed to insert report job audits");
+            } else {
+                free(audit_error);
+            }
+            return 0;
+        }
+        free(audit_error);
+    }
+
     return 1;
 }
 
@@ -102,7 +175,7 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
     const char *sql =
         "WITH job AS ("
         "    SELECT id, job_id::text AS job_id_text, address, notes, recommendations, "
-        "           cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email, deficiency_only "
+        "           cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email, deficiency_only, location_id, include_all "
         "    FROM report_jobs "
         "    WHERE status = 'queued' "
         "    ORDER BY created_at "
@@ -114,7 +187,7 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
         "FROM job "
         "WHERE r.id = job.id "
         "RETURNING job.job_id_text, job.address, job.notes, job.recommendations, "
-        "          job.cover_building_owner, job.cover_street, job.cover_city, job.cover_state, job.cover_zip, job.cover_contact_name, job.cover_contact_email, job.deficiency_only";
+        "          job.cover_building_owner, job.cover_street, job.cover_city, job.cover_state, job.cover_zip, job.cover_contact_name, job.cover_contact_email, job.deficiency_only, job.location_id, job.include_all";
     PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
@@ -243,7 +316,46 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
         }
     }
     job->deficiency_only = !PQgetisnull(res, 0, 11) && (strcmp(PQgetvalue(res, 0, 11), "t") == 0 || strcmp(PQgetvalue(res, 0, 11), "true") == 0 || strcmp(PQgetvalue(res, 0, 11), "1") == 0);
+    job->has_location_id = false;
+    job->location_id = 0;
+    if (!PQgetisnull(res, 0, 12)) {
+        job->has_location_id = true;
+        job->location_id = atoi(PQgetvalue(res, 0, 12));
+    }
+    job->include_all = PQgetisnull(res, 0, 13) || (strcmp(PQgetvalue(res, 0, 13), "t") == 0 || strcmp(PQgetvalue(res, 0, 13), "true") == 0 || strcmp(PQgetvalue(res, 0, 13), "1") == 0);
     PQclear(res);
+
+    const char *audit_params[1] = { job->job_id };
+    PGresult *audit_res = PQexecParams(conn, "SELECT audit_uuid::text FROM report_job_audits WHERE job_id = $1::uuid ORDER BY audit_uuid", 1, NULL, audit_params, NULL, NULL, 0);
+    if (!audit_res || PQresultStatus(audit_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = audit_res ? PQresultErrorMessage(audit_res) : NULL;
+            *error_out = strdup(msg ? msg : "Failed to load report job audits");
+        }
+        if (audit_res) {
+            PQclear(audit_res);
+        }
+        return -1;
+    }
+    string_array_clear(&job->audit_ids);
+    int audit_rows = PQntuples(audit_res);
+    for (int i = 0; i < audit_rows; ++i) {
+        const char *audit_id = PQgetisnull(audit_res, i, 0) ? NULL : PQgetvalue(audit_res, i, 0);
+        if (!audit_id) {
+            continue;
+        }
+        if (!string_array_append_copy(&job->audit_ids, audit_id)) {
+            PQclear(audit_res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory loading job audits");
+            }
+            return -1;
+        }
+    }
+    PQclear(audit_res);
+    if (job->audit_ids.count > 0) {
+        job->include_all = false;
+    }
     return 1;
 }
 
@@ -378,17 +490,25 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
         return NULL;
     }
     const char *sql =
-        "SELECT job_id::text, status, address, "
-        "       to_char(created_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
-        "       to_char(started_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
-        "       to_char(completed_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
-        "       error, "
-        "       deficiency_only, "
-        "       artifact_size, "
-        "       artifact_filename, "
-        "       artifact_version "
-        "FROM report_jobs "
-        "WHERE job_id = $1::uuid";
+        "SELECT r.job_id::text, r.status, r.address, "
+        "       to_char(r.created_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+        "       to_char(r.started_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+        "       to_char(r.completed_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+        "       r.error, "
+        "       r.deficiency_only, "
+        "       r.include_all, "
+        "       r.location_id, "
+        "       r.artifact_size, "
+        "       r.artifact_filename, "
+        "       r.artifact_version, "
+        "       COALESCE(sel.selection_count, 0) "
+        "FROM report_jobs r "
+        "LEFT JOIN ("
+        "    SELECT job_id, COUNT(*) AS selection_count "
+        "    FROM report_job_audits "
+        "    GROUP BY job_id"
+        ") sel ON sel.job_id = r.job_id "
+        "WHERE r.job_id = $1::uuid";
     const char *params[1] = { job_id };
     PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -415,12 +535,19 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
     const char *completed_val = PQgetisnull(res, 0, 5) ? NULL : PQgetvalue(res, 0, 5);
     const char *error_val = PQgetisnull(res, 0, 6) ? NULL : PQgetvalue(res, 0, 6);
     const char *deficiency_only_val = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
-    const char *artifact_size_val = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
-    const char *artifact_filename_val = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
-    const char *artifact_version_val = PQgetisnull(res, 0, 10) ? NULL : PQgetvalue(res, 0, 10);
+    const char *include_all_val = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
+    const char *location_id_val = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
+    const char *artifact_size_val = PQgetisnull(res, 0, 10) ? NULL : PQgetvalue(res, 0, 10);
+    const char *artifact_filename_val = PQgetisnull(res, 0, 11) ? NULL : PQgetvalue(res, 0, 11);
+    const char *artifact_version_val = PQgetisnull(res, 0, 12) ? NULL : PQgetvalue(res, 0, 12);
+    const char *selection_count_val = PQgetisnull(res, 0, 13) ? NULL : PQgetvalue(res, 0, 13);
     long long artifact_size_num = 0;
     if (artifact_size_val) {
         artifact_size_num = atoll(artifact_size_val);
+    }
+    long long selected_count_num = 0;
+    if (selection_count_val) {
+        selected_count_num = atoll(selection_count_val);
     }
     bool download_ready = status_val && strcmp(status_val, "completed") == 0 && artifact_size_num > 0;
 
@@ -479,6 +606,16 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
     if (!buffer_append_cstr(&buf, ",\"deficiency_only\":")) goto fail;
     if (!buffer_append_cstr(&buf, deficiency_only_val && (strcmp(deficiency_only_val, "t") == 0 || strcmp(deficiency_only_val, "true") == 0 || strcmp(deficiency_only_val, "1") == 0) ? "true" : "false")) goto fail;
 
+    if (!buffer_append_cstr(&buf, ",\"include_all\":")) goto fail;
+    if (!buffer_append_cstr(&buf, include_all_val && (strcmp(include_all_val, "f") == 0 || strcmp(include_all_val, "false") == 0 || strcmp(include_all_val, "0") == 0) ? "false" : "true")) goto fail;
+
+    if (!buffer_append_cstr(&buf, ",\"location_id\":")) goto fail;
+    if (location_id_val && location_id_val[0] != '\0') {
+        if (!buffer_append_json_string(&buf, location_id_val)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+
     if (!buffer_append_cstr(&buf, ",\"artifact_size\":")) goto fail;
     if (artifact_size_val) {
         if (!buffer_append_cstr(&buf, artifact_size_val)) goto fail;
@@ -492,6 +629,9 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
     } else {
         if (!buffer_append_cstr(&buf, "null")) goto fail;
     }
+
+    if (!buffer_append_cstr(&buf, ",\"selected_audit_count\":")) goto fail;
+    if (!buffer_appendf(&buf, "%lld", selected_count_num)) goto fail;
 
     if (!buffer_append_cstr(&buf, ",\"version\":")) goto fail;
     if (artifact_version_val && artifact_version_val[0] != '\0') {
@@ -535,6 +675,7 @@ fail:
 int db_find_existing_report_job(PGconn *conn,
                                 const char *address,
                                 bool deficiency_only,
+                                bool include_all,
                                 char **job_id_out,
                                 char **status_out,
                                 bool *artifact_ready_out,
@@ -548,12 +689,15 @@ int db_find_existing_report_job(PGconn *conn,
         }
         return -1;
     }
+    if (!include_all) {
+        return 0;
+    }
 
     const char *params[2] = { address, deficiency_only ? "true" : "false" };
     const char *active_sql =
         "SELECT job_id::text, status "
         "FROM report_jobs "
-        "WHERE address = $1 AND deficiency_only = $2 AND status IN ('queued','processing') "
+        "WHERE address = $1 AND deficiency_only = $2 AND include_all = true AND status IN ('queued','processing') "
         "ORDER BY created_at DESC "
         "LIMIT 1";
     PGresult *res = PQexecParams(conn, active_sql, 2, NULL, params, NULL, NULL, 0);
@@ -580,7 +724,7 @@ int db_find_existing_report_job(PGconn *conn,
     const char *completed_sql =
         "SELECT job_id::text, status, artifact_size "
         "FROM report_jobs "
-        "WHERE address = $1 AND deficiency_only = $2 AND status = 'completed' AND artifact_size IS NOT NULL "
+        "WHERE address = $1 AND deficiency_only = $2 AND include_all = true AND status = 'completed' AND artifact_size IS NOT NULL "
         "ORDER BY completed_at DESC NULLS LAST "
         "LIMIT 1";
     res = PQexecParams(conn, completed_sql, 2, NULL, params, NULL, NULL, 0);
