@@ -1,7 +1,6 @@
 #include "report_jobs.h"
 
 #include "buffer.h"
-#include "json_utils.h"
 #include "log.h"
 
 #include <stdbool.h>
@@ -225,91 +224,79 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
         return NULL;
     }
 
-    char *job_id_json = json_escape_string(job_id_val ? job_id_val : "");
-    char *status_json = json_escape_string(status_val ? status_val : "unknown");
-    char *address_json = address_val ? json_escape_string(address_val) : NULL;
-    char *error_json = error_val ? json_escape_string(error_val) : NULL;
+    if (!buffer_append_cstr(&buf, "{")) goto fail;
+    if (!buffer_append_cstr(&buf, "\"job_id\":")) goto fail;
+    if (!buffer_append_json_string(&buf, job_id_val ? job_id_val : "")) goto fail;
+    if (!buffer_append_cstr(&buf, ",\"status\":")) goto fail;
+    if (!buffer_append_json_string(&buf, status_val ? status_val : "unknown")) goto fail;
+    if (!buffer_append_cstr(&buf, ",\"address\":")) goto fail;
+    if (address_val) {
+        if (!buffer_append_json_string(&buf, address_val)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
 
-    buffer_append_cstr(&buf, "{");
-    buffer_append_cstr(&buf, "\"job_id\":");
-    buffer_append_cstr(&buf, job_id_json ? job_id_json : "\"\"");
-    buffer_append_cstr(&buf, ",\"status\":");
-    buffer_append_cstr(&buf, status_json ? status_json : "\"unknown\"");
-    buffer_append_cstr(&buf, ",\"address\":");
-    buffer_append_cstr(&buf, address_json ? address_json : "null");
-
-    buffer_append_cstr(&buf, ",\"created_at\":");
+    if (!buffer_append_cstr(&buf, ",\"created_at\":")) goto fail;
     if (created_val) {
-        char *created_json = json_escape_string(created_val);
-        buffer_append_cstr(&buf, created_json ? created_json : "null");
-        free(created_json);
+        if (!buffer_append_json_string(&buf, created_val)) goto fail;
     } else {
-        buffer_append_cstr(&buf, "null");
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
     }
 
-    buffer_append_cstr(&buf, ",\"started_at\":");
+    if (!buffer_append_cstr(&buf, ",\"started_at\":")) goto fail;
     if (started_val) {
-        char *started_json = json_escape_string(started_val);
-        buffer_append_cstr(&buf, started_json ? started_json : "null");
-        free(started_json);
+        if (!buffer_append_json_string(&buf, started_val)) goto fail;
     } else {
-        buffer_append_cstr(&buf, "null");
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
     }
 
-    buffer_append_cstr(&buf, ",\"completed_at\":");
+    if (!buffer_append_cstr(&buf, ",\"completed_at\":")) goto fail;
     if (completed_val) {
-        char *completed_json = json_escape_string(completed_val);
-        buffer_append_cstr(&buf, completed_json ? completed_json : "null");
-        free(completed_json);
+        if (!buffer_append_json_string(&buf, completed_val)) goto fail;
     } else {
-        buffer_append_cstr(&buf, "null");
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
     }
 
-    buffer_append_cstr(&buf, ",\"error\":");
-    if (error_json) {
-        buffer_append_cstr(&buf, error_json);
+    if (!buffer_append_cstr(&buf, ",\"error\":")) goto fail;
+    if (error_val) {
+        if (!buffer_append_json_string(&buf, error_val)) goto fail;
     } else {
-        buffer_append_cstr(&buf, "null");
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
     }
 
-    buffer_append_cstr(&buf, ",\"download_ready\":");
-    buffer_append_cstr(&buf, download_ready ? "true" : "false");
+    if (!buffer_append_cstr(&buf, ",\"download_ready\":")) goto fail;
+    if (!buffer_append_cstr(&buf, download_ready ? "true" : "false")) goto fail;
 
-    buffer_append_cstr(&buf, ",\"download_url\":");
+    if (!buffer_append_cstr(&buf, ",\"download_url\":")) goto fail;
     if (download_ready && job_id_val) {
         Buffer url_buf;
-        buffer_init(&url_buf);
+        if (!buffer_init(&url_buf)) goto fail;
         const char *prefix = (path_prefix && path_prefix[0]) ? path_prefix : "";
-        buffer_append_cstr(&url_buf, prefix);
-        buffer_append_cstr(&url_buf, "/reports/");
-        buffer_append_cstr(&url_buf, job_id_val);
-        buffer_append_cstr(&url_buf, "/download");
-        char *url_str = url_buf.data ? url_buf.data : NULL;
-        if (url_str) {
-            char *url_json = json_escape_string(url_str);
-            buffer_append_cstr(&buf, url_json ? url_json : "null");
-            free(url_json);
-            url_buf.data = NULL;
-        } else {
-            buffer_append_cstr(&buf, "null");
-        }
+        if (!buffer_append_cstr(&url_buf, prefix)) { buffer_free(&url_buf); goto fail; }
+        if (!buffer_append_cstr(&url_buf, "/reports/")) { buffer_free(&url_buf); goto fail; }
+        if (!buffer_append_cstr(&url_buf, job_id_val)) { buffer_free(&url_buf); goto fail; }
+        if (!buffer_append_cstr(&url_buf, "/download")) { buffer_free(&url_buf); goto fail; }
+        if (!buffer_append_json_string(&buf, url_buf.data ? url_buf.data : "")) { buffer_free(&url_buf); goto fail; }
         buffer_free(&url_buf);
     } else {
-        buffer_append_cstr(&buf, "null");
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
     }
 
-    buffer_append_cstr(&buf, "}");
+    if (!buffer_append_cstr(&buf, "}")) goto fail;
 
-    free(job_id_json);
-    free(status_json);
-    free(address_json);
-    free(error_json);
     PQclear(res);
-
     char *result = buf.data;
     buf.data = NULL;
     buffer_free(&buf);
     return result;
+
+fail:
+    buffer_free(&buf);
+    PQclear(res);
+    if (error_out && !*error_out) {
+        *error_out = strdup("Out of memory");
+    }
+    return NULL;
 }
 
 int db_fetch_report_download_path(PGconn *conn, const char *job_id, char **path_out, char **error_out) {

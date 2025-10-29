@@ -30,7 +30,6 @@
 #include "fsutil.h"
 #include "http.h"
 #include "json.h"
-#include "json_utils.h"
 #include "log.h"
 #include "routes.h"
 #include "report_jobs.h"
@@ -406,6 +405,7 @@ static char *report_data_to_json(const ReportData *report);
 static char *build_location_detail_payload(PGconn *conn, const char *address, int *status_out, char **error_out);
 static char *build_report_json_payload(PGconn *conn, const char *address, int *status_out, char **error_out);
 static char *build_download_url(const char *job_id);
+static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url);
 static int generate_uuid_v4(char out[37]);
 static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out);
 static void *report_worker_main(void *arg);
@@ -1430,6 +1430,50 @@ static char *build_download_url(const char *job_id) {
     pos += sizeof(download_segment) - 1;
     url[pos] = '\0';
     return url;
+}
+
+static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url) {
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        char *body = build_error_response("Out of memory");
+        send_http_json(client_fd, 500, "Internal Server Error", body);
+        free(body);
+        return;
+    }
+
+    if (!buffer_append_cstr(&buf, "{")) goto fail;
+    if (!buffer_append_cstr(&buf, "\"status\":")) goto fail;
+    if (!buffer_append_json_string(&buf, status_value ? status_value : "queued")) goto fail;
+    if (!buffer_append_cstr(&buf, ",\"job_id\":")) goto fail;
+    if (!buffer_append_json_string(&buf, job_id ? job_id : "")) goto fail;
+    if (!buffer_append_cstr(&buf, ",\"address\":")) goto fail;
+    if (address_value) {
+        if (!buffer_append_json_string(&buf, address_value)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+    if (!buffer_append_cstr(&buf, ",\"download_url\":")) goto fail;
+    if (download_url && download_url[0]) {
+        if (!buffer_append_json_string(&buf, download_url)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+    if (!buffer_append_cstr(&buf, "}")) goto fail;
+
+    {
+        const char *status_text = (http_status == 200) ? "OK" : (http_status == 202 ? "Accepted" : "OK");
+        send_http_json(client_fd, http_status, status_text, buf.data ? buf.data : "{}");
+    }
+    buffer_free(&buf);
+    return;
+
+fail:
+    buffer_free(&buf);
+    {
+        char *body = build_error_response("Failed to build response");
+        send_http_json(client_fd, 500, "Internal Server Error", body);
+        free(body);
+    }
 }
 
 static int load_report_for_building(PGconn *conn, const char *building_address, ReportData *report, char **error_out) {
@@ -5509,49 +5553,14 @@ static void handle_client(int client_fd, void *ctx) {
                 }
 
                 if (reuse_job) {
-                    char *address_json = json_escape_string(address_value);
-                    char *status_json = json_escape_string(existing_status ? existing_status : "queued");
-                    char *job_json = json_escape_string(existing_job_id ? existing_job_id : "");
                     char *download_url = artifact_ready ? build_download_url(existing_job_id) : NULL;
-                    char *download_json = download_url ? json_escape_string(download_url) : NULL;
-                    Buffer resp;
-                    if (!buffer_init(&resp)) {
-                        char *body = build_error_response("Out of memory");
-                        send_http_json(client_fd, 500, "Internal Server Error", body);
-                        free(body);
-                        free(download_json);
-                        free(download_url);
-                        free(job_json);
-                        free(status_json);
-                        free(address_json);
-                        free(existing_job_id);
-                        free(existing_status);
-                        free(existing_output_path);
-                        free(address_value);
-                        free(notes_value);
-                        free(recs_value);
-                        return;
-                    }
-                    buffer_append_cstr(&resp, "{\"status\":");
-                    buffer_append_cstr(&resp, status_json ? status_json : "\"queued\"");
-                    buffer_append_cstr(&resp, ",\"job_id\":");
-                    buffer_append_cstr(&resp, job_json ? job_json : "\"\"");
-                    buffer_append_cstr(&resp, ",\"address\":");
-                    buffer_append_cstr(&resp, address_json ? address_json : "null");
-                    buffer_append_cstr(&resp, ",\"download_url\":");
-                    buffer_append_cstr(&resp, download_json ? download_json : "null");
-                    buffer_append_cstr(&resp, "}");
-
                     int http_status = artifact_ready ? 200 : 202;
-                    const char *status_text = artifact_ready ? "OK" : "Accepted";
-                    send_http_json(client_fd, http_status, status_text, resp.data ? resp.data : "{}");
-
-                    buffer_free(&resp);
-                    free(download_json);
+                    send_report_job_response(client_fd, http_status,
+                                             existing_status ? existing_status : (artifact_ready ? "completed" : "queued"),
+                                             existing_job_id,
+                                             address_value,
+                                             download_url);
                     free(download_url);
-                    free(job_json);
-                    free(status_json);
-                    free(address_json);
                     free(existing_job_id);
                     free(existing_status);
                     free(existing_output_path);
@@ -5591,23 +5600,9 @@ static void handle_client(int client_fd, void *ctx) {
                 free(notes_value);
                 free(recs_value);
 
-                char *address_json = json_escape_string(address_value);
+                send_report_job_response(client_fd, 202, "queued", job_id, address_value, NULL);
                 free(address_value);
-                if (!address_json) {
-                    char *body = build_error_response("Failed to encode address");
-                    send_http_json(client_fd, 500, "Internal Server Error", body);
-                    free(body);
-                    return;
-                }
-                char response[320];
-                snprintf(response, sizeof(response),
-                         "{\"status\":\"queued\",\"job_id\":\"%s\",\"address\":\"%s\",\"download_url\":null}",
-                         job_id,
-                         address_json);
-                free(address_json);
-
                 signal_report_worker();
-                send_http_json(client_fd, 202, "Accepted", response);
                 return;
             }
 
