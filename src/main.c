@@ -405,6 +405,7 @@ static int load_report_for_building(PGconn *conn, const char *building_address, 
 static char *report_data_to_json(const ReportData *report);
 static char *build_location_detail_payload(PGconn *conn, const char *address, int *status_out, char **error_out);
 static char *build_report_json_payload(PGconn *conn, const char *address, int *status_out, char **error_out);
+static char *build_download_url(const char *job_id);
 static int generate_uuid_v4(char out[37]);
 static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out);
 static void *report_worker_main(void *arg);
@@ -1400,6 +1401,35 @@ static char *build_report_json_payload(PGconn *conn, const char *address, int *s
         *status_out = 200;
     }
     return json;
+}
+
+static char *build_download_url(const char *job_id) {
+    if (!job_id || !*job_id) {
+        return NULL;
+    }
+    const char *prefix = (g_api_prefix && g_api_prefix[0]) ? g_api_prefix : "";
+    const char reports_segment[] = "/reports/";
+    const char download_segment[] = "/download";
+    size_t prefix_len = strlen(prefix);
+    size_t total = prefix_len + sizeof(reports_segment) - 1 + strlen(job_id) + sizeof(download_segment) - 1 + 1;
+    char *url = malloc(total);
+    if (!url) {
+        return NULL;
+    }
+    size_t pos = 0;
+    if (prefix_len > 0) {
+        memcpy(url + pos, prefix, prefix_len);
+        pos += prefix_len;
+    }
+    memcpy(url + pos, reports_segment, sizeof(reports_segment) - 1);
+    pos += sizeof(reports_segment) - 1;
+    size_t job_len = strlen(job_id);
+    memcpy(url + pos, job_id, job_len);
+    pos += job_len;
+    memcpy(url + pos, download_segment, sizeof(download_segment) - 1);
+    pos += sizeof(download_segment) - 1;
+    url[pos] = '\0';
+    return url;
 }
 
 static int load_report_for_building(PGconn *conn, const char *building_address, ReportData *report, char **error_out) {
@@ -5450,6 +5480,91 @@ static void handle_client(int client_fd, void *ctx) {
                 free(parse_error);
                 free(body_json);
 
+                char *existing_job_id = NULL;
+                char *existing_status = NULL;
+                char *existing_output_path = NULL;
+                char *lookup_error = NULL;
+                int existing = db_find_existing_report_job(conn, address_value, &existing_job_id, &existing_status, &existing_output_path, &lookup_error);
+                if (existing < 0) {
+                    char *body = build_error_response(lookup_error ? lookup_error : "Failed to check existing reports");
+                    send_http_json(client_fd, 500, "Internal Server Error", body);
+                    free(body);
+                    free(lookup_error);
+                    free(address_value);
+                    free(notes_value);
+                    free(recs_value);
+                    return;
+                }
+                free(lookup_error);
+
+                bool reuse_job = false;
+                bool artifact_ready = false;
+                if (existing == 1 && existing_status) {
+                    if (strcmp(existing_status, "queued") == 0 || strcmp(existing_status, "processing") == 0) {
+                        reuse_job = true;
+                    } else if (strcmp(existing_status, "completed") == 0 && existing_output_path && access(existing_output_path, R_OK) == 0) {
+                        reuse_job = true;
+                        artifact_ready = true;
+                    }
+                }
+
+                if (reuse_job) {
+                    char *address_json = json_escape_string(address_value);
+                    char *status_json = json_escape_string(existing_status ? existing_status : "queued");
+                    char *job_json = json_escape_string(existing_job_id ? existing_job_id : "");
+                    char *download_url = artifact_ready ? build_download_url(existing_job_id) : NULL;
+                    char *download_json = download_url ? json_escape_string(download_url) : NULL;
+                    Buffer resp;
+                    if (!buffer_init(&resp)) {
+                        char *body = build_error_response("Out of memory");
+                        send_http_json(client_fd, 500, "Internal Server Error", body);
+                        free(body);
+                        free(download_json);
+                        free(download_url);
+                        free(job_json);
+                        free(status_json);
+                        free(address_json);
+                        free(existing_job_id);
+                        free(existing_status);
+                        free(existing_output_path);
+                        free(address_value);
+                        free(notes_value);
+                        free(recs_value);
+                        return;
+                    }
+                    buffer_append_cstr(&resp, "{\"status\":");
+                    buffer_append_cstr(&resp, status_json ? status_json : "\"queued\"");
+                    buffer_append_cstr(&resp, ",\"job_id\":");
+                    buffer_append_cstr(&resp, job_json ? job_json : "\"\"");
+                    buffer_append_cstr(&resp, ",\"address\":");
+                    buffer_append_cstr(&resp, address_json ? address_json : "null");
+                    buffer_append_cstr(&resp, ",\"download_url\":");
+                    buffer_append_cstr(&resp, download_json ? download_json : "null");
+                    buffer_append_cstr(&resp, "}");
+
+                    int http_status = artifact_ready ? 200 : 202;
+                    const char *status_text = artifact_ready ? "OK" : "Accepted";
+                    send_http_json(client_fd, http_status, status_text, resp.data ? resp.data : "{}");
+
+                    buffer_free(&resp);
+                    free(download_json);
+                    free(download_url);
+                    free(job_json);
+                    free(status_json);
+                    free(address_json);
+                    free(existing_job_id);
+                    free(existing_status);
+                    free(existing_output_path);
+                    free(address_value);
+                    free(notes_value);
+                    free(recs_value);
+                    return;
+                }
+
+                free(existing_job_id);
+                free(existing_status);
+                free(existing_output_path);
+
                 char job_id[37];
                 if (!generate_uuid_v4(job_id)) {
                     free(address_value);
@@ -5484,9 +5599,9 @@ static void handle_client(int client_fd, void *ctx) {
                     free(body);
                     return;
                 }
-                char response[256];
+                char response[320];
                 snprintf(response, sizeof(response),
-                         "{\"status\":\"queued\",\"job_id\":\"%s\",\"address\":\"%s\"}",
+                         "{\"status\":\"queued\",\"job_id\":\"%s\",\"address\":\"%s\",\"download_url\":null}",
                          job_id,
                          address_json);
                 free(address_json);
@@ -5708,6 +5823,7 @@ int main(int argc, char **argv) {
         .build_report_json = build_report_json_payload
     };
     routes_register_helpers(&route_helpers);
+    routes_set_prefix(g_api_prefix);
 
     char *xai_key_trimmed = trim_copy(getenv("XAI_API_KEY"));
     if (!xai_key_trimmed || xai_key_trimmed[0] == '\0') {

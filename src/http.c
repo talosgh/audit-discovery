@@ -115,6 +115,7 @@ const char *mime_type_for(const char *path) {
     if (strcasecmp(ext, "js") == 0) return "text/javascript; charset=utf-8";
     if (strcasecmp(ext, "mjs") == 0) return "text/javascript; charset=utf-8";
     if (strcasecmp(ext, "json") == 0) return "application/json; charset=utf-8";
+    if (strcasecmp(ext, "zip") == 0) return "application/zip";
     if (strcasecmp(ext, "svg") == 0) return "image/svg+xml";
     if (strcasecmp(ext, "png") == 0) return "image/png";
     if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) return "image/jpeg";

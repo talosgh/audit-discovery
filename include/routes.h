@@ -10,6 +10,7 @@ typedef struct {
 } RouteHelpers;
 
 void routes_register_helpers(const RouteHelpers *helpers);
+void routes_set_prefix(const char *prefix);
 void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char *query_string);
 bool routes_handle_patch(int client_fd, PGconn *conn, const char *api_path, const char *body_json);
 

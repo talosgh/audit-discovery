@@ -1,5 +1,7 @@
 #include "report_jobs.h"
 
+#include "buffer.h"
+#include "json_utils.h"
 #include "log.h"
 
 #include <stdbool.h>
@@ -171,7 +173,7 @@ int db_complete_report_job(PGconn *conn, const char *job_id, const char *status,
     return 1;
 }
 
-char *db_fetch_report_job_status(PGconn *conn, const char *job_id, char **error_out) {
+char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *path_prefix, char **error_out) {
     if (!conn || !job_id) {
         if (error_out && !*error_out) {
             *error_out = strdup("Job id required");
@@ -179,16 +181,11 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, char **error_
         return NULL;
     }
     const char *sql =
-        "SELECT json_build_object("
-        "  'job_id', job_id::text,"
-        "  'status', status,"
-        "  'address', address,"
-        "  'created_at', created_at,"
-        "  'started_at', started_at,"
-        "  'completed_at', completed_at,"
-        "  'error', error,"
-        "  'download_ready', (status = 'completed' AND output_path IS NOT NULL)"
-        ")::text "
+        "SELECT job_id::text, status, address, "
+        "       to_char(created_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+        "       to_char(started_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+        "       to_char(completed_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+        "       error, output_path "
         "FROM report_jobs "
         "WHERE job_id = $1::uuid";
     const char *params[1] = { job_id };
@@ -201,17 +198,118 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, char **error_
         PQclear(res);
         return NULL;
     }
-    if (PQntuples(res) == 0 || PQgetisnull(res, 0, 0)) {
+    if (PQntuples(res) == 0) {
         PQclear(res);
         if (error_out && !*error_out) {
             *error_out = strdup("Report job not found");
         }
         return NULL;
     }
-    const char *value = PQgetvalue(res, 0, 0);
-    char *json = strdup(value ? value : "{}");
+
+    const char *job_id_val = PQgetvalue(res, 0, 0);
+    const char *status_val = PQgetvalue(res, 0, 1);
+    const char *address_val = PQgetisnull(res, 0, 2) ? NULL : PQgetvalue(res, 0, 2);
+    const char *created_val = PQgetisnull(res, 0, 3) ? NULL : PQgetvalue(res, 0, 3);
+    const char *started_val = PQgetisnull(res, 0, 4) ? NULL : PQgetvalue(res, 0, 4);
+    const char *completed_val = PQgetisnull(res, 0, 5) ? NULL : PQgetvalue(res, 0, 5);
+    const char *error_val = PQgetisnull(res, 0, 6) ? NULL : PQgetvalue(res, 0, 6);
+    const char *output_path = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
+    bool download_ready = status_val && strcmp(status_val, "completed") == 0 && output_path && output_path[0] != '\0';
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory");
+        }
+        PQclear(res);
+        return NULL;
+    }
+
+    char *job_id_json = json_escape_string(job_id_val ? job_id_val : "");
+    char *status_json = json_escape_string(status_val ? status_val : "unknown");
+    char *address_json = address_val ? json_escape_string(address_val) : NULL;
+    char *error_json = error_val ? json_escape_string(error_val) : NULL;
+
+    buffer_append_cstr(&buf, "{");
+    buffer_append_cstr(&buf, "\"job_id\":");
+    buffer_append_cstr(&buf, job_id_json ? job_id_json : "\"\"");
+    buffer_append_cstr(&buf, ",\"status\":");
+    buffer_append_cstr(&buf, status_json ? status_json : "\"unknown\"");
+    buffer_append_cstr(&buf, ",\"address\":");
+    buffer_append_cstr(&buf, address_json ? address_json : "null");
+
+    buffer_append_cstr(&buf, ",\"created_at\":");
+    if (created_val) {
+        char *created_json = json_escape_string(created_val);
+        buffer_append_cstr(&buf, created_json ? created_json : "null");
+        free(created_json);
+    } else {
+        buffer_append_cstr(&buf, "null");
+    }
+
+    buffer_append_cstr(&buf, ",\"started_at\":");
+    if (started_val) {
+        char *started_json = json_escape_string(started_val);
+        buffer_append_cstr(&buf, started_json ? started_json : "null");
+        free(started_json);
+    } else {
+        buffer_append_cstr(&buf, "null");
+    }
+
+    buffer_append_cstr(&buf, ",\"completed_at\":");
+    if (completed_val) {
+        char *completed_json = json_escape_string(completed_val);
+        buffer_append_cstr(&buf, completed_json ? completed_json : "null");
+        free(completed_json);
+    } else {
+        buffer_append_cstr(&buf, "null");
+    }
+
+    buffer_append_cstr(&buf, ",\"error\":");
+    if (error_json) {
+        buffer_append_cstr(&buf, error_json);
+    } else {
+        buffer_append_cstr(&buf, "null");
+    }
+
+    buffer_append_cstr(&buf, ",\"download_ready\":");
+    buffer_append_cstr(&buf, download_ready ? "true" : "false");
+
+    buffer_append_cstr(&buf, ",\"download_url\":");
+    if (download_ready && job_id_val) {
+        Buffer url_buf;
+        buffer_init(&url_buf);
+        const char *prefix = (path_prefix && path_prefix[0]) ? path_prefix : "";
+        buffer_append_cstr(&url_buf, prefix);
+        buffer_append_cstr(&url_buf, "/reports/");
+        buffer_append_cstr(&url_buf, job_id_val);
+        buffer_append_cstr(&url_buf, "/download");
+        char *url_str = url_buf.data ? url_buf.data : NULL;
+        if (url_str) {
+            char *url_json = json_escape_string(url_str);
+            buffer_append_cstr(&buf, url_json ? url_json : "null");
+            free(url_json);
+            url_buf.data = NULL;
+        } else {
+            buffer_append_cstr(&buf, "null");
+        }
+        buffer_free(&url_buf);
+    } else {
+        buffer_append_cstr(&buf, "null");
+    }
+
+    buffer_append_cstr(&buf, "}");
+
+    free(job_id_json);
+    free(status_json);
+    free(address_json);
+    free(error_json);
     PQclear(res);
-    return json;
+
+    char *result = buf.data;
+    buf.data = NULL;
+    buffer_free(&buf);
+    return result;
 }
 
 int db_fetch_report_download_path(PGconn *conn, const char *job_id, char **path_out, char **error_out) {
@@ -268,4 +366,74 @@ int db_fetch_report_download_path(PGconn *conn, const char *job_id, char **path_
         return 0;
     }
     return 1;
+}
+
+int db_find_existing_report_job(PGconn *conn, const char *address, char **job_id_out, char **status_out, char **output_path_out, char **error_out) {
+    if (job_id_out) *job_id_out = NULL;
+    if (status_out) *status_out = NULL;
+    if (output_path_out) *output_path_out = NULL;
+    if (!conn || !address) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Address required");
+        }
+        return -1;
+    }
+
+    const char *params[1] = { address };
+    const char *active_sql =
+        "SELECT job_id::text, status, output_path "
+        "FROM report_jobs "
+        "WHERE address = $1 AND status IN ('queued','processing') "
+        "ORDER BY created_at DESC "
+        "LIMIT 1";
+    PGresult *res = PQexecParams(conn, active_sql, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to query report jobs");
+        }
+        PQclear(res);
+        return -1;
+    }
+
+    if (PQntuples(res) > 0) {
+        const char *job_id = PQgetvalue(res, 0, 0);
+        const char *status = PQgetvalue(res, 0, 1);
+        const char *output_path = PQgetisnull(res, 0, 2) ? NULL : PQgetvalue(res, 0, 2);
+        if (job_id_out) *job_id_out = strdup(job_id);
+        if (status_out) *status_out = strdup(status ? status : "queued");
+        if (output_path_out && output_path) *output_path_out = strdup(output_path);
+        PQclear(res);
+        return 1;
+    }
+    PQclear(res);
+
+    const char *completed_sql =
+        "SELECT job_id::text, status, output_path "
+        "FROM report_jobs "
+        "WHERE address = $1 AND status = 'completed' AND output_path IS NOT NULL "
+        "ORDER BY completed_at DESC NULLS LAST "
+        "LIMIT 1";
+    res = PQexecParams(conn, completed_sql, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to query report jobs");
+        }
+        PQclear(res);
+        return -1;
+    }
+
+    if (PQntuples(res) > 0) {
+        const char *job_id = PQgetvalue(res, 0, 0);
+        const char *status = PQgetvalue(res, 0, 1);
+        const char *output_path = PQgetisnull(res, 0, 2) ? NULL : PQgetvalue(res, 0, 2);
+        if (job_id_out) *job_id_out = strdup(job_id);
+        if (status_out) *status_out = strdup(status ? status : "completed");
+        if (output_path_out && output_path) *output_path_out = strdup(output_path);
+        PQclear(res);
+        return 1;
+    }
+    PQclear(res);
+    return 0;
 }

@@ -15,6 +15,7 @@
 #include <strings.h>
 
 static RouteHelpers g_route_helpers = {0};
+static const char *g_route_prefix = "";
 
 void routes_register_helpers(const RouteHelpers *helpers) {
     if (helpers) {
@@ -22,6 +23,10 @@ void routes_register_helpers(const RouteHelpers *helpers) {
     } else {
         memset(&g_route_helpers, 0, sizeof(g_route_helpers));
     }
+}
+
+void routes_set_prefix(const char *prefix) {
+    g_route_prefix = (prefix && prefix[0]) ? prefix : "";
 }
 
 void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char *query_string) {
@@ -92,11 +97,13 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
                 return;
             }
 
-            const char *ext = strrchr(path_str, '.');
-            const char *mime = "application/pdf";
+            const char *mime = mime_type_for(path_str);
+            if (!mime) {
+                mime = "application/octet-stream";
+            }
+
             char download_name[64];
-            if (ext && strcasecmp(ext, ".zip") == 0) {
-                mime = "application/zip";
+            if (mime && strcmp(mime, "application/zip") == 0) {
                 snprintf(download_name, sizeof(download_name), "audit-report-%s.zip", job_id);
             } else {
                 snprintf(download_name, sizeof(download_name), "audit-report-%s.pdf", job_id);
@@ -114,7 +121,7 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
         }
 
         char *error = NULL;
-        char *json = db_fetch_report_job_status(conn, job_id, &error);
+        char *json = db_fetch_report_job_status(conn, job_id, g_route_prefix, &error);
         if (!json) {
             char *body = build_error_response(error ? error : "Failed to fetch report job");
             int status = (error && strcmp(error, "Report job not found") == 0) ? 404 : 500;
