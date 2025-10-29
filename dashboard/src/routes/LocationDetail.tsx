@@ -402,20 +402,28 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                 <h2>Generated reports</h2>
                 <ul class="reports-list">
                   <For each={reports()}>
-                    {(report: ReportVersion) => (
-                      <li class="report-item">
-                        <div class="report-meta">
-                          <span class="report-title">Version {report.version ?? '—'}</span>
-                          <span class="report-date">{formatDateTime(report.completed_at ?? report.created_at)}</span>
-                        </div>
-                        <div class="report-actions">
-                          <span class="report-size">{formatFileSize(report.size_bytes)}</span>
-                          <button type="button" class="action-button" onClick={() => void handleDownloadExisting(report.job_id)}>
-                            Download
-                          </button>
-                        </div>
-                      </li>
-                    )}
+                    {(report: ReportVersion, index) => {
+                      const isCurrent = index() === 0;
+                      return (
+                        <li class={`report-item${isCurrent ? ' report-item--current' : ''}`}>
+                          <div class="report-meta">
+                            <span class="report-title">
+                              Version {report.version ?? '—'}
+                              <Show when={isCurrent}>
+                                <span class="report-badge">Current</span>
+                              </Show>
+                            </span>
+                            <span class="report-date">{formatDateTime(report.completed_at ?? report.created_at)}</span>
+                          </div>
+                          <div class="report-actions">
+                            <span class="report-size">{formatFileSize(report.size_bytes)}</span>
+                            <button type="button" class="action-button" onClick={() => void handleDownloadExisting(report.job_id)}>
+                              Download
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    }}
                   </For>
                 </ul>
               </div>

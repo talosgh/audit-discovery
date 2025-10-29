@@ -418,6 +418,7 @@ static void narrative_set_clear(NarrativeSet *set);
 static int build_report_latex(const ReportData *report, const NarrativeSet *narratives, const ReportJob *job, const char *output_path, char **error_out);
 static int run_pdflatex(const char *working_dir, const char *tex_filename, char **error_out);
 static void normalize_heading_text(char *text);
+static char *format_closed_cell(const char *text, bool closed, const char *suffix);
 static bool read_request_body(int client_fd,
                               const char *header_lines,
                               char *body_start,
@@ -6313,6 +6314,8 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
                 const char *remedy_src = def->remedy ? def->remedy : "—";
                 const char *note_src = def->note ? def->note : "—";
 
+                bool closed = def->resolved.has_value && def->resolved.value;
+
                 char *equip_clean = sanitize_ascii(equip_src);
                 char *cond_clean = sanitize_ascii(cond_src);
                 char *remedy_clean = sanitize_ascii(remedy_src);
@@ -6338,15 +6341,31 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
                     return 0;
                 }
 
-                if (!buffer_appendf(buf, "%s & %s & %s & %s \\\\ \n", equip_tex, cond_tex, remedy_tex, note_tex)) {
-                    free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
-                    return 0;
-                }
+                const char *note_suffix = closed ? "\\ClosedMarker" : NULL;
+                char *equip_cell = format_closed_cell(equip_tex, closed, NULL);
+                char *cond_cell = format_closed_cell(cond_tex, closed, NULL);
+                char *remedy_cell = format_closed_cell(remedy_tex, closed, NULL);
+                char *note_cell = format_closed_cell(note_tex, closed, note_suffix);
 
                 free(equip_tex);
                 free(cond_tex);
                 free(remedy_tex);
                 free(note_tex);
+
+                if (!equip_cell || !cond_cell || !remedy_cell || !note_cell) {
+                    free(equip_cell); free(cond_cell); free(remedy_cell); free(note_cell);
+                    return 0;
+                }
+
+                if (!buffer_appendf(buf, "%s & %s & %s & %s \\\\ \n", equip_cell, cond_cell, remedy_cell, note_cell)) {
+                    free(equip_cell); free(cond_cell); free(remedy_cell); free(note_cell);
+                    return 0;
+                }
+
+                free(equip_cell);
+                free(cond_cell);
+                free(remedy_cell);
+                free(note_cell);
             }
             if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabularx}\n\n")) {
                 return 0;
@@ -6602,6 +6621,36 @@ static void normalize_heading_text(char *text) {
             }
         }
     }
+}
+
+static char *format_closed_cell(const char *text, bool closed, const char *suffix) {
+    if (!text) {
+        text = "";
+    }
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        return NULL;
+    }
+    int ok = 1;
+    if (closed) {
+        ok = ok && buffer_append_cstr(&buf, "\\ClosedText{") && buffer_append_cstr(&buf, text) && buffer_append_cstr(&buf, "}");
+    } else {
+        ok = ok && buffer_append_cstr(&buf, text);
+    }
+    if (ok && suffix && suffix[0]) {
+        ok = buffer_append_cstr(&buf, " ") && buffer_append_cstr(&buf, suffix);
+    }
+    if (!ok) {
+        buffer_free(&buf);
+        return NULL;
+    }
+    char *out = buf.data;
+    buf.data = NULL;
+    buffer_free(&buf);
+    if (!out) {
+        out = strdup("");
+    }
+    return out;
 }
 
 static void *narrative_thread_main(void *arg) {
@@ -6885,6 +6934,7 @@ static int build_report_latex(const ReportData *report,
         "\\usepackage{tikz}\n"
         "\\usepackage{lmodern}\n"
         "\\usepackage{xcolor}\n"
+        "\\usepackage[normalem]{ulem}\n"
         "\\usepackage{float}\n"
         "\\geometry{a4paper, left=0.5in, right=0.5in, top=1in, bottom=1in}\n"
         "\\setlength{\\headheight}{26pt}\n"
@@ -6917,6 +6967,8 @@ static int build_report_latex(const ReportData *report,
         "\\pagestyle{empty}\n"
         "\\setlength{\\parskip}{0.5\\baselineskip}\n"
         "\\setlength{\\parindent}{0pt}\n"
+        "\\newcommand{\\ClosedText}[1]{\\textcolor{gray}{\\sout{#1}}}\n"
+        "\\newcommand{\\ClosedMarker}{\\textcolor{gray}{(Closed)}}\n"
         "\\newcommand{\\coverpage}{%\n"
         "    \\newpage\n"
         "    \\vspace*{1cm}%\n"
