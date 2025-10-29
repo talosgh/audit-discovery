@@ -243,13 +243,25 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setMessage(null);
     setErrorMessage(null);
     setFormError(null);
-    const ownerSuggestion = summary()?.building_owner ?? '';
+    const ownerSuggestion = summary()?.owner_name ?? summary()?.building_owner ?? '';
     if (!coverOwner() && ownerSuggestion) {
       setCoverOwner(ownerSuggestion);
     }
-    const addressSuggestion = summary()?.address ?? '';
+    const addressSuggestion = summary()?.street ?? summary()?.address ?? '';
     if (!coverStreet() && addressSuggestion) {
       setCoverStreet(addressSuggestion);
+    }
+    const citySuggestion = summary()?.city ?? '';
+    if (!coverCity() && citySuggestion) {
+      setCoverCity(citySuggestion);
+    }
+    const stateSuggestion = summary()?.state ?? '';
+    if (!coverState() && stateSuggestion) {
+      setCoverState(stateSuggestion);
+    }
+    const zipSuggestion = summary()?.zip ?? '';
+    if (!coverZip() && zipSuggestion) {
+      setCoverZip(zipSuggestion);
     }
     setShowReportModal(true);
   };
@@ -483,6 +495,15 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     return Math.max(...points.map((point) => (typeof point.spend === 'number' ? point.spend : 0)));
   });
 
+  const combinedStateZip = createMemo(() => {
+    const state = summary()?.state ?? profile()?.state ?? '';
+    const zip = summary()?.zip ?? profile()?.zip ?? '';
+    if (state && zip) return `${state} ${zip}`;
+    if (state) return state;
+    if (zip) return zip;
+    return '—';
+  });
+
   return (
     <section class="page-section" aria-labelledby="location-heading">
       <div class="section-header">
@@ -490,9 +511,17 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
           <button type="button" class="back-button" onClick={props.onBack}>
             ← Locations
           </button>
-          <h1 id="location-heading">{detail()?.profile?.site_name ?? summary()?.address ?? props.location.siteName ?? props.location.address}</h1>
-          <Show when={summary()?.building_owner}>
-            {(owner) => <p class="section-subtitle">Owned by {owner()}</p>}
+          <h1 id="location-heading">
+            {detail()?.profile?.site_name ?? summary()?.site_name ?? props.location.siteName ?? summary()?.address ?? props.location.address}
+          </h1>
+          <Show when={detail()?.profile?.address_label ?? summary()?.address ?? props.location.address}>
+            {(addr) => <p class="section-subtitle">{addr()}</p>}
+          </Show>
+          <Show when={detail()?.profile?.owner.name ?? summary()?.owner_name}>
+            {(owner) => <p class="section-subtitle">Owner: {owner()}</p>}
+          </Show>
+          <Show when={detail()?.profile?.vendor.name ?? summary()?.vendor_name}>
+            {(vendor) => <p class="section-subtitle">Vendor: {vendor()}</p>}
           </Show>
         </div>
         <div class="section-actions">
@@ -546,55 +575,63 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
               <h2>Location Overview</h2>
               <div class="profile-grid">
                 <div>
+                  <span class="profile-label">Site Name</span>
+                  <span class="profile-value">{profile()?.site_name ?? summary()?.site_name ?? props.location.siteName ?? '—'}</span>
+                </div>
+                <div>
+                  <span class="profile-label">Location Code</span>
+                  <span class="profile-value">{profile()?.location_code ?? summary()?.location_code ?? props.location.locationCode ?? '—'}</span>
+                </div>
+                <div>
+                  <span class="profile-label">Devices</span>
+                  <span class="profile-value">{profile()?.device_count ?? summary()?.device_count ?? 0}</span>
+                </div>
+                <div>
                   <span class="profile-label">Address</span>
                   <span class="profile-value">{profile()?.address_label ?? summary()?.address ?? props.location.address}</span>
                 </div>
                 <div>
-                  <span class="profile-label">Site Name</span>
-                  <span class="profile-value">{profile()?.site_name ?? '—'}</span>
+                  <span class="profile-label">City</span>
+                  <span class="profile-value">{summary()?.city ?? profile()?.city ?? '—'}</span>
+                </div>
+                <div>
+                  <span class="profile-label">State / ZIP</span>
+                  <span class="profile-value">{combinedStateZip()}</span>
                 </div>
                 <div>
                   <span class="profile-label">Owner</span>
-                  <span class="profile-value">{profile()?.owner.name ?? summary()?.building_owner ?? '—'}</span>
+                  <span class="profile-value">{profile()?.owner.name ?? summary()?.owner_name ?? '—'}</span>
                 </div>
                 <div>
                   <span class="profile-label">Operator</span>
-                  <span class="profile-value">{profile()?.operator.name ?? '—'}</span>
+                  <span class="profile-value">{profile()?.operator.name ?? summary()?.operator_name ?? '—'}</span>
                 </div>
                 <div>
                   <span class="profile-label">Vendor</span>
-                  <span class="profile-value">{profile()?.vendor.name ?? summary()?.elevator_contractor ?? '—'}</span>
-                </div>
-                <div>
-                  <span class="profile-label">Location ID</span>
-                  <span class="profile-value">{profile()?.location_code ?? '—'}</span>
+                  <span class="profile-value">{profile()?.vendor.name ?? summary()?.vendor_name ?? '—'}</span>
                 </div>
               </div>
             </section>
 
             <section class="stat-grid">
               <div class="stat-card">
-                <h3>Audit Coverage</h3>
+                <h3>Operations Snapshot</h3>
                 <dl>
                   <div>
                     <dt>Devices</dt>
-                    <dd>{summary()?.device_count ?? 0}</dd>
+                    <dd>{profile()?.device_count ?? summary()?.device_count ?? 0}</dd>
                   </div>
                   <div>
-                    <dt>Total Audits</dt>
-                    <dd>{summary()?.audit_count ?? 0}</dd>
-                  </div>
-                  <div>
-                    <dt>Last Audit</dt>
-                    <dd>{formatDateTime(summary()?.last_audit)}</dd>
-                  </div>
-                  <div>
-                    <dt>First Audit</dt>
-                    <dd>{formatDateTime(summary()?.first_audit)}</dd>
+                    <dt>Total Deficiencies</dt>
+                    <dd>{summary()?.total_deficiencies ?? 0}</dd>
                   </div>
                   <div>
                     <dt>Open Deficiencies</dt>
                     <dd class="warning">{summary()?.open_deficiencies ?? 0}</dd>
+                  </div>
+                  <div>
+                    <dt>Visits Tracked</dt>
+                    <dd>{visits().length}</dd>
                   </div>
                 </dl>
               </div>
@@ -912,7 +949,6 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                     <th scope="col">Device</th>
                     <th scope="col">Type</th>
                     <th scope="col">Bank</th>
-                    <th scope="col">City ID</th>
                     <th scope="col">Controller</th>
                     <th scope="col">Tests</th>
                     <th scope="col">Open Deficiencies</th>
@@ -934,7 +970,6 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                           <td>{device.device_id ?? '—'}</td>
                           <td>{device.device_type ?? '—'}</td>
                           <td>{device.bank_name ?? '—'}</td>
-                          <td>{device.city_id ?? '—'}</td>
                           <td>{controllerInfo}</td>
                           <td>
                             <div class="status-stack">

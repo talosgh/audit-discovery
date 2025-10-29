@@ -2,6 +2,8 @@ import type {
   AuditDetailResponse,
   AuditSummary,
   LocationDetail,
+  LocationListParams,
+  LocationListResponse,
   LocationSummary,
   ReportJobCreateRequest,
   ReportJobCreateResponse,
@@ -53,8 +55,19 @@ export function fetchAuditDetail(id: string): Promise<AuditDetailResponse> {
   return fetchJSON<AuditDetailResponse>(`/audits/${id}`);
 }
 
-export function fetchLocations(): Promise<LocationSummary[]> {
-  return fetchJSON<LocationSummary[]>('/locations');
+export function fetchLocations(params: LocationListParams = {}): Promise<LocationListResponse> {
+  const search = new URLSearchParams();
+  if (params.page && params.page > 0) {
+    search.set('page', String(params.page));
+  }
+  if (params.pageSize && params.pageSize > 0) {
+    search.set('page_size', String(params.pageSize));
+  }
+  if (params.search && params.search.trim().length > 0) {
+    search.set('search', params.search.trim());
+  }
+  const query = search.toString();
+  return fetchJSON<LocationListResponse>(query ? `/locations?${query}` : '/locations');
 }
 
 export interface LocationQuery {

@@ -121,9 +121,9 @@ const App = () => {
   return (
     <div class="app-shell">
       <header class="app-header">
-        <button type="button" class="brand" onClick={navigateToList}>
-          <img src="/square.png" alt="Citywide logo" />
-          <span>Citywide Audit Services</span>
+        <button type="button" class="brand" onClick={navigateToList} aria-label="Citywide Elevator Operations">
+          <img src="/citywide.png" alt="Citywide" />
+          <span>Elevator Operations</span>
         </button>
         <nav class="nav-links">
           <button type="button" class={!selectedLocation() && !selectedAudit() ? 'active' : ''} onClick={navigateToList}>

@@ -1,62 +1,89 @@
 import type { Component } from 'solid-js';
-import { For, Match, Show, Switch, createMemo, createResource, createSignal } from 'solid-js';
+import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal } from 'solid-js';
 import { fetchLocations } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
-import { formatDateTime } from '../utils';
 import type { LocationSummary } from '../types';
 
 interface LocationListProps {
   onSelect(location: LocationSummary): void;
 }
 
-const LocationList: Component<LocationListProps> = (props) => {
-  const [search, setSearch] = createSignal('');
-  const [locations, { refetch }] = createResource(fetchLocations);
+const PAGE_SIZE = 25;
 
-  const filteredAudits = createMemo(() => {
-    const list = locations() ?? [];
-    const term = search().trim().toLowerCase();
-    if (!term) {
-      return list;
+const LocationList: Component<LocationListProps> = (props) => {
+  const [page, setPage] = createSignal(1);
+  const [searchInput, setSearchInput] = createSignal('');
+  const [searchTerm, setSearchTerm] = createSignal('');
+
+  const [locations, { refetch }] = createResource(
+    () => ({ page: page(), pageSize: PAGE_SIZE, search: searchTerm() }),
+    fetchLocations
+  );
+
+  createEffect(() => {
+    const result = locations();
+    if (result && typeof result.page === 'number' && result.page !== page()) {
+      setPage(result.page);
     }
-    return list.filter((entry) => {
-      const parts: (string | null | undefined)[] = [
-        entry.address,
-        entry.site_name,
-        entry.street,
-        entry.city,
-        entry.state,
-        entry.zip,
-        entry.building_owner,
-        entry.elevator_contractor,
-        entry.city_id,
-        entry.location_code ? `#${entry.location_code}` : null
-      ];
-      return parts.some((value) => value && value.toLowerCase().includes(term));
-    });
+  });
+
+  const items = createMemo(() => locations()?.items ?? []);
+  const total = createMemo(() => locations()?.total ?? 0);
+  const effectivePageSize = createMemo(() => locations()?.page_size ?? PAGE_SIZE);
+  const totalPages = createMemo(() => {
+    const size = effectivePageSize();
+    return size > 0 ? Math.max(1, Math.ceil(total() / size)) : 1;
+  });
+
+  const startIndex = createMemo(() => {
+    if (total() === 0) return 0;
+    return (page() - 1) * effectivePageSize() + 1;
+  });
+
+  const endIndex = createMemo(() => {
+    const start = startIndex();
+    if (start === 0) return 0;
+    return start + items().length - 1;
   });
 
   const handleSearchInput = (event: InputEvent & { currentTarget: HTMLInputElement }) => {
-    setSearch(event.currentTarget.value);
+    const value = event.currentTarget.value;
+    setSearchInput(value);
+    setSearchTerm(value.trim());
+    setPage(1);
   };
+
+  const handlePrev = () => {
+    if (page() > 1) {
+      setPage(page() - 1);
+    }
+  };
+
+  const handleNext = () => {
+    if (page() < totalPages()) {
+      setPage(page() + 1);
+    }
+  };
+
+  const isLoading = () => locations.loading;
 
   return (
     <section class="page-section" aria-labelledby="locations-heading">
       <div class="section-header">
         <div>
           <h1 id="locations-heading">Locations</h1>
-          <p class="section-subtitle">Review all audited properties, see open issues at a glance, and drill into device-level details.</p>
+          <p class="section-subtitle">Browse every property and drill into device-level history when you need more detail.</p>
         </div>
         <div class="section-actions">
           <input
             type="search"
-            placeholder="Search by address, owner, contractor, city…"
-            value={search()}
+            placeholder="Search by location, owner, vendor…"
+            value={searchInput()}
             onInput={handleSearchInput}
             autoFocus
           />
-          <button type="button" class="action-button refresh-button" onClick={() => refetch()}>
+          <button type="button" class="action-button refresh-button" onClick={() => refetch()} disabled={isLoading()}>
             Refresh
           </button>
         </div>
@@ -66,31 +93,29 @@ const LocationList: Component<LocationListProps> = (props) => {
         <Match when={locations.error}>
           <ErrorMessage message={(locations.error as Error).message} onRetry={() => refetch()} />
         </Match>
-        <Match when={locations.loading}>
+        <Match when={isLoading()}>
           <LoadingIndicator message="Loading locations…" />
         </Match>
-        <Match when={filteredAudits().length === 0}>
-          <div class="empty-state">No locations found. Try a different search or refresh the list.</div>
+        <Match when={items().length === 0}>
+          <div class="empty-state">No locations found. Try updating your search or refresh the list.</div>
         </Match>
-        <Match when={filteredAudits().length > 0}>
+        <Match when={items().length > 0}>
           <div class="table-wrapper" role="region" aria-live="polite">
             <table>
               <thead>
                 <tr>
                   <th scope="col">Location</th>
                   <th scope="col">Owner</th>
-                  <th scope="col">Contractor</th>
-                  <th scope="col">City ID</th>
+                  <th scope="col">Vendor</th>
                   <th scope="col">Devices</th>
-                  <th scope="col">Audits</th>
                   <th scope="col">Open Deficiencies</th>
-                  <th scope="col">Last Audit</th>
                 </tr>
               </thead>
               <tbody>
-                <For each={filteredAudits()}>
-                  {(location: LocationSummary) => {
+                <For each={items()}>
+                  {(location) => {
                     const openCount = location.open_deficiencies ?? 0;
+                    const deviceCount = location.device_count ?? 0;
 
                     return (
                       <tr
@@ -111,28 +136,46 @@ const LocationList: Component<LocationListProps> = (props) => {
                           <Show when={location.site_name && location.site_name !== location.address}>
                             <span class="location-subtext">{location.address}</span>
                           </Show>
+                          <Show when={location.location_code}>
+                            <span class="location-subtext">ID: {location.location_code}</span>
+                          </Show>
                           <Show when={openCount > 0}>
                             <span class="deficiency-chip" role="img" aria-label="Open deficiencies">⚠</span>
                           </Show>
                         </td>
                         <td>{location.building_owner ?? '—'}</td>
-                        <td>{location.elevator_contractor ?? '—'}</td>
-                        <td>{location.city_id ?? '—'}</td>
-                        <td>{location.device_count}</td>
-                        <td>{location.audit_count}</td>
+                        <td>{location.vendor_name ?? '—'}</td>
+                        <td>{deviceCount}</td>
                         <td>
                           <span class="deficiency-count">{openCount}</span>
                           <Show when={openCount > 0}>
                             <span class="deficiency-indicator" aria-hidden="true" title="Open deficiencies" />
                           </Show>
                         </td>
-                        <td>{formatDateTime(location.last_audit)}</td>
                       </tr>
                     );
                   }}
                 </For>
               </tbody>
             </table>
+          </div>
+
+          <div class="pagination-controls">
+            <div class="page-info">
+              <Show when={total() > 0} fallback={<span>No matching locations</span>}>
+                <span>
+                  Showing {startIndex()}–{endIndex()} of {total()} locations
+                </span>
+              </Show>
+            </div>
+            <div class="page-buttons">
+              <button type="button" class="action-button" disabled={page() <= 1 || isLoading()} onClick={handlePrev}>
+                Previous
+              </button>
+              <button type="button" class="action-button" disabled={page() >= totalPages() || isLoading()} onClick={handleNext}>
+                Next
+              </button>
+            </div>
           </div>
         </Match>
       </Switch>

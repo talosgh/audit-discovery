@@ -416,6 +416,7 @@ typedef struct {
     char *city;
     char *state;
     char *zip;
+    OptionalInt device_count;
     char *address_label;
     char *owner_name;
     char *owner_id;
@@ -1754,17 +1755,101 @@ static char *build_location_detail_json(const ReportData *report, const Location
     }
 
     if (!buffer_append_char(&buf, '{')) goto oom;
+    const char *address_value = NULL;
+    if (profile && profile->address_label && profile->address_label[0]) {
+        address_value = profile->address_label;
+    } else if (profile && profile->street) {
+        address_value = profile->street;
+    } else {
+        address_value = report->summary.building_address;
+    }
+    const char *site_name = profile ? profile->site_name : NULL;
+    const char *owner_name = (profile && profile->owner_name && profile->owner_name[0])
+        ? profile->owner_name
+        : report->summary.building_owner;
+    const char *owner_id = profile ? profile->owner_id : NULL;
+    const char *operator_name = profile ? profile->operator_name : NULL;
+    const char *operator_id = profile ? profile->operator_id : NULL;
+    const char *vendor_name = (profile && profile->vendor_name && profile->vendor_name[0])
+        ? profile->vendor_name
+        : report->summary.elevator_contractor;
+    const char *vendor_id = profile ? profile->vendor_id : NULL;
+    const char *street_value = profile ? profile->street : NULL;
+    const char *city_value = profile ? profile->city : NULL;
+    const char *state_value = profile ? profile->state : NULL;
+    const char *zip_value = profile ? profile->zip : NULL;
+    int device_count = report->summary.total_devices;
+    if (profile && profile->device_count.has_value) {
+        device_count = profile->device_count.value;
+    }
+
     if (!buffer_append_cstr(&buf, "\"summary\":{")) goto oom;
     if (!buffer_append_cstr(&buf, "\"address\":")) goto oom;
-    if (!buffer_append_json_string(&buf, report->summary.building_address)) goto oom;
+    if (!buffer_append_json_string(&buf, address_value)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"site_name\":")) goto oom;
+    if (!buffer_append_json_string(&buf, site_name)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"location_code\":")) goto oom;
+    if (!buffer_append_json_string(&buf, profile ? profile->location_code : NULL)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"location_row_id\":")) goto oom;
+    if (profile && profile->row_id.has_value) {
+        if (!buffer_appendf(&buf, "%d", profile->row_id.value)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"street\":")) goto oom;
+    if (!buffer_append_json_string(&buf, street_value)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"city\":")) goto oom;
+    if (!buffer_append_json_string(&buf, city_value)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"state\":")) goto oom;
+    if (!buffer_append_json_string(&buf, state_value)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"zip\":")) goto oom;
+    if (!buffer_append_json_string(&buf, zip_value)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"owner_name\":")) goto oom;
+    if (!buffer_append_json_string(&buf, owner_name)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"owner_id\":")) goto oom;
+    if (!buffer_append_json_string(&buf, owner_id)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"operator_name\":")) goto oom;
+    if (!buffer_append_json_string(&buf, operator_name)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"operator_id\":")) goto oom;
+    if (!buffer_append_json_string(&buf, operator_id)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"vendor_name\":")) goto oom;
+    if (!buffer_append_json_string(&buf, vendor_name)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"vendor_id\":")) goto oom;
+    if (!buffer_append_json_string(&buf, vendor_id)) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
 
     if (!buffer_append_cstr(&buf, "\"building_owner\":")) goto oom;
-    if (!buffer_append_json_string(&buf, report->summary.building_owner)) goto oom;
+    if (!buffer_append_json_string(&buf, owner_name)) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
 
     if (!buffer_append_cstr(&buf, "\"elevator_contractor\":")) goto oom;
-    if (!buffer_append_json_string(&buf, report->summary.elevator_contractor)) goto oom;
+    if (!buffer_append_json_string(&buf, vendor_name)) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
 
     if (!buffer_append_cstr(&buf, "\"city_id\":")) goto oom;
@@ -1772,7 +1857,7 @@ static char *build_location_detail_json(const ReportData *report, const Location
     if (!buffer_append_char(&buf, ',')) goto oom;
 
     if (!buffer_append_cstr(&buf, "\"device_count\":")) goto oom;
-    if (!buffer_appendf(&buf, "%d", report->summary.total_devices)) goto oom;
+    if (!buffer_appendf(&buf, "%d", device_count)) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
 
     if (!buffer_append_cstr(&buf, "\"audit_count\":")) goto oom;
@@ -4144,6 +4229,7 @@ static void audit_visit_clear(AuditVisit *visit) {
 static void location_profile_init(LocationProfile *profile) {
     if (!profile) return;
     optional_int_clear(&profile->row_id);
+    optional_int_clear(&profile->device_count);
     profile->location_code = NULL;
     profile->site_name = NULL;
     profile->street = NULL;
@@ -5442,7 +5528,7 @@ static int load_location_profile_by_row_id(PGconn *conn, int row_id, LocationPro
     snprintf(idbuf, sizeof(idbuf), "%d", row_id);
     const char *params[1] = { idbuf };
     const char *sql =
-        "SELECT id, location_id, site_name, street, city, state, zip_code, "
+        "SELECT id, location_id, site_name, street, city, state, zip_code, units, "
         "       owner_name, owner_id, operator_name, operator_id, vendor_name, vendor_id "
         "FROM locations "
         "WHERE id = $1 "
@@ -5472,14 +5558,22 @@ static int load_location_profile_by_row_id(PGconn *conn, int row_id, LocationPro
     const char *city = PQgetisnull(res, 0, 4) ? NULL : PQgetvalue(res, 0, 4);
     const char *state = PQgetisnull(res, 0, 5) ? NULL : PQgetvalue(res, 0, 5);
     const char *zip = PQgetisnull(res, 0, 6) ? NULL : PQgetvalue(res, 0, 6);
-    const char *owner_name = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
-    const char *owner_id = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
-    const char *operator_name = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
-    const char *operator_id = PQgetisnull(res, 0, 10) ? NULL : PQgetvalue(res, 0, 10);
-    const char *vendor_name = PQgetisnull(res, 0, 11) ? NULL : PQgetvalue(res, 0, 11);
-    const char *vendor_id = PQgetisnull(res, 0, 12) ? NULL : PQgetvalue(res, 0, 12);
+    const char *units = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
+    const char *owner_name = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
+    const char *owner_id = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
+    const char *operator_name = PQgetisnull(res, 0, 10) ? NULL : PQgetvalue(res, 0, 10);
+    const char *operator_id = PQgetisnull(res, 0, 11) ? NULL : PQgetvalue(res, 0, 11);
+    const char *vendor_name = PQgetisnull(res, 0, 12) ? NULL : PQgetvalue(res, 0, 12);
+    const char *vendor_id = PQgetisnull(res, 0, 13) ? NULL : PQgetvalue(res, 0, 13);
 
     PQclear(res);
+
+    if (units) {
+        OptionalInt parsed_units = parse_optional_int(units);
+        if (parsed_units.has_value) {
+            temp.device_count = parsed_units;
+        }
+    }
 
     if ((code && !assign_string(&temp.location_code, code)) ||
         (site_name && !assign_string(&temp.site_name, site_name)) ||
@@ -5512,7 +5606,7 @@ static int load_location_profile_by_code(PGconn *conn, const char *location_code
     }
     const char *params[1] = { location_code };
     const char *sql =
-        "SELECT id, location_id, site_name, street, city, state, zip_code, "
+        "SELECT id, location_id, site_name, street, city, state, zip_code, units, "
         "       owner_name, owner_id, operator_name, operator_id, vendor_name, vendor_id "
         "FROM locations "
         "WHERE location_id = $1 "
@@ -5545,14 +5639,22 @@ static int load_location_profile_by_code(PGconn *conn, const char *location_code
     const char *city = PQgetisnull(res, 0, 4) ? NULL : PQgetvalue(res, 0, 4);
     const char *state = PQgetisnull(res, 0, 5) ? NULL : PQgetvalue(res, 0, 5);
     const char *zip = PQgetisnull(res, 0, 6) ? NULL : PQgetvalue(res, 0, 6);
-    const char *owner_name = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
-    const char *owner_id = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
-    const char *operator_name = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
-    const char *operator_id = PQgetisnull(res, 0, 10) ? NULL : PQgetvalue(res, 0, 10);
-    const char *vendor_name = PQgetisnull(res, 0, 11) ? NULL : PQgetvalue(res, 0, 11);
-    const char *vendor_id = PQgetisnull(res, 0, 12) ? NULL : PQgetvalue(res, 0, 12);
+    const char *units = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
+    const char *owner_name = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
+    const char *owner_id = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
+    const char *operator_name = PQgetisnull(res, 0, 10) ? NULL : PQgetvalue(res, 0, 10);
+    const char *operator_id = PQgetisnull(res, 0, 11) ? NULL : PQgetvalue(res, 0, 11);
+    const char *vendor_name = PQgetisnull(res, 0, 12) ? NULL : PQgetvalue(res, 0, 12);
+    const char *vendor_id = PQgetisnull(res, 0, 13) ? NULL : PQgetvalue(res, 0, 13);
 
     PQclear(res);
+
+    if (units) {
+        OptionalInt parsed_units = parse_optional_int(units);
+        if (parsed_units.has_value) {
+            temp.device_count = parsed_units;
+        }
+    }
 
     if ((code && !assign_string(&temp.location_code, code)) ||
         (site_name && !assign_string(&temp.site_name, site_name)) ||
@@ -5839,6 +5941,14 @@ static char *build_location_profile_json(const LocationProfile *profile) {
 
     if (!buffer_append_cstr(&buf, "\"address_label\":")) goto oom;
     if (!buffer_append_json_string(&buf, profile ? profile->address_label : NULL)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"device_count\":")) goto oom;
+    if (profile && profile->device_count.has_value) {
+        if (!buffer_appendf(&buf, "%d", profile->device_count.value)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
     if (!buffer_append_char(&buf, ',')) goto oom;
 
     if (!buffer_append_cstr(&buf, "\"owner\":{")) goto oom;

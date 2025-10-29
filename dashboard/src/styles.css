@@ -61,18 +61,23 @@ body {
   align-items: center;
   gap: 0.65rem;
   padding: 0;
-  font-size: 1.25rem;
-  font-weight: 700;
-  color: var(--accent);
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--text-strong);
   text-decoration: none;
   cursor: pointer;
 }
 
 .brand img {
-  height: 28px;
-  width: 28px;
-  border-radius: 6px;
-  box-shadow: 0 0 14px rgba(70, 166, 180, 0.35);
+  height: 36px;
+  width: auto;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.brand span {
+  font-weight: 600;
+  color: var(--text-strong);
 }
 
 .nav-links {
@@ -131,6 +136,10 @@ body {
   margin-top: 0.35rem;
   color: var(--text-subtle);
   max-width: 48rem;
+}
+
+.section-subtitle + .section-subtitle {
+  margin-top: 0.25rem;
 }
 
 .section-actions {
@@ -349,6 +358,24 @@ tbody tr:hover {
   background: rgba(249, 115, 22, 0.18);
   color: #b45309;
   box-shadow: 0 0 12px rgba(249, 115, 22, 0.4);
+}
+
+.pagination-controls {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 1.25rem;
+}
+
+.page-buttons {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.page-info {
+  font-size: 0.9rem;
+  color: var(--muted-text);
 }
 
 .status-pill {

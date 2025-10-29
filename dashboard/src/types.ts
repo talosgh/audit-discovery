@@ -132,13 +132,22 @@ export interface LocationSummary {
   state: string | null;
   zip: string | null;
   building_owner: string | null;
-  elevator_contractor: string | null;
-  city_id: string | null;
-  audit_count: number;
+  vendor_name: string | null;
   device_count: number;
   open_deficiencies: number;
-  last_audit: string | null;
-  first_audit: string | null;
+}
+
+export interface LocationListParams {
+  page?: number;
+  pageSize?: number;
+  search?: string;
+}
+
+export interface LocationListResponse {
+  page: number;
+  page_size: number;
+  total: number;
+  items: LocationSummary[];
 }
 
 export interface LocationDeviceDeficiency {
@@ -177,6 +186,7 @@ export interface LocationDevice {
 export interface LocationProfileInfo {
   row_id: number | null;
   location_code: string | null;
+  device_count: number | null;
   site_name: string | null;
   street: string | null;
   city: string | null;
@@ -271,6 +281,17 @@ export interface LocationDetail {
   summary: {
     location_code: string | null;
     location_row_id: number | null;
+    site_name: string | null;
+    street: string | null;
+    city: string | null;
+    state: string | null;
+    zip: string | null;
+    owner_name: string | null;
+    owner_id: string | null;
+    operator_name: string | null;
+    operator_id: string | null;
+    vendor_name: string | null;
+    vendor_id: string | null;
     address: string;
     building_owner: string | null;
     elevator_contractor: string | null;

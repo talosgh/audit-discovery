@@ -80,43 +80,114 @@ char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out) {
     return json;
 }
 
-char *db_fetch_location_list(PGconn *conn, char **error_out) {
-    const char *sql =
-        "SELECT "
-        "  COALESCE(l.location_id, '') AS location_code,"
-        "  l.id AS location_row_id,"
-        "  a.building_address,"
-        "  COALESCE(l.site_name, a.building_address) AS site_name,"
-        "  COALESCE(l.street, a.building_address) AS street,"
-        "  COALESCE(l.city, a.building_city) AS city,"
-        "  COALESCE(l.state, a.building_state) AS state,"
-        "  COALESCE(l.zip_code, a.building_postal_code) AS zip,"
-        "  MAX(a.building_owner) AS building_owner,"
-        "  MAX(a.elevator_contractor) AS elevator_contractor,"
-        "  MAX(a.city_id) AS city_id,"
-        "  COUNT(*) AS audit_count,"
-        "  COUNT(DISTINCT a.building_id) AS device_count,"
-        "  MAX(a.submitted_on) AS last_audit,"
-        "  MIN(a.submitted_on) AS first_audit,"
-        "  COALESCE(SUM(d.open_def_count), 0) AS open_deficiencies"
-        " FROM audits a"
-        " LEFT JOIN locations l ON a.location_id = l.id"
-        " LEFT JOIN ("
-        "   SELECT audit_uuid, COUNT(*) FILTER (WHERE resolved_at IS NULL) AS open_def_count"
-        "   FROM audit_deficiencies"
-        "   GROUP BY audit_uuid"
-        " ) d ON d.audit_uuid = a.audit_uuid"
-        " WHERE a.building_address IS NOT NULL AND a.building_address <> ''"
-        " GROUP BY a.building_address, l.id, l.location_id, l.site_name, l.street, l.city, l.state, l.zip_code"
-        " ORDER BY MAX(a.submitted_on) DESC NULLS LAST, a.building_address";
-
-    PGresult *res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *search, char **error_out) {
+    if (!conn) {
         if (error_out && !*error_out) {
-            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup("Database connection unavailable");
+        }
+        return NULL;
+    }
+
+    if (page < 1) page = 1;
+    if (page_size < 1) page_size = 25;
+    if (page_size > 200) page_size = 200;
+
+    long long offset = (long long)(page - 1) * page_size;
+
+    char offset_buf[32];
+    char limit_buf[32];
+    snprintf(offset_buf, sizeof(offset_buf), "%lld", offset);
+    snprintf(limit_buf, sizeof(limit_buf), "%d", page_size);
+
+    char *pattern = NULL;
+    if (search && search[0]) {
+        size_t len = strlen(search);
+        pattern = malloc(len + 3);
+        if (!pattern) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory preparing search pattern");
+            }
+            return NULL;
+        }
+        pattern[0] = '%';
+        memcpy(pattern + 1, search, len);
+        pattern[len + 1] = '%';
+        pattern[len + 2] = '\0';
+    }
+
+    static const char *COUNT_SQL =
+        "SELECT COUNT(*) "
+        "FROM locations l "
+        "WHERE ($1 IS NULL OR "
+        "       l.location_id ILIKE $1 OR "
+        "       l.site_name ILIKE $1 OR "
+        "       l.street ILIKE $1 OR "
+        "       l.city ILIKE $1 OR "
+        "       l.state ILIKE $1 OR "
+        "       l.zip_code ILIKE $1 OR "
+        "       l.owner_name ILIKE $1 OR "
+        "       l.vendor_name ILIKE $1)";
+
+    const char *count_params[1] = { pattern };
+    PGresult *count_res = PQexecParams(conn, COUNT_SQL, 1, NULL, count_params, NULL, NULL, 0);
+    long long total = 0;
+    if (!count_res || PQresultStatus(count_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = count_res ? PQresultErrorMessage(count_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to count locations");
+        }
+        if (count_res) PQclear(count_res);
+        free(pattern);
+        return NULL;
+    }
+    if (PQntuples(count_res) > 0 && !PQgetisnull(count_res, 0, 0)) {
+        total = atoll(PQgetvalue(count_res, 0, 0));
+    }
+    PQclear(count_res);
+
+    static const char *ITEM_SQL =
+        "WITH stats AS ("
+        "    SELECT a.location_id, SUM(CASE WHEN d.resolved_at IS NULL THEN 1 ELSE 0 END) AS open_deficiencies "
+        "    FROM audits a "
+        "    LEFT JOIN audit_deficiencies d ON d.audit_uuid = a.audit_uuid "
+        "    WHERE a.location_id IS NOT NULL "
+        "    GROUP BY a.location_id"
+        ") "
+        "SELECT "
+        "    l.location_id AS location_code, "
+        "    l.id AS location_row_id, "
+        "    l.site_name, "
+        "    l.street, "
+        "    l.city, "
+        "    l.state, "
+        "    l.zip_code, "
+        "    l.owner_name, "
+        "    l.vendor_name, "
+        "    COALESCE(l.units, 0) AS device_count, "
+        "    COALESCE(stats.open_deficiencies, 0) AS open_deficiencies "
+        "FROM locations l "
+        "LEFT JOIN stats ON stats.location_id = l.id "
+        "WHERE ($3 IS NULL OR "
+        "       l.location_id ILIKE $3 OR "
+        "       l.site_name ILIKE $3 OR "
+        "       l.street ILIKE $3 OR "
+        "       l.city ILIKE $3 OR "
+        "       l.state ILIKE $3 OR "
+        "       l.zip_code ILIKE $3 OR "
+        "       l.owner_name ILIKE $3 OR "
+        "       l.vendor_name ILIKE $3) "
+        "ORDER BY lower(COALESCE(NULLIF(l.site_name, ''), NULLIF(l.street, ''), l.city, l.state, l.location_id)), l.id "
+        "OFFSET $1::bigint LIMIT $2::bigint";
+
+    const char *item_params[3] = { offset_buf, limit_buf, pattern };
+    PGresult *res = PQexecParams(conn, ITEM_SQL, 3, NULL, item_params, NULL, NULL, 0);
+    free(pattern);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = res ? PQresultErrorMessage(res) : PQerrorMessage(conn);
             *error_out = strdup(msg ? msg : "Failed to query locations");
         }
-        PQclear(res);
+        if (res) PQclear(res);
         return NULL;
     }
 
@@ -129,149 +200,84 @@ char *db_fetch_location_list(PGconn *conn, char **error_out) {
         return NULL;
     }
 
-    if (!buffer_append_char(&buf, '[')) {
-        buffer_free(&buf);
-        PQclear(res);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory building location response");
-        }
-        return NULL;
-    }
+    if (!buffer_append_char(&buf, '{')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"page\":")) goto oom;
+    if (!buffer_appendf(&buf, "%d", page)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"page_size\":")) goto oom;
+    if (!buffer_appendf(&buf, "%d", page_size)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"total\":")) goto oom;
+    if (!buffer_appendf(&buf, "%lld", total)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"items\":[")) goto oom;
 
     int rows = PQntuples(res);
     bool first = true;
     for (int row = 0; row < rows; ++row) {
         const char *location_code = PQgetisnull(res, row, 0) ? NULL : PQgetvalue(res, row, 0);
-        const char *row_id_str = PQgetisnull(res, row, 1) ? NULL : PQgetvalue(res, row, 1);
-        const char *address = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
-        if (!address || address[0] == '\0') {
-            continue;
-        }
-        const char *site_name = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
-        const char *street = PQgetisnull(res, row, 4) ? NULL : PQgetvalue(res, row, 4);
-        const char *city = PQgetisnull(res, row, 5) ? NULL : PQgetvalue(res, row, 5);
-        const char *state = PQgetisnull(res, row, 6) ? NULL : PQgetvalue(res, row, 6);
-        const char *zip = PQgetisnull(res, row, 7) ? NULL : PQgetvalue(res, row, 7);
-        const char *owner = PQgetisnull(res, row, 8) ? NULL : PQgetvalue(res, row, 8);
-        const char *contractor = PQgetisnull(res, row, 9) ? NULL : PQgetvalue(res, row, 9);
-        const char *city_id = PQgetisnull(res, row, 10) ? NULL : PQgetvalue(res, row, 10);
-        const char *audit_count_str = PQgetisnull(res, row, 11) ? "0" : PQgetvalue(res, row, 11);
-        const char *device_count_str = PQgetisnull(res, row, 12) ? "0" : PQgetvalue(res, row, 12);
-        const char *last_audit = PQgetisnull(res, row, 13) ? NULL : PQgetvalue(res, row, 13);
-        const char *first_audit = PQgetisnull(res, row, 14) ? NULL : PQgetvalue(res, row, 14);
-        const char *open_def_str = PQgetisnull(res, row, 15) ? "0" : PQgetvalue(res, row, 15);
+        const char *row_id = PQgetisnull(res, row, 1) ? NULL : PQgetvalue(res, row, 1);
+        const char *site_name = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
+        const char *street = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
+        const char *city = PQgetisnull(res, row, 4) ? NULL : PQgetvalue(res, row, 4);
+        const char *state = PQgetisnull(res, row, 5) ? NULL : PQgetvalue(res, row, 5);
+        const char *zip = PQgetisnull(res, row, 6) ? NULL : PQgetvalue(res, row, 6);
+        const char *owner = PQgetisnull(res, row, 7) ? NULL : PQgetvalue(res, row, 7);
+        const char *vendor = PQgetisnull(res, row, 8) ? NULL : PQgetvalue(res, row, 8);
+        const char *device_count = PQgetisnull(res, row, 9) ? "0" : PQgetvalue(res, row, 9);
+        const char *open_def = PQgetisnull(res, row, 10) ? "0" : PQgetvalue(res, row, 10);
 
         if (!first) {
-            if (!buffer_append_char(&buf, ',')) {
-                buffer_free(&buf);
-                PQclear(res);
-                if (error_out && !*error_out) {
-                    *error_out = strdup("Out of memory building location response");
-                }
-                return NULL;
-            }
+            if (!buffer_append_char(&buf, ',')) goto oom;
         }
         first = false;
 
         if (!buffer_append_char(&buf, '{')) goto oom;
         if (!buffer_append_cstr(&buf, "\"location_code\":")) goto oom;
-        if (location_code && location_code[0]) {
-            if (!buffer_append_json_string(&buf, location_code)) goto oom;
+        if (!buffer_append_json_string(&buf, location_code)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"location_row_id\":")) goto oom;
+        if (row_id && row_id[0]) {
+            if (!buffer_append_cstr(&buf, row_id)) goto oom;
         } else {
             if (!buffer_append_cstr(&buf, "null")) goto oom;
         }
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"location_row_id\":")) goto oom;
-        if (row_id_str && row_id_str[0]) {
-            if (!buffer_append_cstr(&buf, row_id_str)) goto oom;
-        } else {
-            if (!buffer_append_cstr(&buf, "null")) goto oom;
-        }
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"address\":")) goto oom;
-        if (!buffer_append_json_string(&buf, address)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"site_name\":")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"address\":")) goto oom;
+        if (!buffer_append_json_string(&buf, street ? street : (site_name ? site_name : location_code))) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"site_name\":")) goto oom;
         if (!buffer_append_json_string(&buf, site_name)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"street\":")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"street\":")) goto oom;
         if (!buffer_append_json_string(&buf, street)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"city\":")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"city\":")) goto oom;
         if (!buffer_append_json_string(&buf, city)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"state\":")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"state\":")) goto oom;
         if (!buffer_append_json_string(&buf, state)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"zip\":")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"zip\":")) goto oom;
         if (!buffer_append_json_string(&buf, zip)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"building_owner\":")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"building_owner\":")) goto oom;
         if (!buffer_append_json_string(&buf, owner)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"elevator_contractor\":")) goto oom;
-        if (!buffer_append_json_string(&buf, contractor)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"city_id\":")) goto oom;
-        if (!buffer_append_json_string(&buf, city_id)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"audit_count\":")) goto oom;
-        if (!buffer_append_cstr(&buf, audit_count_str)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"device_count\":")) goto oom;
-        if (!buffer_append_cstr(&buf, device_count_str)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"open_deficiencies\":")) goto oom;
-        if (!buffer_append_cstr(&buf, open_def_str)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"last_audit\":")) goto oom;
-        if (!buffer_append_json_string(&buf, last_audit)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"first_audit\":")) goto oom;
-        if (!buffer_append_json_string(&buf, first_audit)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"vendor_name\":")) goto oom;
+        if (!buffer_append_json_string(&buf, vendor)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"device_count\":")) goto oom;
+        if (!buffer_append_cstr(&buf, device_count)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"open_deficiencies\":")) goto oom;
+        if (!buffer_append_cstr(&buf, open_def)) goto oom;
         if (!buffer_append_char(&buf, '}')) goto oom;
-        continue;
-
-oom:
-        buffer_free(&buf);
-        PQclear(res);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory building location response");
-        }
-        return NULL;
     }
 
-    if (!buffer_append_char(&buf, ']')) {
-        buffer_free(&buf);
-        PQclear(res);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory building location response");
-        }
-        return NULL;
-    }
+    if (!buffer_append_char(&buf, ']')) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
 
     PQclear(res);
     char *json = buf.data;
     buf.data = NULL;
     buffer_free(&buf);
     return json;
-}
 
+oom:
+    buffer_free(&buf);
+    PQclear(res);
+    if (error_out && !*error_out) {
+        *error_out = strdup("Out of memory building location response");
+    }
+    return NULL;
+}
 bool audit_exists(PGconn *conn, const char *uuid) {
     if (!uuid || !*uuid) {
         return false;

@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <limits.h>
 
 static RouteHelpers g_route_helpers = {0};
 static const char *g_route_prefix = "";
@@ -183,8 +184,33 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
         free(visit_ids_value);
         free(audit_ids_value);
 
+        char *page_value = http_extract_query_param(query_string, "page");
+        char *page_size_value = http_extract_query_param(query_string, "page_size");
+        char *search_value = http_extract_query_param(query_string, "search");
+
+        int page = 1;
+        if (page_value && page_value[0]) {
+            char *endptr = NULL;
+            long parsed = strtol(page_value, &endptr, 10);
+            if (endptr && *endptr == '\0' && parsed > 0 && parsed <= INT_MAX) {
+                page = (int)parsed;
+            }
+        }
+
+        int page_size = 25;
+        if (page_size_value && page_size_value[0]) {
+            char *endptr = NULL;
+            long parsed = strtol(page_size_value, &endptr, 10);
+            if (endptr && *endptr == '\0' && parsed > 0 && parsed <= 200) {
+                page_size = (int)parsed;
+            }
+        }
+
         char *error = NULL;
-        char *json = db_fetch_location_list(conn, &error);
+        char *json = db_fetch_location_list(conn, page, page_size, search_value, &error);
+        free(page_value);
+        free(page_size_value);
+        free(search_value);
         if (!json) {
             char *body = build_error_response(error ? error : "Failed to fetch locations");
             send_http_json(client_fd, 500, "Internal Server Error", body);
@@ -194,6 +220,7 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
         }
         send_http_json(client_fd, 200, "OK", json);
         free(json);
+        free(error);
         return;
     }
 
