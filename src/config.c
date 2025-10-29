@@ -15,6 +15,8 @@ char *g_database_dsn = NULL;
 char *g_report_output_dir = NULL;
 char *g_report_assets_dir = NULL;
 char *g_xai_api_key = NULL;
+char *g_google_api_key = NULL;
+char *g_google_region_code = NULL;
 
 static void trim_inplace(char *str) {
     if (!str) {

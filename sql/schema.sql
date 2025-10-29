@@ -98,7 +98,17 @@ CREATE TABLE IF NOT EXISTS audits (
     mobile_app_version TEXT,
     mobile_app_type TEXT,
     mobile_sdk_release TEXT,
-    mobile_memory_mb BIGINT
+    mobile_memory_mb BIGINT,
+    building_city TEXT,
+    building_state TEXT,
+    building_postal_code TEXT,
+    building_postal_code_suffix TEXT,
+    building_country TEXT,
+    building_formatted_address TEXT,
+    building_latitude DOUBLE PRECISION,
+    building_longitude DOUBLE PRECISION,
+    building_plus_code TEXT,
+    building_place_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS audit_visits (
@@ -153,7 +163,17 @@ ALTER TABLE audit_deficiencies
 
 ALTER TABLE audits
     ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id),
-    ADD COLUMN IF NOT EXISTS visit_id UUID REFERENCES audit_visits(visit_id);
+    ADD COLUMN IF NOT EXISTS visit_id UUID REFERENCES audit_visits(visit_id),
+    ADD COLUMN IF NOT EXISTS building_city TEXT,
+    ADD COLUMN IF NOT EXISTS building_state TEXT,
+    ADD COLUMN IF NOT EXISTS building_postal_code TEXT,
+    ADD COLUMN IF NOT EXISTS building_postal_code_suffix TEXT,
+    ADD COLUMN IF NOT EXISTS building_country TEXT,
+    ADD COLUMN IF NOT EXISTS building_formatted_address TEXT,
+    ADD COLUMN IF NOT EXISTS building_latitude DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS building_longitude DOUBLE PRECISION,
+    ADD COLUMN IF NOT EXISTS building_plus_code TEXT,
+    ADD COLUMN IF NOT EXISTS building_place_id TEXT;
 
 CREATE TABLE IF NOT EXISTS report_jobs (
     id BIGSERIAL PRIMARY KEY,

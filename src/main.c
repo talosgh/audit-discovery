@@ -32,6 +32,7 @@
 #include "http.h"
 #include "json.h"
 #include "log.h"
+#include "address_validation.h"
 #include "routes.h"
 #include "report_jobs.h"
 #include "server.h"
@@ -298,6 +299,16 @@ typedef struct {
     OptionalInt location_id;
     char *device_type;
     OptionalBool is_first_car;
+    char *building_city;
+    char *building_state;
+    char *building_postal_code;
+    char *building_postal_code_suffix;
+    char *building_country;
+    char *building_formatted_address;
+    OptionalDouble building_latitude;
+    OptionalDouble building_longitude;
+    char *building_plus_code;
+    char *building_place_id;
     char *building_information;
     char *bank_name;
     StringArray cars_in_bank;
@@ -419,6 +430,23 @@ typedef struct {
     char *conclusion;
 } NarrativeSet;
 
+typedef struct {
+    char *raw_address;
+    char *key;
+    NormalizedAddress normalized;
+    char *error_message;
+    int success;
+} AddressCacheEntry;
+
+typedef struct {
+    AddressCacheEntry *items;
+    size_t count;
+    size_t capacity;
+} AddressCache;
+
+static AddressCache g_address_cache;
+static pthread_mutex_t g_address_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 static void handle_options_request(int client_fd);
 static void handle_client(int client_fd, void *ctx);
 static const char *optional_bool_to_text(const OptionalBool *value);
@@ -447,6 +475,13 @@ static char *build_visit_summary_json(PGconn *conn, const LocationProfile *profi
 static char *build_report_version_list(PGconn *conn, const char *address, bool deficiency_only, char **error_out);
 static int append_service_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
 static int append_financial_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
+static void address_cache_init(AddressCache *cache);
+static void address_cache_clear(AddressCache *cache);
+static AddressCacheEntry *address_cache_find(AddressCache *cache, const char *raw);
+static AddressCacheEntry *address_cache_store(AddressCache *cache, const char *raw, const NormalizedAddress *normalized, int success, const char *error_message);
+static int get_normalized_address_cached(const char *raw_address, NormalizedAddress *result, char **error_out);
+static int apply_normalized_address_to_visit(AuditVisit *visit, const NormalizedAddress *normalized);
+static int db_exec_simple(PGconn *conn, const char *sql, char **error_out);
 
 static char *build_location_detail_payload(PGconn *conn, const LocationDetailRequest *request, int *status_out, char **error_out) {
     if (status_out) {
@@ -2222,11 +2257,15 @@ static char *build_download_url(const char *job_id) {
 }
 
 #define SERVICE_FILTER \
-    "(($1 IS NOT NULL AND sd_location_id = $1) " \
-    " OR ($2 IS NOT NULL AND $3 IS NOT NULL AND $4 IS NOT NULL " \
-    "     AND sd_normalized_street ILIKE ('%' || $2 || '%') " \
-    "     AND sd_normalized_city ILIKE ('%' || $3 || '%') " \
-    "     AND sd_normalized_state ILIKE ('%' || $4 || '%'))))"
+    "(" \
+    "  ($1 IS NOT NULL AND sd_location_id = $1) " \
+    "  OR (" \
+    "    $2 IS NOT NULL AND $3 IS NOT NULL AND $4 IS NOT NULL " \
+    "    AND sd_normalized_street ILIKE ('%' || $2 || '%') " \
+    "    AND sd_normalized_city ILIKE ('%' || $3 || '%') " \
+    "    AND sd_normalized_state ILIKE ('%' || $4 || '%')" \
+    "  )" \
+    ")"
 
 static int append_service_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out) {
     if (!buf || !conn || !job) {
@@ -3830,6 +3869,8 @@ static void audit_record_init(AuditRecord *record) {
     optional_long_clear(&record->user_id);
     optional_int_clear(&record->rating_overall);
     optional_bool_clear(&record->is_first_car);
+    optional_double_clear(&record->building_latitude);
+    optional_double_clear(&record->building_longitude);
     optional_int_clear(&record->location_id);
     optional_int_clear(&record->controller_install_year);
     optional_int_clear(&record->car_speed);
@@ -3875,6 +3916,14 @@ static void audit_record_free(AuditRecord *record) {
     free(record->elevator_contractor);
     free(record->city_id);
     free(record->building_id);
+    free(record->building_city);
+    free(record->building_state);
+    free(record->building_postal_code);
+    free(record->building_postal_code_suffix);
+    free(record->building_country);
+    free(record->building_formatted_address);
+    free(record->building_plus_code);
+    free(record->building_place_id);
     free(record->device_type);
     free(record->building_information);
     free(record->bank_name);
@@ -4284,6 +4333,939 @@ static int append_unique_candidate(StringArray *array, const char *value) {
     return string_array_append_copy(array, value);
 }
 
+static void address_cache_init(AddressCache *cache) {
+    if (!cache) {
+        return;
+    }
+    cache->items = NULL;
+    cache->count = 0;
+    cache->capacity = 0;
+}
+
+static void address_cache_clear(AddressCache *cache) {
+    if (!cache) {
+        return;
+    }
+    for (size_t i = 0; i < cache->count; ++i) {
+        AddressCacheEntry *entry = &cache->items[i];
+        free(entry->raw_address);
+        free(entry->key);
+        free(entry->error_message);
+        normalized_address_clear(&entry->normalized);
+    }
+    free(cache->items);
+    cache->items = NULL;
+    cache->count = 0;
+    cache->capacity = 0;
+}
+
+static int address_cache_ensure_capacity(AddressCache *cache) {
+    if (!cache) {
+        return 0;
+    }
+    if (cache->count < cache->capacity) {
+        return 1;
+    }
+    size_t new_capacity = cache->capacity == 0 ? 16 : cache->capacity * 2;
+    AddressCacheEntry *items = realloc(cache->items, new_capacity * sizeof(AddressCacheEntry));
+    if (!items) {
+        return 0;
+    }
+    cache->items = items;
+    cache->capacity = new_capacity;
+    return 1;
+}
+
+static char *address_cache_make_key(const char *raw) {
+    if (!raw) {
+        return NULL;
+    }
+    char *trimmed = trim_copy(raw);
+    if (!trimmed) {
+        return NULL;
+    }
+    size_t len = strlen(trimmed);
+    if (len == 0) {
+        free(trimmed);
+        return NULL;
+    }
+    char *buffer = malloc(len + 1);
+    if (!buffer) {
+        free(trimmed);
+        return NULL;
+    }
+    size_t write = 0;
+    bool in_space = false;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char ch = (unsigned char)trimmed[i];
+        if (isspace(ch)) {
+            if (!in_space && write > 0) {
+                buffer[write++] = ' ';
+                in_space = true;
+            }
+            continue;
+        }
+        if (ch == ',' || ch == ';') {
+            if (!in_space && write > 0) {
+                buffer[write++] = ' ';
+                in_space = true;
+            }
+            continue;
+        }
+        in_space = false;
+        buffer[write++] = (char)toupper(ch);
+    }
+    while (write > 0 && buffer[write - 1] == ' ') {
+        --write;
+    }
+    buffer[write] = '\0';
+    free(trimmed);
+    if (write == 0) {
+        free(buffer);
+        return NULL;
+    }
+    return buffer;
+}
+
+static AddressCacheEntry *address_cache_lookup(AddressCache *cache, const char *key) {
+    if (!cache || !key) {
+        return NULL;
+    }
+    for (size_t i = 0; i < cache->count; ++i) {
+        if (strcmp(cache->items[i].key, key) == 0) {
+            return &cache->items[i];
+        }
+    }
+    return NULL;
+}
+
+static AddressCacheEntry *address_cache_find(AddressCache *cache, const char *raw) {
+    if (!cache || !raw) {
+        return NULL;
+    }
+    char *key = address_cache_make_key(raw);
+    if (!key) {
+        return NULL;
+    }
+    AddressCacheEntry *entry = address_cache_lookup(cache, key);
+    free(key);
+    return entry;
+}
+
+static AddressCacheEntry *address_cache_store(AddressCache *cache, const char *raw, const NormalizedAddress *normalized, int success, const char *error_message) {
+    if (!cache || !raw) {
+        return NULL;
+    }
+    char *key = address_cache_make_key(raw);
+    if (!key) {
+        return NULL;
+    }
+
+    AddressCacheEntry *existing = address_cache_lookup(cache, key);
+    if (existing) {
+        normalized_address_clear(&existing->normalized);
+        free(existing->error_message);
+        existing->error_message = NULL;
+        existing->success = success ? 1 : 0;
+        if (existing->success && normalized) {
+            if (!normalized_address_clone(normalized, &existing->normalized)) {
+                existing->success = 0;
+                existing->error_message = strdup("Out of memory storing normalized address");
+            }
+        } else if (!existing->success && error_message) {
+            existing->error_message = strdup(error_message);
+        }
+        free(key);
+        return existing;
+    }
+
+    if (!address_cache_ensure_capacity(cache)) {
+        free(key);
+        return NULL;
+    }
+
+    AddressCacheEntry *entry = &cache->items[cache->count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->raw_address = strdup(raw);
+    if (!entry->raw_address) {
+        cache->count--;
+        free(key);
+        memset(entry, 0, sizeof(*entry));
+        return NULL;
+    }
+    entry->key = key;
+    entry->success = success ? 1 : 0;
+    if (entry->success && normalized) {
+        if (!normalized_address_clone(normalized, &entry->normalized)) {
+            entry->success = 0;
+            entry->error_message = strdup("Out of memory storing normalized address");
+        }
+    } else if (!entry->success && error_message) {
+        entry->error_message = strdup(error_message);
+    }
+    return entry;
+}
+
+static int get_normalized_address_cached(const char *raw_address, NormalizedAddress *result, char **error_out) {
+    if (error_out) {
+        *error_out = NULL;
+    }
+    if (!result) {
+        if (error_out) {
+            *error_out = strdup("Invalid normalized address output");
+        }
+        return 0;
+    }
+    normalized_address_init(result);
+    if (!raw_address || raw_address[0] == '\0') {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Address is empty");
+        }
+        return 0;
+    }
+
+    pthread_mutex_lock(&g_address_cache_mutex);
+    AddressCacheEntry *cached = address_cache_find(&g_address_cache, raw_address);
+    if (cached) {
+        if (cached->success) {
+            if (!normalized_address_clone(&cached->normalized, result)) {
+                pthread_mutex_unlock(&g_address_cache_mutex);
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory cloning normalized address");
+                }
+                return 0;
+            }
+            pthread_mutex_unlock(&g_address_cache_mutex);
+            return 1;
+        }
+        if (error_out && cached->error_message && !*error_out) {
+            *error_out = strdup(cached->error_message);
+        }
+        pthread_mutex_unlock(&g_address_cache_mutex);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_address_cache_mutex);
+
+    NormalizedAddress temp;
+    normalized_address_init(&temp);
+    char *local_error = NULL;
+    int ok = validate_address_with_google(raw_address, &temp, &local_error);
+
+    pthread_mutex_lock(&g_address_cache_mutex);
+    address_cache_store(&g_address_cache, raw_address, ok ? &temp : NULL, ok, local_error);
+    pthread_mutex_unlock(&g_address_cache_mutex);
+
+    if (!ok) {
+        if (error_out && local_error && !*error_out) {
+            *error_out = strdup(local_error);
+        }
+        free(local_error);
+        normalized_address_clear(&temp);
+        return 0;
+    }
+
+    int clone_ok = normalized_address_clone(&temp, result);
+    normalized_address_clear(&temp);
+    free(local_error);
+    if (!clone_ok) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory cloning normalized address");
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int apply_normalized_address_to_visit(AuditVisit *visit, const NormalizedAddress *normalized) {
+    if (!visit || !normalized) {
+        return 1;
+    }
+
+    const char *preferred = normalized->formatted_address ? normalized->formatted_address : normalized->primary_address_line;
+    if (preferred && !assign_string(&visit->building_address, preferred)) {
+        return 0;
+    }
+
+    if (normalized->primary_address_line && !assign_string(&visit->street, normalized->primary_address_line)) {
+        return 0;
+    }
+    if (normalized->city && !assign_string(&visit->city, normalized->city)) {
+        return 0;
+    }
+    if (normalized->state && !assign_string(&visit->state, normalized->state)) {
+        return 0;
+    }
+
+    if (normalized->postal_code) {
+        char *zip_combined = NULL;
+        const char *suffix = normalized->postal_code_suffix;
+        if (suffix && suffix[0]) {
+            size_t len = strlen(normalized->postal_code) + 1 + strlen(suffix) + 1;
+            zip_combined = malloc(len);
+            if (!zip_combined) {
+                return 0;
+            }
+            snprintf(zip_combined, len, "%s-%s", normalized->postal_code, suffix);
+        } else {
+            zip_combined = strdup(normalized->postal_code);
+            if (!zip_combined) {
+                return 0;
+            }
+        }
+        free(visit->zip_code);
+        visit->zip_code = zip_combined;
+    }
+
+    if (normalized->formatted_address && (!visit->visit_label || visit->visit_label[0] == '\0')) {
+        if (!assign_string(&visit->visit_label, normalized->formatted_address)) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int record_address_failure(StringArray *failures, const char *table, const char *identifier, const char *message) {
+    if (!failures) {
+        return 1;
+    }
+    const char *table_val = table ? table : "unknown_table";
+    const char *id_val = (identifier && identifier[0]) ? identifier : "unknown_id";
+    const char *msg_val = (message && message[0]) ? message : "unknown error";
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        return 0;
+    }
+    if (!buffer_appendf(&buf, "%s:%s:%s", table_val, id_val, msg_val)) {
+        buffer_free(&buf);
+        return 0;
+    }
+    int ok = string_array_append_copy(failures, buf.data ? buf.data : "");
+    buffer_free(&buf);
+    return ok;
+}
+
+static const char *bool_to_text(int value) {
+    return value ? "true" : "false";
+}
+
+static int sanitize_audits_table(PGconn *conn, StringArray *failures) {
+    if (!conn) {
+        return 0;
+    }
+
+    const char *create_sql =
+        "CREATE TABLE IF NOT EXISTS audits_add ("
+        " audit_uuid UUID PRIMARY KEY,"
+        " raw_address TEXT,"
+        " normalized_primary TEXT,"
+        " normalized_formatted TEXT,"
+        " city TEXT,"
+        " state TEXT,"
+        " postal_code TEXT,"
+        " postal_code_suffix TEXT,"
+        " country TEXT,"
+        " latitude DOUBLE PRECISION,"
+        " longitude DOUBLE PRECISION,"
+        " plus_code TEXT,"
+        " place_id TEXT,"
+        " success BOOLEAN NOT NULL,"
+        " error_message TEXT"
+        ")";
+    if (!db_exec_simple(conn, create_sql, NULL)) {
+        return 0;
+    }
+    if (!db_exec_simple(conn, "TRUNCATE audits_add", NULL)) {
+        return 0;
+    }
+
+    const char *select_sql =
+        "SELECT audit_uuid::text, "
+        "       COALESCE(NULLIF(building_formatted_address, ''), building_address) AS raw_address "
+        "FROM audits";
+    PGresult *res = PQexec(conn, select_sql);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        return 0;
+    }
+
+    const char *insert_sql =
+        "INSERT INTO audits_add ("
+        " audit_uuid, raw_address, normalized_primary, normalized_formatted, city, state, postal_code, "
+        " postal_code_suffix, country, latitude, longitude, plus_code, place_id, success, error_message"
+        ") VALUES ("
+        " $1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10::double precision, $11::double precision, $12, $13, $14::boolean, $15"
+        ") ON CONFLICT (audit_uuid) DO UPDATE SET "
+        " raw_address = EXCLUDED.raw_address, "
+        " normalized_primary = EXCLUDED.normalized_primary, "
+        " normalized_formatted = EXCLUDED.normalized_formatted, "
+        " city = EXCLUDED.city, "
+        " state = EXCLUDED.state, "
+        " postal_code = EXCLUDED.postal_code, "
+        " postal_code_suffix = EXCLUDED.postal_code_suffix, "
+        " country = EXCLUDED.country, "
+        " latitude = EXCLUDED.latitude, "
+        " longitude = EXCLUDED.longitude, "
+        " plus_code = EXCLUDED.plus_code, "
+        " place_id = EXCLUDED.place_id, "
+        " success = EXCLUDED.success, "
+        " error_message = EXCLUDED.error_message";
+
+    int rows = PQntuples(res);
+    for (int i = 0; i < rows; ++i) {
+        const char *audit_uuid = PQgetisnull(res, i, 0) ? NULL : PQgetvalue(res, i, 0);
+        const char *raw_address = PQgetisnull(res, i, 1) ? NULL : PQgetvalue(res, i, 1);
+
+        NormalizedAddress norm;
+        normalized_address_init(&norm);
+        char *norm_error = NULL;
+        int success = (raw_address && raw_address[0]) ? get_normalized_address_cached(raw_address, &norm, &norm_error) : 0;
+        if (!raw_address || raw_address[0] == '\0') {
+            if (norm_error) {
+                free(norm_error);
+                norm_error = NULL;
+            }
+            norm_error = strdup("Address missing");
+        }
+
+        AllocationList pool;
+        allocation_list_init(&pool);
+
+        const char *lat_param = NULL;
+        const char *lon_param = NULL;
+        if (success && norm.has_geocode) {
+            if (!isnan(norm.latitude)) {
+                char *lat_buf = malloc(64);
+                if (!lat_buf) {
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    PQclear(res);
+                    return 0;
+                }
+                snprintf(lat_buf, 64, "%.10f", norm.latitude);
+                if (!allocation_list_add(&pool, lat_buf)) {
+                    free(lat_buf);
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    PQclear(res);
+                    return 0;
+                }
+                lat_param = lat_buf;
+            }
+            if (!isnan(norm.longitude)) {
+                char *lon_buf = malloc(64);
+                if (!lon_buf) {
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    PQclear(res);
+                    return 0;
+                }
+                snprintf(lon_buf, 64, "%.10f", norm.longitude);
+                if (!allocation_list_add(&pool, lon_buf)) {
+                    free(lon_buf);
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    PQclear(res);
+                    return 0;
+                }
+                lon_param = lon_buf;
+            }
+        }
+
+        const char *success_param = bool_to_text(success);
+        const char *error_param = success ? NULL : norm_error;
+
+        const char *params[15] = {
+            audit_uuid,
+            raw_address && raw_address[0] ? raw_address : NULL,
+            norm.primary_address_line,
+            norm.formatted_address,
+            norm.city,
+            norm.state,
+            norm.postal_code,
+            norm.postal_code_suffix,
+            norm.country,
+            lat_param,
+            lon_param,
+            norm.plus_code,
+            norm.place_id,
+            success_param,
+            error_param
+        };
+        int lengths[15] = {0};
+        int formats[15] = {0};
+
+        PGresult *ins_res = PQexecParams(conn, insert_sql, 15, NULL, params, lengths, formats, 0);
+        int insert_ok = ins_res && PQresultStatus(ins_res) == PGRES_COMMAND_OK;
+        if (ins_res) {
+            PQclear(ins_res);
+        }
+        if (!insert_ok) {
+            allocation_list_clear(&pool);
+            normalized_address_clear(&norm);
+            if (norm_error) free(norm_error);
+            PQclear(res);
+            return 0;
+        }
+
+        if (!success) {
+            record_address_failure(failures, "audits", audit_uuid, error_param);
+        }
+
+        allocation_list_clear(&pool);
+        normalized_address_clear(&norm);
+        if (norm_error) {
+            free(norm_error);
+        }
+    }
+    PQclear(res);
+    return 1;
+}
+
+static int sanitize_locations_table(PGconn *conn, StringArray *failures) {
+    if (!conn) {
+        return 0;
+    }
+
+    const char *create_sql =
+        "CREATE TABLE IF NOT EXISTS locations_add ("
+        " location_row_id INTEGER PRIMARY KEY,"
+        " location_code TEXT,"
+        " raw_address TEXT,"
+        " normalized_primary TEXT,"
+        " normalized_formatted TEXT,"
+        " city TEXT,"
+        " state TEXT,"
+        " postal_code TEXT,"
+        " postal_code_suffix TEXT,"
+        " country TEXT,"
+        " latitude DOUBLE PRECISION,"
+        " longitude DOUBLE PRECISION,"
+        " plus_code TEXT,"
+        " place_id TEXT,"
+        " success BOOLEAN NOT NULL,"
+        " error_message TEXT"
+        ")";
+    if (!db_exec_simple(conn, create_sql, NULL)) {
+        return 0;
+    }
+    if (!db_exec_simple(conn, "TRUNCATE locations_add", NULL)) {
+        return 0;
+    }
+
+    const char *select_sql =
+        "SELECT id::text, location_id, street, city, state, zip_code "
+        "FROM locations";
+    PGresult *res = PQexec(conn, select_sql);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        return 0;
+    }
+
+    const char *insert_sql =
+        "INSERT INTO locations_add ("
+        " location_row_id, location_code, raw_address, normalized_primary, normalized_formatted, city, state, postal_code, "
+        " postal_code_suffix, country, latitude, longitude, plus_code, place_id, success, error_message"
+        ") VALUES ("
+        " $1::integer, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::double precision, $12::double precision, $13, $14, $15::boolean, $16"
+        ") ON CONFLICT (location_row_id) DO UPDATE SET "
+        " location_code = EXCLUDED.location_code, "
+        " raw_address = EXCLUDED.raw_address, "
+        " normalized_primary = EXCLUDED.normalized_primary, "
+        " normalized_formatted = EXCLUDED.normalized_formatted, "
+        " city = EXCLUDED.city, "
+        " state = EXCLUDED.state, "
+        " postal_code = EXCLUDED.postal_code, "
+        " postal_code_suffix = EXCLUDED.postal_code_suffix, "
+        " country = EXCLUDED.country, "
+        " latitude = EXCLUDED.latitude, "
+        " longitude = EXCLUDED.longitude, "
+        " plus_code = EXCLUDED.plus_code, "
+        " place_id = EXCLUDED.place_id, "
+        " success = EXCLUDED.success, "
+        " error_message = EXCLUDED.error_message";
+
+    int rows = PQntuples(res);
+    for (int i = 0; i < rows; ++i) {
+        const char *row_id = PQgetisnull(res, i, 0) ? NULL : PQgetvalue(res, i, 0);
+        const char *location_code = PQgetisnull(res, i, 1) ? NULL : PQgetvalue(res, i, 1);
+        const char *street = PQgetisnull(res, i, 2) ? NULL : PQgetvalue(res, i, 2);
+        const char *city = PQgetisnull(res, i, 3) ? NULL : PQgetvalue(res, i, 3);
+        const char *state = PQgetisnull(res, i, 4) ? NULL : PQgetvalue(res, i, 4);
+        const char *zip = PQgetisnull(res, i, 5) ? NULL : PQgetvalue(res, i, 5);
+
+        Buffer addr_buf;
+        int addr_buf_init = buffer_init(&addr_buf);
+        const char *raw_address = NULL;
+        if (addr_buf_init) {
+            if (street && street[0]) {
+                buffer_append_cstr(&addr_buf, street);
+            }
+            if (city && city[0]) {
+                if (addr_buf.length > 0) buffer_append_cstr(&addr_buf, ", ");
+                buffer_append_cstr(&addr_buf, city);
+            }
+            if (state && state[0]) {
+                if (addr_buf.length > 0) buffer_append_cstr(&addr_buf, ", ");
+                buffer_append_cstr(&addr_buf, state);
+            }
+            if (zip && zip[0]) {
+                if (addr_buf.length > 0) buffer_append_cstr(&addr_buf, " ");
+                buffer_append_cstr(&addr_buf, zip);
+            }
+            raw_address = addr_buf.data;
+        }
+
+        NormalizedAddress norm;
+        normalized_address_init(&norm);
+        char *norm_error = NULL;
+        int success = (raw_address && raw_address[0]) ? get_normalized_address_cached(raw_address, &norm, &norm_error) : 0;
+        if ((!raw_address || raw_address[0] == '\0') && !norm_error) {
+            norm_error = strdup("Address missing");
+        }
+
+        AllocationList pool;
+        allocation_list_init(&pool);
+        const char *lat_param = NULL;
+        const char *lon_param = NULL;
+        if (success && norm.has_geocode) {
+            if (!isnan(norm.latitude)) {
+                char *lat_buf = malloc(64);
+                if (!lat_buf) {
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    if (addr_buf_init) buffer_free(&addr_buf);
+                    PQclear(res);
+                    return 0;
+                }
+                snprintf(lat_buf, 64, "%.10f", norm.latitude);
+                if (!allocation_list_add(&pool, lat_buf)) {
+                    free(lat_buf);
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    if (addr_buf_init) buffer_free(&addr_buf);
+                    PQclear(res);
+                    return 0;
+                }
+                lat_param = lat_buf;
+            }
+            if (!isnan(norm.longitude)) {
+                char *lon_buf = malloc(64);
+                if (!lon_buf) {
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    if (addr_buf_init) buffer_free(&addr_buf);
+                    PQclear(res);
+                    return 0;
+                }
+                snprintf(lon_buf, 64, "%.10f", norm.longitude);
+                if (!allocation_list_add(&pool, lon_buf)) {
+                    free(lon_buf);
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    if (addr_buf_init) buffer_free(&addr_buf);
+                    PQclear(res);
+                    return 0;
+                }
+                lon_param = lon_buf;
+            }
+        }
+
+        const char *success_param = bool_to_text(success);
+        const char *error_param = success ? NULL : norm_error;
+
+        const char *params[16] = {
+            row_id,
+            location_code,
+            raw_address && raw_address[0] ? raw_address : NULL,
+            norm.primary_address_line,
+            norm.formatted_address,
+            norm.city,
+            norm.state,
+            norm.postal_code,
+            norm.postal_code_suffix,
+            norm.country,
+            lat_param,
+            lon_param,
+            norm.plus_code,
+            norm.place_id,
+            success_param,
+            error_param
+        };
+        int lengths[16] = {0};
+        int formats[16] = {0};
+
+        PGresult *ins_res = PQexecParams(conn, insert_sql, 16, NULL, params, lengths, formats, 0);
+        int insert_ok = ins_res && PQresultStatus(ins_res) == PGRES_COMMAND_OK;
+        if (ins_res) {
+            PQclear(ins_res);
+        }
+        if (!insert_ok) {
+            allocation_list_clear(&pool);
+            normalized_address_clear(&norm);
+            if (norm_error) free(norm_error);
+            if (addr_buf_init) buffer_free(&addr_buf);
+            PQclear(res);
+            return 0;
+        }
+
+        if (!success) {
+            record_address_failure(failures, "locations", row_id, error_param);
+        }
+
+        allocation_list_clear(&pool);
+        normalized_address_clear(&norm);
+        if (norm_error) free(norm_error);
+        if (addr_buf_init) {
+            buffer_free(&addr_buf);
+        }
+    }
+    PQclear(res);
+    return 1;
+}
+
+static int sanitize_service_table(PGconn *conn, StringArray *failures) {
+    if (!conn) {
+        return 0;
+    }
+
+    const char *create_sql =
+        "CREATE TABLE IF NOT EXISTS esa_in_progress_add ("
+        " record_id INTEGER PRIMARY KEY,"
+        " raw_address TEXT,"
+        " normalized_primary TEXT,"
+        " normalized_formatted TEXT,"
+        " city TEXT,"
+        " state TEXT,"
+        " postal_code TEXT,"
+        " postal_code_suffix TEXT,"
+        " country TEXT,"
+        " latitude DOUBLE PRECISION,"
+        " longitude DOUBLE PRECISION,"
+        " plus_code TEXT,"
+        " place_id TEXT,"
+        " success BOOLEAN NOT NULL,"
+        " error_message TEXT"
+        ")";
+    if (!db_exec_simple(conn, create_sql, NULL)) {
+        return 0;
+    }
+    if (!db_exec_simple(conn, "TRUNCATE esa_in_progress_add", NULL)) {
+        return 0;
+    }
+
+    const char *select_sql =
+        "SELECT sd_record_id::text, sd_normalized_street, sd_normalized_city, sd_normalized_state, sd_normalized_zip_code "
+        "FROM esa_in_progress";
+    PGresult *res = PQexec(conn, select_sql);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (res) {
+            PQclear(res);
+        }
+        return 0;
+    }
+
+    const char *insert_sql =
+        "INSERT INTO esa_in_progress_add ("
+        " record_id, raw_address, normalized_primary, normalized_formatted, city, state, postal_code, postal_code_suffix, "
+        " country, latitude, longitude, plus_code, place_id, success, error_message"
+        ") VALUES ("
+        " $1::integer, $2, $3, $4, $5, $6, $7, $8, $9, $10::double precision, $11::double precision, $12, $13, $14::boolean, $15"
+        ") ON CONFLICT (record_id) DO UPDATE SET "
+        " raw_address = EXCLUDED.raw_address, "
+        " normalized_primary = EXCLUDED.normalized_primary, "
+        " normalized_formatted = EXCLUDED.normalized_formatted, "
+        " city = EXCLUDED.city, "
+        " state = EXCLUDED.state, "
+        " postal_code = EXCLUDED.postal_code, "
+        " postal_code_suffix = EXCLUDED.postal_code_suffix, "
+        " country = EXCLUDED.country, "
+        " latitude = EXCLUDED.latitude, "
+        " longitude = EXCLUDED.longitude, "
+        " plus_code = EXCLUDED.plus_code, "
+        " place_id = EXCLUDED.place_id, "
+        " success = EXCLUDED.success, "
+        " error_message = EXCLUDED.error_message";
+
+    int rows = PQntuples(res);
+    for (int i = 0; i < rows; ++i) {
+        const char *record_id = PQgetisnull(res, i, 0) ? NULL : PQgetvalue(res, i, 0);
+        const char *street = PQgetisnull(res, i, 1) ? NULL : PQgetvalue(res, i, 1);
+        const char *city = PQgetisnull(res, i, 2) ? NULL : PQgetvalue(res, i, 2);
+        const char *state = PQgetisnull(res, i, 3) ? NULL : PQgetvalue(res, i, 3);
+        const char *zip = PQgetisnull(res, i, 4) ? NULL : PQgetvalue(res, i, 4);
+
+        Buffer addr_buf;
+        int addr_buf_init = buffer_init(&addr_buf);
+        const char *raw_address = NULL;
+        if (addr_buf_init) {
+            if (street && street[0]) buffer_append_cstr(&addr_buf, street);
+            if (city && city[0]) {
+                if (addr_buf.length > 0) buffer_append_cstr(&addr_buf, ", ");
+                buffer_append_cstr(&addr_buf, city);
+            }
+            if (state && state[0]) {
+                if (addr_buf.length > 0) buffer_append_cstr(&addr_buf, ", ");
+                buffer_append_cstr(&addr_buf, state);
+            }
+            if (zip && zip[0]) {
+                if (addr_buf.length > 0) buffer_append_cstr(&addr_buf, " ");
+                buffer_append_cstr(&addr_buf, zip);
+            }
+            raw_address = addr_buf.data;
+        }
+
+        NormalizedAddress norm;
+        normalized_address_init(&norm);
+        char *norm_error = NULL;
+        int success = (raw_address && raw_address[0]) ? get_normalized_address_cached(raw_address, &norm, &norm_error) : 0;
+        if ((!raw_address || raw_address[0] == '\0') && !norm_error) {
+            norm_error = strdup("Address missing");
+        }
+
+        AllocationList pool;
+        allocation_list_init(&pool);
+        const char *lat_param = NULL;
+        const char *lon_param = NULL;
+        if (success && norm.has_geocode) {
+            if (!isnan(norm.latitude)) {
+                char *lat_buf = malloc(64);
+                if (!lat_buf) {
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    if (addr_buf_init) buffer_free(&addr_buf);
+                    PQclear(res);
+                    return 0;
+                }
+                snprintf(lat_buf, 64, "%.10f", norm.latitude);
+                if (!allocation_list_add(&pool, lat_buf)) {
+                    free(lat_buf);
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    if (addr_buf_init) buffer_free(&addr_buf);
+                    PQclear(res);
+                    return 0;
+                }
+                lat_param = lat_buf;
+            }
+            if (!isnan(norm.longitude)) {
+                char *lon_buf = malloc(64);
+                if (!lon_buf) {
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    if (addr_buf_init) buffer_free(&addr_buf);
+                    PQclear(res);
+                    return 0;
+                }
+                snprintf(lon_buf, 64, "%.10f", norm.longitude);
+                if (!allocation_list_add(&pool, lon_buf)) {
+                    free(lon_buf);
+                    allocation_list_clear(&pool);
+                    normalized_address_clear(&norm);
+                    if (norm_error) free(norm_error);
+                    if (addr_buf_init) buffer_free(&addr_buf);
+                    PQclear(res);
+                    return 0;
+                }
+                lon_param = lon_buf;
+            }
+        }
+
+        const char *success_param = bool_to_text(success);
+        const char *error_param = success ? NULL : norm_error;
+
+        const char *params[15] = {
+            record_id,
+            raw_address && raw_address[0] ? raw_address : NULL,
+            norm.primary_address_line,
+            norm.formatted_address,
+            norm.city,
+            norm.state,
+            norm.postal_code,
+            norm.postal_code_suffix,
+            norm.country,
+            lat_param,
+            lon_param,
+            norm.plus_code,
+            norm.place_id,
+            success_param,
+            error_param
+        };
+        int lengths[15] = {0};
+        int formats[15] = {0};
+
+        PGresult *ins_res = PQexecParams(conn, insert_sql, 15, NULL, params, lengths, formats, 0);
+        int insert_ok = ins_res && PQresultStatus(ins_res) == PGRES_COMMAND_OK;
+        if (ins_res) {
+            PQclear(ins_res);
+        }
+        if (!insert_ok) {
+            allocation_list_clear(&pool);
+            normalized_address_clear(&norm);
+            if (norm_error) free(norm_error);
+            if (addr_buf_init) buffer_free(&addr_buf);
+            PQclear(res);
+            return 0;
+        }
+
+        if (!success) {
+            record_address_failure(failures, "esa_in_progress", record_id, error_param);
+        }
+
+        allocation_list_clear(&pool);
+        normalized_address_clear(&norm);
+        if (norm_error) free(norm_error);
+        if (addr_buf_init) {
+            buffer_free(&addr_buf);
+        }
+    }
+    PQclear(res);
+    return 1;
+}
+
+static void log_address_failures(const StringArray *failures) {
+    if (!failures || failures->count == 0) {
+        log_info("Address sanitization completed without failures");
+        return;
+    }
+    log_error("Address sanitization failures (%zu)", failures->count);
+    for (size_t i = 0; i < failures->count; ++i) {
+        log_error("  %s", failures->values[i]);
+    }
+}
+
+static int run_address_sanitization(PGconn *conn) {
+    if (!conn) {
+        return 0;
+    }
+    StringArray failures;
+    string_array_init(&failures);
+
+    int ok = sanitize_audits_table(conn, &failures) &&
+             sanitize_locations_table(conn, &failures) &&
+             sanitize_service_table(conn, &failures);
+
+    log_address_failures(&failures);
+    string_array_clear(&failures);
+    return ok;
+}
+
 static int append_audits_for_visits(PGconn *conn, const char *address, const StringArray *visit_ids, StringArray *out, char **error_out) {
     if (!visit_ids || visit_ids->count == 0) {
         return 1;
@@ -4684,12 +5666,95 @@ static int audit_visit_lookup_location(PGconn *conn, AuditVisit *visit, char **e
         return 1;
     }
 
+    char *original_address = visit->building_address ? strdup(visit->building_address) : NULL;
+    if (visit->building_address && !original_address) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory copying address");
+        }
+        return 0;
+    }
+
+    NormalizedAddress normalized;
+    normalized_address_init(&normalized);
+    char *norm_error = NULL;
+    char *norm_primary_candidate = NULL;
+    char *norm_formatted_candidate = NULL;
+
+    if (get_normalized_address_cached(visit->building_address, &normalized, &norm_error)) {
+        if (!apply_normalized_address_to_visit(visit, &normalized)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory applying normalized address");
+            }
+            normalized_address_clear(&normalized);
+            free(norm_error);
+            free(original_address);
+            return 0;
+        }
+        if (normalized.primary_address_line) {
+            norm_primary_candidate = normalize_address_candidate(normalized.primary_address_line);
+        }
+        if (normalized.formatted_address) {
+            norm_formatted_candidate = normalize_address_candidate(normalized.formatted_address);
+        }
+    } else if (norm_error) {
+        log_error("Address validation failed for '%s': %s", visit->building_address ? visit->building_address : "(null)", norm_error);
+    }
+    normalized_address_clear(&normalized);
+    free(norm_error);
+
     StringArray candidates;
     if (!build_location_candidates(visit->building_address, &candidates)) {
+        free(original_address);
+        free(norm_primary_candidate);
+        free(norm_formatted_candidate);
         if (error_out && !*error_out) {
             *error_out = strdup("Failed to build location candidates");
         }
         return 0;
+    }
+
+    if (norm_primary_candidate) {
+        if (!append_unique_candidate(&candidates, norm_primary_candidate)) {
+            free(norm_primary_candidate);
+            free(norm_formatted_candidate);
+            free(original_address);
+            string_array_clear(&candidates);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory capturing normalized address");
+            }
+            return 0;
+        }
+        free(norm_primary_candidate);
+    }
+
+    if (norm_formatted_candidate) {
+        if (!append_unique_candidate(&candidates, norm_formatted_candidate)) {
+            free(norm_formatted_candidate);
+            free(original_address);
+            string_array_clear(&candidates);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory capturing normalized address");
+            }
+            return 0;
+        }
+        free(norm_formatted_candidate);
+    }
+
+    if (original_address) {
+        char *orig_candidate = normalize_address_candidate(original_address);
+        if (orig_candidate) {
+            if (!append_unique_candidate(&candidates, orig_candidate)) {
+                free(orig_candidate);
+                free(original_address);
+                string_array_clear(&candidates);
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory capturing address candidate");
+                }
+                return 0;
+            }
+            free(orig_candidate);
+        }
+        free(original_address);
     }
 
     static const char *SQL_EXACT =
@@ -6220,6 +7285,88 @@ static int populate_audit_record(const CsvFile *csv, const CsvRow *row, const Js
     if (!assign_string(&record->elevator_contractor, csv_row_get(csv, row, "Elevator Contractor"))) goto oom;
     if (!assign_string(&record->city_id, csv_row_get(csv, row, "City ID"))) goto oom;
     if (!assign_string(&record->building_id, csv_row_get(csv, row, "Building ID"))) goto oom;
+
+    if (record->building_address && record->building_address[0]) {
+        NormalizedAddress norm;
+        normalized_address_init(&norm);
+        char *norm_error = NULL;
+        if (get_normalized_address_cached(record->building_address, &norm, &norm_error)) {
+            if (norm.primary_address_line) {
+                if (!assign_string(&record->building_address, norm.primary_address_line)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+            }
+            if (norm.formatted_address) {
+                if (!assign_string(&record->building_formatted_address, norm.formatted_address)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+            }
+            if (norm.city) {
+                if (!assign_string(&record->building_city, norm.city)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+                if (!assign_string(&record->city_id, norm.city)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+            }
+            if (norm.state) {
+                if (!assign_string(&record->building_state, norm.state)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+            }
+            if (norm.postal_code) {
+                if (!assign_string(&record->building_postal_code, norm.postal_code)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+            }
+            if (norm.postal_code_suffix) {
+                if (!assign_string(&record->building_postal_code_suffix, norm.postal_code_suffix)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+            }
+            if (norm.country) {
+                if (!assign_string(&record->building_country, norm.country)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+            }
+            if (norm.plus_code) {
+                if (!assign_string(&record->building_plus_code, norm.plus_code)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+            }
+            if (norm.place_id) {
+                if (!assign_string(&record->building_place_id, norm.place_id)) {
+                    normalized_address_clear(&norm);
+                    goto oom;
+                }
+            }
+            if (norm.has_geocode) {
+                record->building_latitude.has_value = true;
+                record->building_latitude.value = norm.latitude;
+                record->building_longitude.has_value = true;
+                record->building_longitude.value = norm.longitude;
+            } else {
+                optional_double_clear(&record->building_latitude);
+                optional_double_clear(&record->building_longitude);
+            }
+        } else {
+            if (norm_error) {
+                log_error("Address validation failed for '%s': %s", record->building_address, norm_error);
+                free(norm_error);
+            }
+        }
+        normalized_address_clear(&norm);
+    }
+
     if (!assign_string(&record->device_type, csv_row_get(csv, row, "Device Type"))) goto oom;
 
     record->is_first_car = parse_optional_bool(csv_row_get(csv, row, "Is This the First or Only Car in the Bank?"));
@@ -6514,6 +7661,39 @@ static int db_update_audit_visit_bounds(PGconn *conn, const char *visit_uuid, ch
     return 1;
 }
 
+static int db_update_audit_visit_address(PGconn *conn, const AuditVisit *visit, char **error_out) {
+    if (!conn || !visit) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid visit parameters");
+        }
+        return 0;
+    }
+    const char *sql =
+        "UPDATE audit_visits SET building_address = $2, street = $3, city = $4, state = $5, zip_code = $6, updated_at = NOW() "
+        "WHERE visit_id = $1::uuid";
+
+    const char *params[6] = {
+        visit->visit_uuid,
+        visit->building_address,
+        visit->street,
+        visit->city,
+        visit->state,
+        visit->zip_code
+    };
+
+    PGresult *res = PQexecParams(conn, sql, 6, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to update audit visit address");
+        }
+        PQclear(res);
+        return 0;
+    }
+    PQclear(res);
+    return 1;
+}
+
 static int db_exec_simple(PGconn *conn, const char *sql, char **error_out) {
     PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
@@ -6541,7 +7721,7 @@ static void db_rollback(PGconn *conn) {
     PQclear(res);
 }
 
-#define AUDIT_PARAM_COUNT 100
+#define AUDIT_PARAM_COUNT 110
 
 static int db_insert_audit(PGconn *conn, const AuditRecord *record, char **error_out) {
     const char *delete_sql = "DELETE FROM audits WHERE audit_uuid = $1";
@@ -6572,9 +7752,11 @@ static int db_insert_audit(PGconn *conn, const AuditRecord *record, char **error
         "car_door_operator_model, restrictor_type, has_hoistway_access_keyswitches, hallway_pi_type, hatch_door_unlocking_type, "
         "hatch_door_equipment_manufacturer, hatch_door_lock_manufacturer, pit_access, safety_type, buffer_type, sump_pump_present, "
         "compensation_type, jack_piston_type, scavenger_pump_present, general_notes, door_opening_width, rating_overall, expected_stop_count, "
-        "mobile_device, mobile_app_name, mobile_app_version, mobile_app_type, mobile_sdk_release, mobile_memory_mb, location_id, visit_id)"
+        "mobile_device, mobile_app_name, mobile_app_version, mobile_app_type, mobile_sdk_release, mobile_memory_mb, location_id, visit_id, "
+        "building_city, building_state, building_postal_code, building_postal_code_suffix, building_country, building_formatted_address, "
+        "building_latitude, building_longitude, building_plus_code, building_place_id)"
         " VALUES ("
-        "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$60,$61,$62,$63,$64,$65,$66,$67,$68,$69,$70,$71,$72,$73,$74,$75,$76,$77,$78,$79,$80,$81,$82,$83,$84,$85,$86,$87,$88,$89,$90,$91,$92,$93,$94,$95,$96,$97,$98,$99,$100)";
+        "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$60,$61,$62,$63,$64,$65,$66,$67,$68,$69,$70,$71,$72,$73,$74,$75,$76,$77,$78,$79,$80,$81,$82,$83,$84,$85,$86,$87,$88,$89,$90,$91,$92,$93,$94,$95,$96,$97,$98,$99,$100,$101,$102,$103,$104,$105,$106,$107,$108,$109,$110)";
 
     const char *values[AUDIT_PARAM_COUNT];
     int lengths[AUDIT_PARAM_COUNT];
@@ -6764,6 +7946,23 @@ static int db_insert_audit(PGconn *conn, const AuditRecord *record, char **error
     values[idx++] = location_id_param;
 
     values[idx++] = record->visit_id;
+    values[idx++] = record->building_city;
+    values[idx++] = record->building_state;
+    values[idx++] = record->building_postal_code;
+    values[idx++] = record->building_postal_code_suffix;
+    values[idx++] = record->building_country;
+    values[idx++] = record->building_formatted_address;
+
+    const char *building_lat_param = optional_double_param(&record->building_latitude, &pool);
+    if (record->building_latitude.has_value && !building_lat_param) goto oom_params;
+    values[idx++] = building_lat_param;
+
+    const char *building_lon_param = optional_double_param(&record->building_longitude, &pool);
+    if (record->building_longitude.has_value && !building_lon_param) goto oom_params;
+    values[idx++] = building_lon_param;
+
+    values[idx++] = record->building_plus_code;
+    values[idx++] = record->building_place_id;
 
     if (idx != AUDIT_PARAM_COUNT) {
         if (error_out) *error_out = strdup("Internal error: audit parameter count mismatch");
@@ -10778,13 +11977,19 @@ send_http_json(client_fd, 400, "Bad Request", body);
 }
 
 int main(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
+    bool sanitize_mode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--sanitize-addresses") == 0) {
+            sanitize_mode = true;
+        }
+    }
 
     signal(SIGPIPE, SIG_IGN);
 
     int exit_code = 1;
     PGconn *conn = NULL;
+
+    address_cache_init(&g_address_cache);
 
     const char *env_file = getenv("ENV_FILE");
     if (!env_file || env_file[0] == '\0') {
@@ -10911,6 +12116,25 @@ int main(int argc, char **argv) {
     }
     g_xai_api_key = xai_key_trimmed;
 
+    char *google_key_trimmed = trim_copy(getenv("GOOGLE_API_KEY"));
+    if (!google_key_trimmed || google_key_trimmed[0] == '\0') {
+        log_error("GOOGLE_API_KEY must be set");
+        free(google_key_trimmed);
+        goto cleanup;
+    }
+    g_google_api_key = google_key_trimmed;
+
+    char *google_region_trimmed = trim_copy(getenv("GOOGLE_REGION_CODE"));
+    if (!google_region_trimmed || google_region_trimmed[0] == '\0') {
+        free(google_region_trimmed);
+        google_region_trimmed = strdup("US");
+    }
+    if (!google_region_trimmed) {
+        log_error("Failed to allocate GOOGLE_REGION_CODE");
+        goto cleanup;
+    }
+    g_google_region_code = google_region_trimmed;
+
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
         log_error("Failed to initialize HTTP client");
         goto cleanup;
@@ -10923,6 +12147,13 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     log_info("Connected to Postgres");
+
+    if (sanitize_mode) {
+        log_info("Running address sanitization mode");
+        int sanitize_ok = run_address_sanitization(conn);
+        exit_code = sanitize_ok ? 0 : 1;
+        goto cleanup;
+    }
 
     if (pthread_create(&g_report_thread, NULL, report_worker_main, NULL) != 0) {
         log_error("Failed to start report worker thread");
@@ -10966,11 +12197,16 @@ cleanup:
     g_report_assets_dir = NULL;
     free(g_xai_api_key);
     g_xai_api_key = NULL;
+    free(g_google_api_key);
+    g_google_api_key = NULL;
+    free(g_google_region_code);
+    g_google_region_code = NULL;
     if (g_curl_initialized) {
         curl_global_cleanup();
         g_curl_initialized = false;
     }
     free(g_database_dsn);
     g_database_dsn = NULL;
+    address_cache_clear(&g_address_cache);
     return exit_code;
 }
