@@ -3314,16 +3314,22 @@ static int load_report_for_building(PGconn *conn, const char *building_address, 
     }
 
     int rows = PQntuples(res);
-    if (rows == 0) {
-        if (error_out && !*error_out) {
-            const char *not_found = has_location ? "No audits found for location" : "No audits found for building address";
-            *error_out = strdup(has_filter ? "No audits found for selected criteria" : not_found);
-        }
-        PQclear(res);
-        return 0;
-    }
     report_data_clear(report);
     report_data_init(report);
+    if (rows == 0) {
+        if (building_address && building_address[0]) {
+            if (!assign_string(&report->summary.building_address, building_address)) {
+                PQclear(res);
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory preparing location summary");
+                }
+                return 0;
+            }
+        }
+        report->summary.audit_count = 0;
+        PQclear(res);
+        return 1;
+    }
     report->summary.audit_count = rows;
 
     for (int row = 0; row < rows; ++row) {
