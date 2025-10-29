@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     texlive-latex-recommended \
     texlive-fonts-recommended \
     texlive-latex-extra \
+    lmodern \
     ghostscript \
     unzip \
     zip \
