@@ -440,6 +440,18 @@ static char *sanitize_path_component(const char *input);
 static int copy_file_contents(const char *src_path, const char *dst_path);
 static int create_report_archive(PGconn *conn, const ReportJob *job, const ReportData *report,
                                  const char *job_dir, const char *pdf_path, char **zip_path_out, char **error_out);
+typedef struct {
+    const char *system_prompt;
+    char *prompt;
+    char **slot;
+    char *error;
+    int success;
+    pthread_t thread;
+    bool thread_started;
+} NarrativeTask;
+
+static void narrative_task_execute(NarrativeTask *task);
+static void *narrative_thread_main(void *arg);
 static bool read_request_body(int client_fd,
                               const char *header_lines,
                               char *body_start,
@@ -4612,6 +4624,13 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
     NarrativeSet narratives;
     narrative_set_init(&narratives);
 
+    const size_t SECTION_COUNT = 6;
+    NarrativeTask tasks[6];
+    memset(tasks, 0, sizeof(tasks));
+    size_t section_count = SECTION_COUNT;
+    size_t tasks_created = 0;
+    char *narrative_build_error = NULL;
+
     char *load_error = NULL;
     if (!load_report_for_building(conn, job->address, &report, &load_error)) {
         if (error_out && !*error_out) {
@@ -4641,6 +4660,36 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
         goto cleanup;
     }
 
+    if (g_report_assets_dir && g_report_assets_dir[0]) {
+        const char *asset_files[] = {"citywide.png", "square.png"};
+        for (size_t i = 0; i < sizeof(asset_files) / sizeof(asset_files[0]); ++i) {
+            char *src_path = join_path(g_report_assets_dir, asset_files[i]);
+            char *dst_path = join_path(job_dir, asset_files[i]);
+            if (!src_path || !dst_path) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory preparing report assets");
+                }
+                free(src_path);
+                free(dst_path);
+                goto cleanup;
+            }
+            if (copy_file_contents(src_path, dst_path) != 0) {
+                if (error_out && !*error_out) {
+                    char *msg = malloc(160);
+                    if (msg) {
+                        snprintf(msg, 160, "Failed to copy asset %s: %s", asset_files[i], strerror(errno));
+                        *error_out = msg;
+                    }
+                }
+                free(src_path);
+                free(dst_path);
+                goto cleanup;
+            }
+            free(src_path);
+            free(dst_path);
+        }
+    }
+
     tex_path = join_path(job_dir, "audit_report.tex");
     pdf_path = join_path(job_dir, "audit_report.pdf");
     if (!tex_path || !pdf_path) {
@@ -4664,60 +4713,119 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
         const char *title;
         char **slot;
         const char *instructions;
-        int include_notes;
-        int include_recommendations;
+        bool include_notes;
+        bool include_recommendations;
     } sections[] = {
         {"Executive Summary", &narratives.executive_summary,
-         "Write an executive summary highlighting equipment condition, total device count, total deficiencies, and the most critical safety issues.\nProvide actionable context appropriate for ownership decisions.", 1, 0},
+         "Write an executive summary highlighting equipment condition, total device count, total deficiencies, and the most critical safety issues.\nProvide actionable context appropriate for ownership decisions.", true, false},
         {"Key Findings", &narratives.key_findings,
-         "List the top findings from the audit with concise explanations. Focus on safety, compliance, and maintenance trends across devices.", 1, 0},
+         "List the top findings from the audit with concise explanations. Focus on safety, compliance, and maintenance trends across devices.", true, false},
         {"Methodology", &narratives.methodology,
-         "Describe the inspection methodology, standards referenced, and scope of the audit. Mention any limitations or assumptions.", 0, 0},
+         "Describe the inspection methodology, standards referenced, and scope of the audit. Mention any limitations or assumptions.", false, false},
         {"Maintenance Performance", &narratives.maintenance_performance,
-         "Analyze maintenance performance and recurring issues observed in the audit. Discuss patterns tied to equipment age, usage, or contractor performance.", 1, 0},
+         "Analyze maintenance performance and recurring issues observed in the audit. Discuss patterns tied to equipment age, usage, or contractor performance.", true, false},
         {"Recommendations", &narratives.recommendations,
-         "Provide prioritized recommendations for remediation, including immediate safety concerns, short-term actions, and long-term planning guidance.", 1, 1},
+         "Provide prioritized recommendations for remediation, including immediate safety concerns, short-term actions, and long-term planning guidance.", true, true},
         {"Conclusion", &narratives.conclusion,
-         "Deliver a closing narrative summarizing risk outlook, benefits of addressing recommendations, and next steps for maintaining compliance.", 0, 0}
+         "Deliver a closing narrative summarizing risk outlook, benefits of addressing recommendations, and next steps for maintaining compliance.", false, false}
     };
 
-    for (size_t i = 0; i < sizeof(sections) / sizeof(sections[0]); ++i) {
+    section_count = sizeof(sections) / sizeof(sections[0]);
+
+    for (size_t i = 0; i < section_count; ++i) {
         Buffer prompt;
         if (!buffer_init(&prompt)) {
-            if (error_out && !*error_out) {
-                *error_out = strdup("Out of memory");
+            if (!narrative_build_error) {
+                narrative_build_error = strdup("Out of memory");
             }
-            goto cleanup;
+            goto narrative_join;
         }
 
         if (!buffer_appendf(&prompt, "%s\n\nAudit Data:\n%s", sections[i].instructions, report_json)) {
             buffer_free(&prompt);
-            if (error_out && !*error_out) {
-                *error_out = strdup("Out of memory");
+            if (!narrative_build_error) {
+                narrative_build_error = strdup("Out of memory");
             }
-            goto cleanup;
+            goto narrative_join;
         }
 
         if (sections[i].include_notes && job->notes && job->notes[0]) {
-            buffer_appendf(&prompt, "\n\nInspector Notes:\n%s", job->notes);
+            if (!buffer_appendf(&prompt, "\n\nInspector Notes:\n%s", job->notes)) {
+                buffer_free(&prompt);
+                if (!narrative_build_error) {
+                    narrative_build_error = strdup("Out of memory");
+                }
+                goto narrative_join;
+            }
         }
         if (sections[i].include_recommendations && job->recommendations && job->recommendations[0]) {
-            buffer_appendf(&prompt, "\n\nClient Guidance:\n%s", job->recommendations);
+            if (!buffer_appendf(&prompt, "\n\nClient Guidance:\n%s", job->recommendations)) {
+                buffer_free(&prompt);
+                if (!narrative_build_error) {
+                    narrative_build_error = strdup("Out of memory");
+                }
+                goto narrative_join;
+            }
         }
 
-        char *section_text = NULL;
-        char *section_error = NULL;
-        if (!generate_grok_completion(system_prompt, prompt.data, &section_text, &section_error)) {
-            if (error_out && !*error_out) {
-                *error_out = section_error ? section_error : strdup("Narrative generation failed");
-            } else {
-                free(section_error);
+        char *prompt_str = prompt.data;
+        prompt.data = NULL;
+        buffer_free(&prompt);
+        if (!prompt_str) {
+            if (!narrative_build_error) {
+                narrative_build_error = strdup("Out of memory");
             }
-            buffer_free(&prompt);
+            goto narrative_join;
+        }
+
+        tasks[i].system_prompt = system_prompt;
+        tasks[i].prompt = prompt_str;
+        tasks[i].slot = sections[i].slot;
+        tasks[i].error = NULL;
+        tasks[i].success = 0;
+        tasks[i].thread_started = false;
+
+        if (pthread_create(&tasks[i].thread, NULL, narrative_thread_main, &tasks[i]) == 0) {
+            tasks[i].thread_started = true;
+        } else {
+            narrative_task_execute(&tasks[i]);
+        }
+        tasks_created = i + 1;
+    }
+
+narrative_join:
+    for (size_t i = 0; i < tasks_created; ++i) {
+        if (tasks[i].thread_started) {
+            pthread_join(tasks[i].thread, NULL);
+            tasks[i].thread_started = false;
+        }
+    }
+
+    if (narrative_build_error) {
+        if (error_out && !*error_out) {
+            *error_out = narrative_build_error;
+        } else {
+            free(narrative_build_error);
+        }
+        narrative_build_error = NULL;
+        goto cleanup;
+    }
+
+    for (size_t i = 0; i < tasks_created; ++i) {
+        if (!tasks[i].success) {
+            if (error_out && !*error_out) {
+                if (tasks[i].error) {
+                    *error_out = tasks[i].error;
+                    tasks[i].error = NULL;
+                } else {
+                    *error_out = strdup("Narrative generation failed");
+                }
+            } else {
+                free(tasks[i].error);
+                tasks[i].error = NULL;
+            }
             goto cleanup;
         }
-        buffer_free(&prompt);
-        *(sections[i].slot) = section_text;
     }
 
     char *latex_error = NULL;
@@ -4763,6 +4871,12 @@ cleanup:
     if (!success && output_path_out && *output_path_out) {
         free(*output_path_out);
         *output_path_out = NULL;
+    }
+    for (size_t i = 0; i < section_count; ++i) {
+        free(tasks[i].prompt);
+        tasks[i].prompt = NULL;
+        free(tasks[i].error);
+        tasks[i].error = NULL;
     }
     free(zip_path);
     free(report_json);
@@ -4927,30 +5041,631 @@ static int run_pdflatex(const char *working_dir, const char *tex_filename, char 
     return 1;
 }
 
+static char *make_pgf_identifier(const char *label) {
+    const char *src = label ? label : "item";
+    char *clean = sanitize_ascii(src);
+    const char *text = clean ? clean : src;
+    size_t len = strlen(text);
+    char *out = malloc(len + 1);
+    if (!out) {
+        free(clean);
+        return NULL;
+    }
+    size_t pos = 0;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        if (isalnum(c)) {
+            out[pos++] = (char)tolower(c);
+        } else if (c == ' ' || c == '-' || c == '/' || c == '_' || c == '+') {
+            out[pos++] = '_';
+        }
+    }
+    if (pos == 0) {
+        out[pos++] = 'i';
+        out[pos++] = 't';
+        out[pos++] = 'e';
+        out[pos++] = 'm';
+    }
+    out[pos] = '\0';
+    free(clean);
+    return out;
+}
+
+static int append_deficiency_code_chart(Buffer *buf, const ReportData *report) {
+    if (!report || !buf) {
+        return 0;
+    }
+    if (report->summary.deficiencies_by_code.count == 0) {
+        return buffer_append_cstr(buf, "\\paragraph{Deficiencies by Condition Code}\\textit{No deficiencies recorded.}\\\n\n");
+    }
+
+    Buffer tokens, labels, coords;
+    if (!buffer_init(&tokens) || !buffer_init(&labels) || !buffer_init(&coords)) {
+        buffer_free(&tokens);
+        buffer_free(&labels);
+        buffer_free(&coords);
+        return 0;
+    }
+
+    for (size_t i = 0; i < report->summary.deficiencies_by_code.count; ++i) {
+        KeyCountEntry *entry = &report->summary.deficiencies_by_code.items[i];
+        char *identifier = make_pgf_identifier(entry->key);
+        char *label_tex = latex_escape(entry->key ? entry->key : "Unknown");
+        if (!identifier || !label_tex) {
+            free(identifier);
+            free(label_tex);
+            buffer_free(&tokens);
+            buffer_free(&labels);
+            buffer_free(&coords);
+            return 0;
+        }
+        if (i > 0) {
+            buffer_append_cstr(&tokens, ",");
+            buffer_append_cstr(&labels, ",");
+            buffer_append_cstr(&coords, " ");
+        }
+        buffer_appendf(&tokens, "%s", identifier);
+        buffer_appendf(&labels, "%s", label_tex);
+        buffer_appendf(&coords, "(%s,%d)", identifier, entry->count);
+        free(identifier);
+        free(label_tex);
+    }
+
+    int ok = 1;
+    ok = ok && buffer_append_cstr(buf,
+        "\\paragraph{Deficiencies by Condition Code}\n"
+        "\\begin{figure}[H]\n"
+        "\\centering\n"
+        "\\begin{tikzpicture}\n"
+        "\\begin{axis}[\n"
+        "ybar,\n"
+        "bar width=14pt,\n"
+        "width=\\textwidth,\n"
+        "height=7cm,\n"
+        "xlabel={Condition Code},\n"
+        "ylabel={Deficiencies},\n"
+        "symbolic x coords={");
+    ok = ok && buffer_appendf(buf, "%s", tokens.data ? tokens.data : "");
+    ok = ok && buffer_append_cstr(buf, "},\n");
+    ok = ok && buffer_append_cstr(buf, "xtick=data,\n");
+    ok = ok && buffer_append_cstr(buf, "xticklabels={");
+    ok = ok && buffer_appendf(buf, "%s", labels.data ? labels.data : "");
+    ok = ok && buffer_append_cstr(buf,
+        "},\n"
+        "xticklabel style={rotate=45, anchor=east},\n"
+        "ymin=0,\n"
+        "ymajorgrids,\n"
+        "nodes near coords,\n"
+        "nodes near coords align={vertical}\n"
+        "]\n");
+    ok = ok && buffer_append_cstr(buf, "\\addplot coordinates {");
+    ok = ok && buffer_appendf(buf, "%s", coords.data ? coords.data : "");
+    ok = ok && buffer_append_cstr(buf, "};\n\\end{axis}\n\\end{tikzpicture}\n\\caption{Deficiencies by Condition Code}\n\\end{figure}\n\n");
+
+    buffer_free(&tokens);
+    buffer_free(&labels);
+    buffer_free(&coords);
+    return ok;
+}
+
+static int append_deficiencies_per_device_chart(Buffer *buf, const ReportData *report) {
+    if (!buf || !report) {
+        return 0;
+    }
+
+    if (report->devices.count == 0) {
+        return buffer_append_cstr(buf, "\\paragraph{Deficiencies per Device}\\textit{No devices available.}\\\n\n");
+    }
+
+    Buffer tokens, labels, coords;
+    if (!buffer_init(&tokens) || !buffer_init(&labels) || !buffer_init(&coords)) {
+        buffer_free(&tokens);
+        buffer_free(&labels);
+        buffer_free(&coords);
+        return 0;
+    }
+
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        ReportDevice *device = &report->devices.items[i];
+        const char *id_src = device->device_id ? device->device_id :
+                             (device->submission_id ? device->submission_id : device->audit_uuid);
+        char *identifier = make_pgf_identifier(id_src);
+        char *label_tex = latex_escape(id_src ? id_src : "Device");
+        if (!identifier || !label_tex) {
+            free(identifier);
+            free(label_tex);
+            buffer_free(&tokens);
+            buffer_free(&labels);
+            buffer_free(&coords);
+            return 0;
+        }
+        if (i > 0) {
+            buffer_append_cstr(&tokens, ",");
+            buffer_append_cstr(&labels, ",");
+            buffer_append_cstr(&coords, " ");
+        }
+        buffer_appendf(&tokens, "%s", identifier);
+        buffer_appendf(&labels, "%s", label_tex);
+        buffer_appendf(&coords, "(%s,%zu)", identifier, device->deficiencies.count);
+        free(identifier);
+        free(label_tex);
+    }
+
+    int ok = 1;
+    ok = ok && buffer_append_cstr(buf,
+        "\\paragraph{Deficiencies per Device}\n"
+        "\\begin{figure}[H]\n\\centering\n\\begin{tikzpicture}\n\\begin{axis}[\n"
+        "ybar,\n"
+        "bar width=14pt,\n"
+        "width=\\textwidth,\n"
+        "height=7cm,\n"
+        "xlabel={Device},\n"
+        "ylabel={Deficiencies},\n"
+        "symbolic x coords={");
+    ok = ok && buffer_appendf(buf, "%s", tokens.data ? tokens.data : "");
+    ok = ok && buffer_append_cstr(buf, "},\n");
+    ok = ok && buffer_append_cstr(buf, "xtick=data,\n");
+    ok = ok && buffer_append_cstr(buf, "xticklabels={");
+    ok = ok && buffer_appendf(buf, "%s", labels.data ? labels.data : "");
+    ok = ok && buffer_append_cstr(buf,
+        "},\n"
+        "xticklabel style={rotate=45, anchor=east},\n"
+        "ymin=0,\n"
+        "ymajorgrids,\n"
+        "nodes near coords,\n"
+        "nodes near coords align={vertical}\n"
+        "]\n");
+    ok = ok && buffer_append_cstr(buf, "\\addplot coordinates {");
+    ok = ok && buffer_appendf(buf, "%s", coords.data ? coords.data : "");
+    ok = ok && buffer_append_cstr(buf, "};\n\\end{axis}\n\\end{tikzpicture}\n\\caption{Deficiencies per Device}\n\\end{figure}\n\n");
+
+    buffer_free(&tokens);
+    buffer_free(&labels);
+    buffer_free(&coords);
+    return ok;
+}
+
+static int append_controller_age_chart(Buffer *buf, const ReportData *report) {
+    if (!buf || !report) {
+        return 0;
+    }
+    Buffer coords;
+    if (!buffer_init(&coords)) {
+        return 0;
+    }
+    size_t point_count = 0;
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        ReportDevice *device = &report->devices.items[i];
+        if (device->metrics.controller_age.has_value) {
+            if (point_count > 0) {
+                buffer_append_cstr(&coords, " ");
+            }
+            buffer_appendf(&coords, "(%d,%zu)", device->metrics.controller_age.value, device->deficiencies.count);
+            point_count++;
+        }
+    }
+    if (point_count == 0) {
+        buffer_free(&coords);
+        return buffer_append_cstr(buf, "\\paragraph{Controller Age vs Deficiencies}\\textit{Controller age data unavailable.}\\\n\n");
+    }
+
+    int ok = 1;
+    ok = ok && buffer_append_cstr(buf, "\\paragraph{Controller Age vs Deficiencies}\n");
+    ok = ok && buffer_append_cstr(buf,
+        "\\begin{figure}[H]\n\\centering\n\\begin{tikzpicture}\n\\begin{axis}[\n"
+        "width=\\textwidth,\n"
+        "height=7cm,\n"
+        "xlabel={Controller Age (Years)},\n"
+        "ylabel={Documented Deficiencies},\n"
+        "xmin=0,\n"
+        "ymin=0,\n"
+        "xmajorgrids,\n"
+        "ymajorgrids\n]\\addplot[only marks, mark=*, mark size=2pt, color=tabblue] coordinates {");
+    ok = ok && buffer_appendf(buf, "%s", coords.data ? coords.data : "");
+    ok = ok && buffer_append_cstr(buf, "};\n\\end{axis}\n\\end{tikzpicture}\n\\caption{Controller Age vs Number of Deficiencies}\n\\end{figure}\n\n");
+
+    buffer_free(&coords);
+    return ok;
+}
+
+static int append_device_sections(Buffer *buf, const ReportData *report) {
+    if (!buf || !report) {
+        return 0;
+    }
+
+    if (!buffer_append_cstr(buf, "\\subsection{Per-Device Equipment Condition}\n\n")) {
+        return 0;
+    }
+
+    const char *current_type = NULL;
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        ReportDevice *device = &report->devices.items[i];
+        const char *device_type = device->device_type ? device->device_type : "Device";
+        char *device_type_clean = sanitize_ascii(device_type);
+        const char *device_type_text = device_type_clean ? device_type_clean : device_type;
+        char *device_type_tex = latex_escape(device_type_text);
+        free(device_type_clean);
+
+        const char *id_src = device->device_id ? device->device_id :
+                            (device->submission_id ? device->submission_id : device->audit_uuid);
+        char *device_id_clean = sanitize_ascii(id_src);
+        const char *device_id_text = device_id_clean ? device_id_clean : (id_src ? id_src : "Device");
+        char *device_id_tex = latex_escape(device_id_text);
+        free(device_id_clean);
+
+        if (!device_type_tex || !device_id_tex) {
+            free(device_type_tex);
+            free(device_id_tex);
+            return 0;
+        }
+
+        if (!current_type || strcmp(current_type, device_type) != 0) {
+            if (!buffer_appendf(buf, "\\paragraph{%ss}\n\n", device_type_tex)) {
+                free(device_type_tex);
+                free(device_id_tex);
+                return 0;
+            }
+            current_type = device_type;
+        }
+
+        if (!buffer_appendf(buf, "\\subsubsection{%s %s}\n\n", device_type_tex, device_id_tex)) {
+            free(device_type_tex);
+            free(device_id_tex);
+            return 0;
+        }
+
+        free(device_type_tex);
+        free(device_id_tex);
+
+        if (!buffer_append_cstr(buf, "\\begin{tabularx}{\\textwidth}{@{}lX@{}}\\toprule\n")) {
+            return 0;
+        }
+
+        const struct {
+            const char *label;
+            const char *value;
+        } info_rows[] = {
+            {"Bank", device->bank_name},
+            {"City ID", device->city_id},
+            {"Controller Manufacturer", device->controller_manufacturer},
+            {"Controller Model", device->controller_model},
+            {"Machine Manufacturer", device->machine_manufacturer},
+            {"Machine Type", device->machine_type},
+            {"Roping", device->roping},
+            {"Door Operation", device->door_operation}
+        };
+
+        for (size_t j = 0; j < sizeof(info_rows) / sizeof(info_rows[0]); ++j) {
+            if (!info_rows[j].value || info_rows[j].value[0] == '\0') {
+                continue;
+            }
+            char *label_clean = sanitize_ascii(info_rows[j].label);
+            char *value_clean = sanitize_ascii(info_rows[j].value);
+            const char *label_text = label_clean ? label_clean : info_rows[j].label;
+            const char *value_text = value_clean ? value_clean : info_rows[j].value;
+            char *label_tex = latex_escape(label_text);
+            char *value_tex = latex_escape(value_text);
+            free(label_clean);
+            free(value_clean);
+            if (!label_tex || !value_tex) {
+                free(label_tex);
+                free(value_tex);
+                return 0;
+            }
+            if (!buffer_appendf(buf, "%s & %s \\\\ \n", label_tex, value_tex)) {
+                free(label_tex);
+                free(value_tex);
+                return 0;
+            }
+            free(label_tex);
+            free(value_tex);
+        }
+
+        struct {
+            const char *label;
+            const OptionalInt *value;
+        } numeric_rows[] = {
+            {"Capacity", &device->metrics.capacity},
+            {"Car Speed", &device->metrics.car_speed},
+            {"Controller Installation Year", &device->metrics.controller_install_year},
+            {"Number of Stops", &device->metrics.number_of_stops},
+            {"Code Data Year", &device->metrics.code_data_year}
+        };
+
+        char numeric[32];
+        for (size_t j = 0; j < sizeof(numeric_rows) / sizeof(numeric_rows[0]); ++j) {
+            const char *value_text = optional_int_to_text(numeric_rows[j].value, numeric, sizeof(numeric));
+            if (!value_text || value_text[0] == '\0' || strcmp(value_text, "—") == 0) {
+                continue;
+            }
+            char *label_tex = latex_escape(numeric_rows[j].label);
+            char *value_tex = latex_escape(value_text);
+            if (!label_tex || !value_tex || !buffer_appendf(buf, "%s & %s \\\\ \n", label_tex, value_tex)) {
+                free(label_tex);
+                free(value_tex);
+                return 0;
+            }
+            free(label_tex);
+            free(value_tex);
+        }
+
+        const char *bool_text = optional_bool_to_text(&device->metrics.dlm_compliant);
+        if (bool_text && bool_text[0]) {
+            char *label_tex = latex_escape("DLM Compliant");
+            char *value_tex = latex_escape(bool_text);
+            if (!label_tex || !value_tex || !buffer_appendf(buf, "%s & %s \\\\ \n", label_tex, value_tex)) {
+                free(label_tex);
+                free(value_tex);
+                return 0;
+            }
+            free(label_tex);
+            free(value_tex);
+        }
+
+        bool_text = optional_bool_to_text(&device->metrics.cat1_tag_current);
+        if (bool_text && bool_text[0]) {
+            char *label_tex = latex_escape("Cat 1 Tag Current");
+            char *value_tex = latex_escape(bool_text);
+            if (!label_tex || !value_tex || !buffer_appendf(buf, "%s & %s \\\\ \n", label_tex, value_tex)) {
+                free(label_tex);
+                free(value_tex);
+                return 0;
+            }
+            free(label_tex);
+            free(value_tex);
+        }
+
+        bool_text = optional_bool_to_text(&device->metrics.cat5_tag_current);
+        if (bool_text && bool_text[0]) {
+            char *label_tex = latex_escape("Cat 5 Tag Current");
+            char *value_tex = latex_escape(bool_text);
+            if (!label_tex || !value_tex || !buffer_appendf(buf, "%s & %s \\\\ \n", label_tex, value_tex)) {
+                free(label_tex);
+                free(value_tex);
+                return 0;
+            }
+            free(label_tex);
+            free(value_tex);
+        }
+
+        bool_text = optional_bool_to_text(&device->metrics.maintenance_log_up_to_date);
+        if (bool_text && bool_text[0]) {
+            char *label_tex = latex_escape("Maintenance Log Up to Date");
+            char *value_tex = latex_escape(bool_text);
+            if (!label_tex || !value_tex || !buffer_appendf(buf, "%s & %s \\\\ \n", label_tex, value_tex)) {
+                free(label_tex);
+                free(value_tex);
+                return 0;
+            }
+            free(label_tex);
+            free(value_tex);
+        }
+
+        if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabularx}\n\n")) {
+            return 0;
+        }
+
+        const char *notes_src = (device->general_notes && device->general_notes[0]) ? device->general_notes : "No general notes for this device.";
+        char *notes_clean = sanitize_ascii(notes_src);
+        const char *notes_text = notes_clean ? notes_clean : notes_src;
+        char *notes_tex = latex_escape(notes_text);
+        free(notes_clean);
+        if (!notes_tex) {
+            return 0;
+        }
+        if (!buffer_appendf(buf, "\\paragraph{General Notes}\n%s\\\\\n\n", notes_tex)) {
+            free(notes_tex);
+            return 0;
+        }
+        free(notes_tex);
+
+        if (device->deficiencies.count > 0) {
+            if (!buffer_append_cstr(buf, "\\paragraph{Documented Deficiencies}\n")) {
+                return 0;
+            }
+            if (!buffer_append_cstr(buf,
+                "\\begin{tabularx}{\\textwidth}{@{}p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} X@{}}\\toprule\n"
+                "\\textbf{Equipment} & \\textbf{Condition} & \\textbf{Remedy} & \\textbf{Note} \\\\ \\midrule\n")) {
+                return 0;
+            }
+            for (size_t j = 0; j < device->deficiencies.count; ++j) {
+                ReportDeficiency *def = &device->deficiencies.items[j];
+                const char *equip_src = def->equipment ? def->equipment : "—";
+                const char *cond_src = def->condition ? def->condition : "—";
+                const char *remedy_src = def->remedy ? def->remedy : "—";
+                const char *note_src = def->note ? def->note : "—";
+
+                char *equip_clean = sanitize_ascii(equip_src);
+                char *cond_clean = sanitize_ascii(cond_src);
+                char *remedy_clean = sanitize_ascii(remedy_src);
+                char *note_clean = sanitize_ascii(note_src);
+
+                const char *equip_text = equip_clean ? equip_clean : equip_src;
+                const char *cond_text = cond_clean ? cond_clean : cond_src;
+                const char *remedy_text = remedy_clean ? remedy_clean : remedy_src;
+                const char *note_text = note_clean ? note_clean : note_src;
+
+                char *equip_tex = latex_escape(equip_text);
+                char *cond_tex = latex_escape(cond_text);
+                char *remedy_tex = latex_escape(remedy_text);
+                char *note_tex = latex_escape(note_text);
+
+                free(equip_clean);
+                free(cond_clean);
+                free(remedy_clean);
+                free(note_clean);
+
+                if (!equip_tex || !cond_tex || !remedy_tex || !note_tex) {
+                    free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
+                    return 0;
+                }
+
+                if (!buffer_appendf(buf, "%s & %s & %s & %s \\\\ \n", equip_tex, cond_tex, remedy_tex, note_tex)) {
+                    free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
+                    return 0;
+                }
+
+                free(equip_tex);
+                free(cond_tex);
+                free(remedy_tex);
+                free(note_tex);
+            }
+            if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabularx}\n\n")) {
+                return 0;
+            }
+        } else {
+            if (!buffer_append_cstr(buf, "\\paragraph{Documented Deficiencies}\n\\textit{No deficiencies recorded for this device.}\\\n\n")) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int append_narrative_block(Buffer *buf, const char *content) {
+    if (!buf) {
+        return 0;
+    }
+
+    const char *source = (content && content[0]) ? content : "Narrative unavailable.";
+    char *clean = sanitize_ascii(source);
+    const char *text = clean ? clean : source;
+    char *work = strdup(text);
+    if (!work) {
+        free(clean);
+        return 0;
+    }
+
+    bool in_list = false;
+    bool ok = true;
+    char *line = work;
+
+    while (line && ok) {
+        char *next = strchr(line, '\n');
+        if (next) {
+            *next = '\0';
+            next++;
+        }
+
+        char *trimmed = trim_copy(line);
+        if (!trimmed) {
+            ok = false;
+            break;
+        }
+
+        char *p = trimmed;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+
+        if (*p == '\0') {
+            free(trimmed);
+            if (in_list) {
+                ok = buffer_append_cstr(buf, "\\end{itemize}\n\n");
+                in_list = false;
+            } else {
+                ok = buffer_append_cstr(buf, "\n");
+            }
+            line = next;
+            continue;
+        }
+
+        bool bullet = false;
+        if (*p == '-' || *p == '*') {
+            bullet = true;
+            p++;
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+        } else if ((*p == 'o' || *p == 'O') && (p[1] == ' ' || p[1] == '\t')) {
+            bullet = true;
+            p += 2;
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+        }
+
+        if (bullet) {
+            if (!in_list) {
+                ok = buffer_append_cstr(buf, "\\begin{itemize}\n");
+                in_list = true;
+            }
+            if (ok) {
+                char *escaped = latex_escape(p);
+                if (!escaped) {
+                    ok = false;
+                } else {
+                    ok = buffer_appendf(buf, "  \\item %s\n", escaped);
+                    free(escaped);
+                }
+            }
+        } else {
+            if (in_list) {
+                ok = buffer_append_cstr(buf, "\\end{itemize}\n\n");
+                in_list = false;
+            }
+            if (ok) {
+                char *escaped = latex_escape(trimmed);
+                if (!escaped) {
+                    ok = false;
+                } else {
+                    ok = buffer_appendf(buf, "%s\n\n", escaped);
+                    free(escaped);
+                }
+            }
+        }
+
+        free(trimmed);
+        line = next;
+    }
+
+    if (ok && in_list) {
+        ok = buffer_append_cstr(buf, "\\end{itemize}\n\n");
+    }
+
+    free(work);
+    free(clean);
+    return ok;
+}
+
+static void narrative_task_execute(NarrativeTask *task) {
+    if (!task) {
+        return;
+    }
+    task->success = 0;
+    char *response = NULL;
+    char *error = NULL;
+    if (!generate_grok_completion(task->system_prompt, task->prompt, &response, &error)) {
+        task->error = error ? error : strdup("Narrative generation failed");
+        return;
+    }
+    *(task->slot) = response;
+    task->success = 1;
+}
+
+static void *narrative_thread_main(void *arg) {
+    NarrativeTask *task = (NarrativeTask *)arg;
+    narrative_task_execute(task);
+    return NULL;
+}
+
 static int append_narrative_section(Buffer *buf, const char *title, const char *content) {
     if (!buf || !title) {
         return 0;
     }
     char *title_clean = sanitize_ascii(title);
-    char *title_tex = latex_escape(title_clean ? title_clean : (title ? title : ""));
+    const char *title_src = title_clean ? title_clean : title;
+    char *title_tex = latex_escape(title_src ? title_src : "");
     free(title_clean);
-    const char *body_source = (content && content[0]) ? content : "Narrative unavailable.";
-    char *body_clean = sanitize_ascii(body_source);
-    char *body_tex = latex_escape(body_clean ? body_clean : body_source);
-    free(body_clean);
-    if (!title_tex || !body_tex) {
-        free(title_tex);
-        free(body_tex);
+    if (!title_tex) {
         return 0;
     }
-    if (!buffer_appendf(buf, "\\section*{%s}\n%s\n\n", title_tex, body_tex)) {
-        free(title_tex);
-        free(body_tex);
-        return 0;
-    }
+    int ok = buffer_appendf(buf, "\\section{%s}\n\n", title_tex);
     free(title_tex);
-    free(body_tex);
-    return 1;
+    if (!ok) {
+        return 0;
+    }
+    return append_narrative_block(buf, content);
 }
 
 static int build_report_latex(const ReportData *report,
@@ -4975,25 +5690,56 @@ static int build_report_latex(const ReportData *report,
 
     int success = 0;
 
-    const char *address_src = report->summary.building_address ? report->summary.building_address : job->address;
-    char *address_clean = sanitize_ascii(address_src);
-    char *address_tex = latex_escape(address_clean ? address_clean : (address_src ? address_src : "Unknown address"));
-    free(address_clean);
+    char *address_clean = NULL;
+    char *address_tex = NULL;
+    char *owner_clean = NULL;
+    char *owner_tex = NULL;
+    char *contractor_clean = NULL;
+    char *contractor_tex = NULL;
+    char *city_clean = NULL;
+    char *city_tex = NULL;
+    char *date_range_tex = NULL;
+    char *client_name_env = NULL;
+    char *client_name_tex = NULL;
+    char *client_address_env = NULL;
+    char *client_address_tex = NULL;
+    char *contact_name_env = NULL;
+    char *contact_name_tex = NULL;
+    char *contact_email_env = NULL;
+    char *contact_email_tex = NULL;
+    char *asset_location_tex = NULL;
 
-    const char *owner_src = report->summary.building_owner ? report->summary.building_owner : "Unknown owner";
-    char *owner_clean = sanitize_ascii(owner_src);
-    char *owner_tex = latex_escape(owner_clean ? owner_clean : owner_src);
-    free(owner_clean);
+    const char *address_src = (report->summary.building_address && report->summary.building_address[0])
+        ? report->summary.building_address
+        : (job->address && job->address[0] ? job->address : "Unknown address");
+    address_clean = sanitize_ascii(address_src);
+    const char *address_text = address_clean ? address_clean : address_src;
+    address_tex = latex_escape(address_text);
+    if (!address_tex) goto cleanup;
 
-    const char *contractor_src = report->summary.elevator_contractor ? report->summary.elevator_contractor : "Unknown contractor";
-    char *contractor_clean = sanitize_ascii(contractor_src);
-    char *contractor_tex = latex_escape(contractor_clean ? contractor_clean : contractor_src);
-    free(contractor_clean);
+    const char *owner_src = (report->summary.building_owner && report->summary.building_owner[0])
+        ? report->summary.building_owner
+        : "Unknown owner";
+    owner_clean = sanitize_ascii(owner_src);
+    const char *owner_text = owner_clean ? owner_clean : owner_src;
+    owner_tex = latex_escape(owner_text);
+    if (!owner_tex) goto cleanup;
 
-    const char *city_src = report->summary.city_id ? report->summary.city_id : "—";
-    char *city_clean = sanitize_ascii(city_src);
-    char *city_tex = latex_escape(city_clean ? city_clean : city_src);
-    free(city_clean);
+    const char *contractor_src = (report->summary.elevator_contractor && report->summary.elevator_contractor[0])
+        ? report->summary.elevator_contractor
+        : "Not specified";
+    contractor_clean = sanitize_ascii(contractor_src);
+    const char *contractor_text = contractor_clean ? contractor_clean : contractor_src;
+    contractor_tex = latex_escape(contractor_text);
+    if (!contractor_tex) goto cleanup;
+
+    const char *city_src = (report->summary.city_id && report->summary.city_id[0])
+        ? report->summary.city_id
+        : "—";
+    city_clean = sanitize_ascii(city_src);
+    const char *city_text = city_clean ? city_clean : city_src;
+    city_tex = latex_escape(city_text);
+    if (!city_tex) goto cleanup;
 
     char date_range_buf[256];
     if (report->summary.audit_range.start && report->summary.audit_range.end) {
@@ -5007,20 +5753,44 @@ static int build_report_latex(const ReportData *report,
     } else {
         snprintf(date_range_buf, sizeof(date_range_buf), "—");
     }
-    char *date_range_tex = latex_escape(date_range_buf);
+    date_range_tex = latex_escape(date_range_buf);
+    if (!date_range_tex) goto cleanup;
 
-    if (!address_tex || !owner_tex || !contractor_tex || !city_tex || !date_range_tex) {
-        free(address_tex);
-        free(owner_tex);
-        free(contractor_tex);
-        free(city_tex);
-        free(date_range_tex);
-        buffer_free(&buf);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory");
-        }
-        return 0;
-    }
+    client_name_env = trim_copy(getenv("REPORT_CLIENT_NAME"));
+    const char *client_name_src = (client_name_env && client_name_env[0]) ? client_name_env : owner_text;
+    char *client_name_clean = sanitize_ascii(client_name_src);
+    const char *client_name_text = client_name_clean ? client_name_clean : client_name_src;
+    client_name_tex = latex_escape(client_name_text);
+    free(client_name_clean);
+    if (!client_name_tex) goto cleanup;
+
+    client_address_env = trim_copy(getenv("REPORT_CLIENT_ADDRESS"));
+    const char *client_address_src = (client_address_env && client_address_env[0]) ? client_address_env : address_text;
+    char *client_address_clean = sanitize_ascii(client_address_src);
+    const char *client_address_text = client_address_clean ? client_address_clean : client_address_src;
+    client_address_tex = latex_escape(client_address_text);
+    free(client_address_clean);
+    if (!client_address_tex) goto cleanup;
+
+    contact_name_env = trim_copy(getenv("REPORT_CONTACT_NAME"));
+    const char *default_contact = (contractor_text && contractor_text[0]) ? contractor_text : "Citywide Elevator Consulting";
+    const char *contact_name_src = (contact_name_env && contact_name_env[0]) ? contact_name_env : default_contact;
+    char *contact_name_clean = sanitize_ascii(contact_name_src);
+    const char *contact_name_text = contact_name_clean ? contact_name_clean : contact_name_src;
+    contact_name_tex = latex_escape(contact_name_text);
+    free(contact_name_clean);
+    if (!contact_name_tex) goto cleanup;
+
+    contact_email_env = trim_copy(getenv("REPORT_CONTACT_EMAIL"));
+    const char *contact_email_src = (contact_email_env && contact_email_env[0]) ? contact_email_env : "support@citywideportal.io";
+    char *contact_email_clean = sanitize_ascii(contact_email_src);
+    const char *contact_email_text = contact_email_clean ? contact_email_clean : contact_email_src;
+    contact_email_tex = latex_escape(contact_email_text);
+    free(contact_email_clean);
+    if (!contact_email_tex) goto cleanup;
+
+    asset_location_tex = strdup(address_tex);
+    if (!asset_location_tex) goto cleanup;
 
     if (!buffer_append_cstr(&buf,
         "\\documentclass[12pt]{article}\n"
@@ -5029,282 +5799,144 @@ static int build_report_latex(const ReportData *report,
         "\\usepackage{geometry}\n"
         "\\usepackage{fancyhdr}\n"
         "\\usepackage{graphicx}\n"
-        "\\usepackage{longtable}\n"
+        "\\usepackage{datetime}\n"
+        "\\usepackage{hyperref}\n"
+        "\\usepackage{etoolbox}\n"
         "\\usepackage{array}\n"
-        "\\usepackage{booktabs}\n"
+        "\\usepackage{helvet}\n"
         "\\usepackage{tabularx}\n"
+        "\\usepackage{booktabs}\n"
+        "\\usepackage{pgfplots}\n"
+        "\\usepackage{tikz}\n"
+        "\\usepackage{lmodern}\n"
         "\\usepackage{xcolor}\n"
         "\\usepackage{float}\n"
-        "\\geometry{letterpaper, margin=1in}\n"
-        "\\setlength{\\parskip}{0.6em}\n"
+        "\\geometry{a4paper, left=0.5in, right=0.5in, top=1in, bottom=1in}\n"
+        "\\setlength{\\headheight}{26pt}\n"
+        "\\pgfplotsset{compat=1.18}\n"
+        "\\graphicspath{{.}{./assets/}}\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\newcommand{\\clientname}{")) goto cleanup;
+    if (!buffer_appendf(&buf, "%s", client_name_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "}\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\newcommand{\\clientaddress}{")) goto cleanup;
+    if (!buffer_appendf(&buf, "%s", client_address_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "}\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\newcommand{\\contactname}{")) goto cleanup;
+    if (!buffer_appendf(&buf, "%s", contact_name_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "}\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\newcommand{\\contactemail}{")) goto cleanup;
+    if (!buffer_appendf(&buf, "%s", contact_email_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "}\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\newcommand{\\assetlocation}{")) goto cleanup;
+    if (!buffer_appendf(&buf, "%s", asset_location_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "}\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf,
+        "\\pagestyle{empty}\n"
+        "\\setlength{\\parskip}{0.5\\baselineskip}\n"
         "\\setlength{\\parindent}{0pt}\n"
-        "\\begin{document}\n\n")) {
-        goto cleanup;
-    }
+        "\\newcommand{\\coverpage}{%\n"
+        "    \\newpage\n"
+        "    \\vspace*{1cm}%\n"
+        "    \\noindent\\includegraphics[width=0.3\\textwidth]{citywide.png}\\\\[0.5cm]\n"
+        "    \\noindent\\textbf{Citywide Elevator Consulting}\\[0pt]\n"
+        "    991 US HWY 22\\[0pt]\n"
+        "    Suite 100A\\[0pt]\n"
+        "    Bridgewater, NJ 08807\\[0.5cm]\n"
+        "    \\noindent\\textbf{Client}\\[0pt]\n"
+        "    \\clientname\\[0pt]\n"
+        "    \\clientaddress\\[0.25cm]\n"
+        "    \\noindent\\textbf{Contact}\\[0pt]\n"
+        "    \\contactname\\[0pt]\n"
+        "    email: \\contactemail\\[0.25cm]\n"
+        "    \\noindent\\textbf{Asset Location}\\[0pt]\n"
+        "    \\assetlocation\\[0.5cm]\n"
+        "    \\noindent\\textbf{Creation Date:} \\today\\[0.5cm]\n"
+        "    \\vfill\n"
+        "}\n"
+        "\\fancypagestyle{mainstyle}{%\n"
+        "    \\fancyhf{}%\n"
+        "    \\fancyhead[R]{\\includegraphics[width=0.0375\\textwidth]{square.png}}%\n"
+        "    \\fancyfoot[L]{%\n"
+        "        \\scriptsize\n"
+        "        \\clientname\\%\n"
+        "        \\clientaddress%\n"
+        "    }%\n"
+        "    \\fancyfoot[R]{\\thepage}%\n"
+        "    \\renewcommand{\\headrulewidth}{0pt}%\n"
+        "    \\renewcommand{\\footrulewidth}{0pt}%\n"
+        "    \\setlength{\\headsep}{0.4in}%\n"
+        "}\n"
+        "\\AtBeginDocument{%\n"
+        "    \\normalsize\n"
+        "    \\thispagestyle{empty}%\n"
+        "    \\coverpage\n"
+        "    \\newpage\n"
+        "    \\pagestyle{mainstyle}%\n"
+        "    \\pagenumbering{arabic}%\n"
+        "    \\hypersetup{pdfborder = {0 0 0}}%\n"
+        "    \\tableofcontents\n"
+        "    \\newpage\n"
+        "}\n"
+        "\\AtEndDocument{}\n"
+        "\\begin{document}\n\n")) goto cleanup;
 
-    if (!buffer_appendf(&buf,
-        "\\begin{center}\n"
-        "{\\Large\\textbf{Audit Report}}\\\\[0.6em]\n"
-        "%s\\\\[0.4em]\n"
-        "{\\normalsize %s}\\\\[1em]\n"
-        "\\end{center}\n"
-        "\\hrule\n"
-        "\\vspace{1em}\n",
-        address_tex,
-        date_range_tex)) {
-        goto cleanup;
-    }
+    if (!buffer_append_cstr(&buf, "\\section{Executive Summary}\n\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\subsection{Overview}\n")) goto cleanup;
+    if (!append_narrative_block(&buf, narratives->executive_summary)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\subsection{Key Findings}\n")) goto cleanup;
+    if (!append_narrative_block(&buf, narratives->key_findings)) goto cleanup;
 
-    if (!buffer_append_cstr(&buf, "\\section*{Property Summary}\n")) {
-        goto cleanup;
-    }
-    if (!buffer_append_cstr(&buf, "\\begin{tabular}{ll}\n")) {
-        goto cleanup;
-    }
+    if (!buffer_append_cstr(&buf, "\\section{Scope of Work}\n\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\subsection{Methodology}\n")) goto cleanup;
+    if (!append_narrative_block(&buf, narratives->methodology)) goto cleanup;
+    if (!buffer_append_cstr(&buf,
+        "\\subsection{Audit Process}\n"
+        "The audit process involved a comprehensive evaluation of all elevator equipment, including mechanical components, electrical systems, safety devices, and maintenance records. Each device was inspected according to applicable codes and industry standards.\n\n")) goto cleanup;
 
-    char buffer_num[64];
+    if (!buffer_append_cstr(&buf,
+        "\\section{Equipment Summary}\n\n"
+        "\\subsection{General Equipment Condition}\n"
+        "The following analysis provides an overview of the equipment condition across all devices inspected.\n\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\begin{center}\n\\begin{tabular}{ll}\n\\toprule\n\\textbf{Metric} & \\textbf{Value} \\\\ \\midrule\n")) goto cleanup;
+
+    char number_buf[32];
     if (!buffer_appendf(&buf, "Address & %s \\\\ \n", address_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "Owner & %s \\\\ \n", owner_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "Elevator Contractor & %s \\\\ \n", contractor_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "City ID & %s \\\\ \n", city_tex)) goto cleanup;
-    snprintf(buffer_num, sizeof(buffer_num), "%d", report->summary.total_devices);
-    if (!buffer_appendf(&buf, "Total Devices & %s \\\\ \n", buffer_num)) goto cleanup;
-    snprintf(buffer_num, sizeof(buffer_num), "%d", report->summary.audit_count);
-    if (!buffer_appendf(&buf, "Audit Count & %s \\\\ \n", buffer_num)) goto cleanup;
-    snprintf(buffer_num, sizeof(buffer_num), "%d", report->summary.total_deficiencies);
-    if (!buffer_appendf(&buf, "Total Deficiencies & %s \\\\ \n", buffer_num)) goto cleanup;
-    snprintf(buffer_num, sizeof(buffer_num), "%0.2f", report->summary.average_deficiencies_per_device);
-    if (!buffer_appendf(&buf, "Average Deficiencies / Device & %s \\\\ \n", buffer_num)) goto cleanup;
     if (!buffer_appendf(&buf, "Audit Date Range & %s \\\\ \n", date_range_tex)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\end{tabular}\n\n")) goto cleanup;
+    snprintf(number_buf, sizeof(number_buf), "%d", report->summary.total_devices);
+    if (!buffer_appendf(&buf, "Total Devices & %s \\\\ \n", number_buf)) goto cleanup;
+    snprintf(number_buf, sizeof(number_buf), "%d", report->summary.audit_count);
+    if (!buffer_appendf(&buf, "Audit Count & %s \\\\ \n", number_buf)) goto cleanup;
+    snprintf(number_buf, sizeof(number_buf), "%d", report->summary.total_deficiencies);
+    if (!buffer_appendf(&buf, "Total Deficiencies & %s \\\\ \n", number_buf)) goto cleanup;
+    snprintf(number_buf, sizeof(number_buf), "%.2f", report->summary.average_deficiencies_per_device);
+    if (!buffer_appendf(&buf, "Average Deficiencies / Device & %s \\\\ \n", number_buf)) goto cleanup;
 
-    if (!append_narrative_section(&buf, "Executive Summary", narratives->executive_summary)) goto cleanup;
-    if (!append_narrative_section(&buf, "Key Findings", narratives->key_findings)) goto cleanup;
-    if (!append_narrative_section(&buf, "Methodology", narratives->methodology)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\n\\end{center}\n\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "These metrics summarize all submissions included in this report and frame the analyses that follow.\n\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\subsection{Deficiency Patterns}\n")) goto cleanup;
+    if (!append_deficiency_code_chart(&buf, report)) goto cleanup;
+    if (!append_deficiencies_per_device_chart(&buf, report)) goto cleanup;
+    if (!append_controller_age_chart(&buf, report)) goto cleanup;
+
+    if (!append_device_sections(&buf, report)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\newpage\n")) goto cleanup;
+
     if (!append_narrative_section(&buf, "Maintenance Performance", narratives->maintenance_performance)) goto cleanup;
     if (!append_narrative_section(&buf, "Recommendations", narratives->recommendations)) goto cleanup;
     if (!append_narrative_section(&buf, "Conclusion", narratives->conclusion)) goto cleanup;
 
-    if (!buffer_append_cstr(&buf, "\\section*{Device Overview}\n")) goto cleanup;
-
-    for (size_t i = 0; i < report->devices.count; ++i) {
-        ReportDevice *device = &report->devices.items[i];
-        const char *device_id_raw = device->device_id ? device->device_id : (device->submission_id ? device->submission_id : device->audit_uuid);
-        char *device_id_tex = latex_escape(device_id_raw ? device_id_raw : "Unknown Device");
-        char *device_type_tex = latex_escape(device->device_type ? device->device_type : "Device");
-        char *bank_tex = latex_escape(device->bank_name ? device->bank_name : "—");
-        char *city_device_tex = latex_escape(device->city_id ? device->city_id : "—");
-        char *controller_manufacturer_tex = latex_escape(device->controller_manufacturer ? device->controller_manufacturer : "—");
-        char *controller_model_tex = latex_escape(device->controller_model ? device->controller_model : "—");
-        char *machine_type_tex = latex_escape(device->machine_type ? device->machine_type : "—");
-        const char *general_source = (device->general_notes && device->general_notes[0]) ? device->general_notes : "No general notes.";
-        char *general_clean = sanitize_ascii(general_source);
-        char *general_notes_tex = latex_escape(general_clean ? general_clean : general_source);
-        free(general_clean);
-        char *floors_join = string_array_join(&device->floors_served, ", ");
-        const char *floors_src = floors_join ? floors_join : "—";
-        char *floors_clean = sanitize_ascii(floors_src);
-        char *floors_tex = latex_escape(floors_clean ? floors_clean : floors_src);
-        free(floors_clean);
-        free(floors_join);
-
-        char int_buffer[64];
-        const char *capacity_text = optional_int_to_text(&device->metrics.capacity, int_buffer, sizeof(int_buffer));
-        char *capacity_tex = latex_escape(capacity_text);
-        const char *speed_text = optional_int_to_text(&device->metrics.car_speed, int_buffer, sizeof(int_buffer));
-        char *speed_tex = latex_escape(speed_text);
-        const char *install_year_text = optional_int_to_text(&device->metrics.controller_install_year, int_buffer, sizeof(int_buffer));
-        char *install_year_tex = latex_escape(install_year_text);
-        const char *stops_text = optional_int_to_text(&device->metrics.number_of_stops, int_buffer, sizeof(int_buffer));
-        char *stops_tex = latex_escape(stops_text);
-        const char *openings_text = optional_int_to_text(&device->metrics.number_of_openings, int_buffer, sizeof(int_buffer));
-        char *openings_tex = latex_escape(openings_text);
-        const char *code_year_text = optional_int_to_text(&device->metrics.code_data_year, int_buffer, sizeof(int_buffer));
-        char *code_year_tex = latex_escape(code_year_text);
-        const char *dlm_text = optional_bool_to_text(&device->metrics.dlm_compliant);
-        char *dlm_tex = latex_escape(dlm_text);
-        const char *cat1_text = optional_bool_to_text(&device->metrics.cat1_tag_current);
-        char *cat1_tex = latex_escape(cat1_text);
-        const char *cat5_text = optional_bool_to_text(&device->metrics.cat5_tag_current);
-        char *cat5_tex = latex_escape(cat5_text);
-        const char *maint_text = optional_bool_to_text(&device->metrics.maintenance_log_up_to_date);
-        char *maint_tex = latex_escape(maint_text);
-
-        if (!device_id_tex || !device_type_tex || !bank_tex || !city_device_tex || !controller_manufacturer_tex || !controller_model_tex ||
-            !machine_type_tex || !general_notes_tex || !floors_tex || !capacity_tex || !speed_tex || !install_year_tex || !stops_tex ||
-            !openings_tex || !code_year_tex || !dlm_tex || !cat1_tex || !cat5_tex || !maint_tex) {
-            free(device_id_tex); free(device_type_tex); free(bank_tex); free(city_device_tex);
-            free(controller_manufacturer_tex); free(controller_model_tex); free(machine_type_tex);
-            free(general_notes_tex); free(floors_tex); free(capacity_tex); free(speed_tex);
-            free(install_year_tex); free(stops_tex); free(openings_tex); free(code_year_tex);
-            free(dlm_tex); free(cat1_tex); free(cat5_tex); free(maint_tex);
-            goto cleanup;
-        }
-
-        if (!buffer_appendf(&buf, "\\subsection*{%s (Type: %s)}\n", device_id_tex, device_type_tex)) {
-            free(device_id_tex); free(device_type_tex); free(bank_tex); free(city_device_tex);
-            free(controller_manufacturer_tex); free(controller_model_tex); free(machine_type_tex);
-            free(general_notes_tex); free(floors_tex); free(capacity_tex); free(speed_tex);
-            free(install_year_tex); free(stops_tex); free(openings_tex); free(code_year_tex);
-            free(dlm_tex); free(cat1_tex); free(cat5_tex); free(maint_tex);
-            goto cleanup;
-        }
-
-        if (!buffer_append_cstr(&buf, "\\begin{tabular}{ll}\n")) {
-            free(device_id_tex); free(device_type_tex); free(bank_tex); free(city_device_tex);
-            free(controller_manufacturer_tex); free(controller_model_tex); free(machine_type_tex);
-            free(general_notes_tex); free(floors_tex); free(capacity_tex); free(speed_tex);
-            free(install_year_tex); free(stops_tex); free(openings_tex); free(code_year_tex);
-            free(dlm_tex); free(cat1_tex); free(cat5_tex); free(maint_tex);
-            goto cleanup;
-        }
-        if (!buffer_appendf(&buf, "Bank & %s \\\\ \n", bank_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "City ID & %s \\\\ \n", city_device_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Controller Manufacturer & %s \\\\ \n", controller_manufacturer_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Controller Model & %s \\\\ \n", controller_model_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Controller Install Year & %s \\\\ \n", install_year_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Machine Type & %s \\\\ \n", machine_type_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Capacity (lbs) & %s \\\\ \n", capacity_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Car Speed (fpm) & %s \\\\ \n", speed_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Number of Stops & %s \\\\ \n", stops_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Number of Openings & %s \\\\ \n", openings_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Code Data Year & %s \\\\ \n", code_year_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Floors Served & %s \\\\ \n", floors_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "DLM Compliant & %s \\\\ \n", dlm_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Cat 1 Tag Current & %s \\\\ \n", cat1_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Cat 5 Tag Current & %s \\\\ \n", cat5_tex)) goto device_cleanup;
-        if (!buffer_appendf(&buf, "Maintenance Log Up to Date & %s \\\\ \n", maint_tex)) goto device_cleanup;
-        if (!buffer_append_cstr(&buf, "\\end{tabular}\n\n")) goto device_cleanup;
-
-        if (!buffer_appendf(&buf, "\\textbf{General Notes:}~%s\\\\\\\\[0.5em]\n", general_notes_tex)) goto device_cleanup;
-
-        size_t deficiency_count = device->deficiencies.count;
-        if (deficiency_count == 0) {
-            if (!buffer_append_cstr(&buf, "No deficiencies documented.\\\\\n\n")) goto device_cleanup;
-        } else {
-            if (!buffer_append_cstr(&buf,
-                "\\begin{tabularx}{\\textwidth}{p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} p{.1\\textwidth} X}\\toprule\n"
-                "\\textbf{Equipment} & \\textbf{Condition} & \\textbf{Remedy} & \\textbf{Status} & \\textbf{Note}\\\\\\\\midrule\n")) goto device_cleanup;
-
-            for (size_t j = 0; j < deficiency_count; ++j) {
-                ReportDeficiency *def = &device->deficiencies.items[j];
-                const char *equip_src = def->equipment ? def->equipment : "—";
-                const char *cond_src = def->condition ? def->condition : "—";
-                const char *remedy_src = def->remedy ? def->remedy : "—";
-                const char *note_src = def->note ? def->note : "—";
-                char *equip_clean = sanitize_ascii(equip_src);
-                char *cond_clean = sanitize_ascii(cond_src);
-                char *remedy_clean = sanitize_ascii(remedy_src);
-                char *note_clean = sanitize_ascii(note_src);
-                char *equipment_tex = latex_escape(equip_clean ? equip_clean : equip_src);
-                char *condition_tex = latex_escape(cond_clean ? cond_clean : cond_src);
-                char *remedy_tex = latex_escape(remedy_clean ? remedy_clean : remedy_src);
-                char *note_tex = latex_escape(note_clean ? note_clean : note_src);
-                free(equip_clean);
-                free(cond_clean);
-                free(remedy_clean);
-                free(note_clean);
-                const char *status_text = (def->resolved.has_value && def->resolved.value) ? "Closed" : "Open";
-                char *status_tex = latex_escape(status_text);
-                if (!equipment_tex || !condition_tex || !remedy_tex || !note_tex || !status_tex) {
-                    free(equipment_tex); free(condition_tex); free(remedy_tex); free(note_tex); free(status_tex);
-                    goto device_cleanup;
-                }
-                if (!buffer_appendf(&buf, "%s & %s & %s & %s & %s \\\\ \n",
-                                    equipment_tex, condition_tex, remedy_tex, status_tex, note_tex)) {
-                    free(equipment_tex); free(condition_tex); free(remedy_tex); free(note_tex); free(status_tex);
-                    goto device_cleanup;
-                }
-                free(equipment_tex); free(condition_tex); free(remedy_tex); free(note_tex); free(status_tex);
-            }
-            if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabularx}\n\n")) goto device_cleanup;
-        }
-
-device_cleanup:
-        free(device_id_tex); free(device_type_tex); free(bank_tex); free(city_device_tex);
-        free(controller_manufacturer_tex); free(controller_model_tex); free(machine_type_tex);
-        free(general_notes_tex); free(floors_tex); free(capacity_tex); free(speed_tex);
-        free(install_year_tex); free(stops_tex); free(openings_tex); free(code_year_tex);
-        free(dlm_tex); free(cat1_tex); free(cat5_tex); free(maint_tex);
-        if (buf.length == 0) {
-            goto cleanup;
-        }
-    }
-
-    if (!buffer_append_cstr(&buf, "\\section*{Location Deficiencies Overview}\n")) goto cleanup;
-
-    bool any_rows = false;
-    if (!buffer_append_cstr(&buf,
-        "\\begin{tabularx}{\\textwidth}{p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} X}\\toprule\n"
-        "Device & Equipment & Condition & Remedy & Note (Status) \\\\ \\midrule\n")) goto cleanup;
-
-    for (size_t i = 0; i < report->devices.count; ++i) {
-        ReportDevice *device = &report->devices.items[i];
-        if (device->deficiencies.count == 0) {
-            continue;
-        }
-        const char *device_id_src = device->device_id ? device->device_id : (device->submission_id ? device->submission_id : device->audit_uuid);
-        char *device_id_clean = sanitize_ascii(device_id_src);
-        char *device_id_tex = latex_escape(device_id_clean ? device_id_clean : (device_id_src ? device_id_src : "Device"));
-        free(device_id_clean);
-        if (!device_id_tex) goto cleanup;
-        for (size_t j = 0; j < device->deficiencies.count; ++j) {
-            ReportDeficiency *def = &device->deficiencies.items[j];
-            const char *equip_src = def->equipment ? def->equipment : "—";
-            const char *cond_src = def->condition ? def->condition : "—";
-            const char *remedy_src = def->remedy ? def->remedy : "—";
-            const char *note_src = def->note ? def->note : "—";
-            char *equip_clean = sanitize_ascii(equip_src);
-            char *cond_clean = sanitize_ascii(cond_src);
-            char *remedy_clean = sanitize_ascii(remedy_src);
-            char *equip_tex = latex_escape(equip_clean ? equip_clean : equip_src);
-            char *cond_tex = latex_escape(cond_clean ? cond_clean : cond_src);
-            char *remedy_tex = latex_escape(remedy_clean ? remedy_clean : remedy_src);
-            free(equip_clean);
-            free(cond_clean);
-            free(remedy_clean);
-            const char *status_text = (def->resolved.has_value && def->resolved.value) ? "Closed" : "Open";
-            size_t note_len = note_src ? strlen(note_src) : 0;
-            size_t status_len = strlen(status_text);
-            size_t total = (note_len ? note_len + 10 : 8) + status_len + 1;
-            char *note_augmented = malloc(total);
-            if (!note_augmented) {
-                free(device_id_tex);
-                free(equip_tex); free(cond_tex); free(remedy_tex);
-                goto cleanup;
-            }
-            if (note_len) {
-                snprintf(note_augmented, total, "%s (Status: %s)", note_src, status_text);
-            } else {
-                snprintf(note_augmented, total, "Status: %s", status_text);
-            }
-            char *note_clean = sanitize_ascii(note_augmented);
-            char *note_tex = latex_escape(note_clean ? note_clean : note_augmented);
-            free(note_clean);
-            free(note_augmented);
-            if (!equip_tex || !cond_tex || !remedy_tex || !note_tex) {
-                free(device_id_tex);
-                free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
-                goto cleanup;
-            }
-            if (!buffer_appendf(&buf, "%s & %s & %s & %s & %s \\\\ \n", device_id_tex, equip_tex, cond_tex, remedy_tex, note_tex)) {
-                free(device_id_tex); free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
-                goto cleanup;
-            }
-            free(equip_tex); free(cond_tex); free(remedy_tex); free(note_tex);
-            any_rows = true;
-        }
-        free(device_id_tex);
-    }
-
-    if (!any_rows) {
-        if (!buffer_append_cstr(&buf, "\\multicolumn{5}{c}{No deficiencies recorded.}\\\\\n")) goto cleanup;
-    }
-    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabularx}\n\n")) goto cleanup;
-
-    if (!buffer_append_cstr(&buf, "\\end{document}\n")) {
-        goto cleanup;
-    }
+    if (!buffer_append_cstr(&buf, "\\end{document}\n")) goto cleanup;
 
     if (write_buffer_to_file(output_path, buf.data, buf.length) != 0) {
         if (error_out && !*error_out) {
@@ -5320,17 +5952,31 @@ device_cleanup:
     success = 1;
 
 cleanup:
+    free(address_clean);
     free(address_tex);
+    free(owner_clean);
     free(owner_tex);
+    free(contractor_clean);
     free(contractor_tex);
+    free(city_clean);
     free(city_tex);
     free(date_range_tex);
+    free(client_name_env);
+    free(client_name_tex);
+    free(client_address_env);
+    free(client_address_tex);
+    free(contact_name_env);
+    free(contact_name_tex);
+    free(contact_email_env);
+    free(contact_email_tex);
+    free(asset_location_tex);
     buffer_free(&buf);
     if (!success && error_out && !*error_out) {
         *error_out = strdup("Failed to build LaTeX report");
     }
     return success;
 }
+
 
 static void handle_client(int client_fd, void *ctx) {
     PGconn *conn = (PGconn *)ctx;
@@ -5813,6 +6459,17 @@ int main(int argc, char **argv) {
     }
     g_report_output_dir = report_dir_trimmed;
 
+    char *assets_dir_trimmed = trim_copy(getenv("REPORT_ASSETS_DIR"));
+    if (!assets_dir_trimmed || assets_dir_trimmed[0] == '\0') {
+        free(assets_dir_trimmed);
+        assets_dir_trimmed = strdup("./assets");
+    }
+    if (!assets_dir_trimmed) {
+        log_error("Failed to allocate report assets directory");
+        goto cleanup;
+    }
+    g_report_assets_dir = assets_dir_trimmed;
+
     RouteHelpers route_helpers = {
         .build_location_detail = build_location_detail_payload,
         .build_report_json = build_report_json_payload
@@ -5879,6 +6536,8 @@ cleanup:
     g_static_dir = NULL;
     free(g_report_output_dir);
     g_report_output_dir = NULL;
+    free(g_report_assets_dir);
+    g_report_assets_dir = NULL;
     free(g_xai_api_key);
     g_xai_api_key = NULL;
     if (g_curl_initialized) {

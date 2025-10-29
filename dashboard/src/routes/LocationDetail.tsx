@@ -107,8 +107,20 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     if (!id) return;
     setErrorMessage(null);
     try {
-      const blob = await downloadReport(id);
-      const filename = `audit-report-${slugify(props.address)}.pdf`;
+      const { blob, filename: serverFilename, contentType } = await downloadReport(id);
+      const inferredExt = (() => {
+        if (serverFilename) {
+          const dot = serverFilename.lastIndexOf('.');
+          if (dot !== -1) {
+            return serverFilename.slice(dot + 1).toLowerCase();
+          }
+        }
+        if (contentType && contentType.includes('zip')) return 'zip';
+        if (contentType && contentType.includes('pdf')) return 'pdf';
+        return 'zip';
+      })();
+      const fallbackName = `audit-report-${slugify(props.address)}.${inferredExt}`;
+      const filename = serverFilename ?? fallbackName;
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;

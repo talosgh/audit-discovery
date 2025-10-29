@@ -13,6 +13,7 @@ size_t g_api_prefix_len = 0;
 char *g_static_dir = NULL;
 char *g_database_dsn = NULL;
 char *g_report_output_dir = NULL;
+char *g_report_assets_dir = NULL;
 char *g_xai_api_key = NULL;
 
 static void trim_inplace(char *str) {

@@ -131,11 +131,29 @@ export async function updateDeficiencyStatus(auditId: string, deficiencyId: numb
   return (await response.json()) as DeficiencyUpdateResponse;
 }
 
-export async function downloadReport(jobId: string): Promise<Blob> {
+export interface DownloadedReport {
+  blob: Blob;
+  filename?: string;
+  contentType: string | null;
+}
+
+function extractFilename(headerValue: string | null): string | undefined {
+  if (!headerValue) return undefined;
+  const match = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(headerValue);
+  if (!match) return undefined;
+  const value = match[1] || match[2];
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+export async function downloadReport(jobId: string): Promise<DownloadedReport> {
   const url = buildUrl(`/reports/${encodeURIComponent(jobId)}/download`);
   const response = await fetch(url, {
     headers: {
-      Accept: 'application/pdf'
+      Accept: 'application/zip, application/pdf;q=0.9, */*;q=0.5'
     }
   });
 
@@ -152,5 +170,9 @@ export async function downloadReport(jobId: string): Promise<Blob> {
     throw new Error(message || `Request failed with status ${response.status}`);
   }
 
-  return await response.blob();
+  const blob = await response.blob();
+  const contentType = response.headers.get('Content-Type');
+  const filename = extractFilename(response.headers.get('Content-Disposition'));
+
+  return { blob, filename: filename ?? undefined, contentType };
 }
