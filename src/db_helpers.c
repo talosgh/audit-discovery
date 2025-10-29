@@ -8,6 +8,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef TEXTOID
+#define TEXTOID 25
+#endif
+#ifndef INT8OID
+#define INT8OID 20
+#endif
 
 char *db_fetch_audit_list(PGconn *conn, char **error_out) {
     const char *sql =
@@ -129,7 +135,8 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         "       l.vendor_name ILIKE $1)";
 
     const char *count_params[1] = { pattern };
-    PGresult *count_res = PQexecParams(conn, COUNT_SQL, 1, NULL, count_params, NULL, NULL, 0);
+    const Oid count_types[1] = { TEXTOID };
+    PGresult *count_res = PQexecParams(conn, COUNT_SQL, 1, count_types, count_params, NULL, NULL, 0);
     long long total = 0;
     if (!count_res || PQresultStatus(count_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
@@ -180,7 +187,8 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         "OFFSET $1::bigint LIMIT $2::bigint";
 
     const char *item_params[3] = { offset_buf, limit_buf, pattern };
-    PGresult *res = PQexecParams(conn, ITEM_SQL, 3, NULL, item_params, NULL, NULL, 0);
+    const Oid item_types[3] = { INT8OID, INT8OID, TEXTOID };
+    PGresult *res = PQexecParams(conn, ITEM_SQL, 3, item_types, item_params, NULL, NULL, 0);
     free(pattern);
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {

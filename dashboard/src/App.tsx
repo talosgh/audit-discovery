@@ -122,7 +122,7 @@ const App = () => {
     <div class="app-shell">
       <header class="app-header">
         <button type="button" class="brand" onClick={navigateToList} aria-label="Citywide Elevator Operations">
-          <img src="/citywide.png" alt="Citywide" />
+          <img src="/assets/citywide.png" alt="Citywide" />
           <span>Elevator Operations</span>
         </button>
         <nav class="nav-links">
