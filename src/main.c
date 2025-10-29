@@ -5570,6 +5570,41 @@ static int append_narrative_block(Buffer *buf, const char *content) {
             continue;
         }
 
+        size_t hash_count = 0;
+        while (p[hash_count] == '#') {
+            hash_count++;
+        }
+        if (hash_count > 0 && (p[hash_count] == ' ' || p[hash_count] == '\t')) {
+            if (in_list) {
+                ok = buffer_append_cstr(buf, "\\end{itemize}\n\n");
+                in_list = false;
+            }
+            if (ok) {
+                const char *heading_start = p + hash_count;
+                while (*heading_start == ' ' || *heading_start == '\t') {
+                    heading_start++;
+                }
+                if (*heading_start != '\0') {
+                    char *escaped = latex_escape(heading_start);
+                    if (!escaped) {
+                        ok = false;
+                    } else {
+                        const char *format = (hash_count == 1)
+                            ? "\\subsection*{%s}\n\n"
+                            : "\\subsubsection*{%s}\n\n";
+                        ok = buffer_appendf(buf, format, escaped);
+                        free(escaped);
+                    }
+                }
+            }
+            free(trimmed);
+            if (!ok) {
+                break;
+            }
+            line = next;
+            continue;
+        }
+
         bool bullet = false;
         if (*p == '-' || *p == '*') {
             bullet = true;
@@ -5708,6 +5743,7 @@ static int build_report_latex(const ReportData *report,
     char *contact_email_env = NULL;
     char *contact_email_tex = NULL;
     char *asset_location_tex = NULL;
+    char *cover_address_plain = NULL;
 
     const char *address_src = (report->summary.building_address && report->summary.building_address[0])
         ? report->summary.building_address
@@ -5756,8 +5792,93 @@ static int build_report_latex(const ReportData *report,
     date_range_tex = latex_escape(date_range_buf);
     if (!date_range_tex) goto cleanup;
 
+    if ((job->cover_street && job->cover_street[0]) ||
+        (job->cover_city && job->cover_city[0]) ||
+        (job->cover_state && job->cover_state[0]) ||
+        (job->cover_zip && job->cover_zip[0])) {
+        Buffer cover_buf;
+        if (!buffer_init(&cover_buf)) goto cleanup;
+        int cover_ok = 1;
+
+        if (job->cover_street && job->cover_street[0]) {
+            char *street_clean = sanitize_ascii(job->cover_street);
+            const char *street_text = street_clean ? street_clean : job->cover_street;
+            if (!buffer_appendf(&cover_buf, "%s", street_text)) {
+                cover_ok = 0;
+            }
+            free(street_clean);
+        }
+
+        bool have_city = job->cover_city && job->cover_city[0];
+        bool have_state = job->cover_state && job->cover_state[0];
+        bool have_zip = job->cover_zip && job->cover_zip[0];
+        if (cover_ok && (have_city || have_state || have_zip)) {
+            if (cover_buf.length > 0) {
+                if (!buffer_append_char(&cover_buf, '\n')) {
+                    cover_ok = 0;
+                }
+            }
+            bool wrote_any = false;
+            if (cover_ok && have_city) {
+                char *city_clean = sanitize_ascii(job->cover_city);
+                const char *city_text = city_clean ? city_clean : job->cover_city;
+                if (!buffer_appendf(&cover_buf, "%s", city_text)) {
+                    cover_ok = 0;
+                }
+                free(city_clean);
+                wrote_any = cover_ok ? true : wrote_any;
+            }
+            if (cover_ok && have_state) {
+                if (wrote_any) {
+                    if (!buffer_append_cstr(&cover_buf, ", ")) {
+                        cover_ok = 0;
+                    }
+                }
+                if (cover_ok) {
+                    char *state_clean = sanitize_ascii(job->cover_state);
+                    const char *state_text = state_clean ? state_clean : job->cover_state;
+                    if (!buffer_appendf(&cover_buf, "%s", state_text)) {
+                        cover_ok = 0;
+                    }
+                    free(state_clean);
+                }
+                wrote_any = cover_ok ? true : wrote_any;
+            }
+            if (cover_ok && have_zip) {
+                if (wrote_any) {
+                    if (!buffer_append_char(&cover_buf, ' ')) {
+                        cover_ok = 0;
+                    }
+                }
+                if (cover_ok) {
+                    char *zip_clean = sanitize_ascii(job->cover_zip);
+                    const char *zip_text = zip_clean ? zip_clean : job->cover_zip;
+                    if (!buffer_appendf(&cover_buf, "%s", zip_text)) {
+                        cover_ok = 0;
+                    }
+                    free(zip_clean);
+                }
+            }
+        }
+
+        if (!cover_ok) {
+            buffer_free(&cover_buf);
+            goto cleanup;
+        }
+        cover_address_plain = cover_buf.data;
+        cover_buf.data = NULL;
+        buffer_free(&cover_buf);
+    }
+
     client_name_env = trim_copy(getenv("REPORT_CLIENT_NAME"));
-    const char *client_name_src = (client_name_env && client_name_env[0]) ? client_name_env : owner_text;
+    const char *client_name_src = NULL;
+    if (job->cover_building_owner && job->cover_building_owner[0]) {
+        client_name_src = job->cover_building_owner;
+    } else if (client_name_env && client_name_env[0]) {
+        client_name_src = client_name_env;
+    } else {
+        client_name_src = owner_text;
+    }
     char *client_name_clean = sanitize_ascii(client_name_src);
     const char *client_name_text = client_name_clean ? client_name_clean : client_name_src;
     client_name_tex = latex_escape(client_name_text);
@@ -5765,7 +5886,14 @@ static int build_report_latex(const ReportData *report,
     if (!client_name_tex) goto cleanup;
 
     client_address_env = trim_copy(getenv("REPORT_CLIENT_ADDRESS"));
-    const char *client_address_src = (client_address_env && client_address_env[0]) ? client_address_env : address_text;
+    const char *client_address_src = NULL;
+    if (cover_address_plain && cover_address_plain[0]) {
+        client_address_src = cover_address_plain;
+    } else if (client_address_env && client_address_env[0]) {
+        client_address_src = client_address_env;
+    } else {
+        client_address_src = address_text;
+    }
     char *client_address_clean = sanitize_ascii(client_address_src);
     const char *client_address_text = client_address_clean ? client_address_clean : client_address_src;
     client_address_tex = latex_escape(client_address_text);
@@ -5774,7 +5902,14 @@ static int build_report_latex(const ReportData *report,
 
     contact_name_env = trim_copy(getenv("REPORT_CONTACT_NAME"));
     const char *default_contact = (contractor_text && contractor_text[0]) ? contractor_text : "Citywide Elevator Consulting";
-    const char *contact_name_src = (contact_name_env && contact_name_env[0]) ? contact_name_env : default_contact;
+    const char *contact_name_src = NULL;
+    if (job->cover_contact_name && job->cover_contact_name[0]) {
+        contact_name_src = job->cover_contact_name;
+    } else if (contact_name_env && contact_name_env[0]) {
+        contact_name_src = contact_name_env;
+    } else {
+        contact_name_src = default_contact;
+    }
     char *contact_name_clean = sanitize_ascii(contact_name_src);
     const char *contact_name_text = contact_name_clean ? contact_name_clean : contact_name_src;
     contact_name_tex = latex_escape(contact_name_text);
@@ -5782,14 +5917,25 @@ static int build_report_latex(const ReportData *report,
     if (!contact_name_tex) goto cleanup;
 
     contact_email_env = trim_copy(getenv("REPORT_CONTACT_EMAIL"));
-    const char *contact_email_src = (contact_email_env && contact_email_env[0]) ? contact_email_env : "support@citywideportal.io";
+    const char *contact_email_src = NULL;
+    if (job->cover_contact_email && job->cover_contact_email[0]) {
+        contact_email_src = job->cover_contact_email;
+    } else if (contact_email_env && contact_email_env[0]) {
+        contact_email_src = contact_email_env;
+    } else {
+        contact_email_src = "support@citywideportal.io";
+    }
     char *contact_email_clean = sanitize_ascii(contact_email_src);
     const char *contact_email_text = contact_email_clean ? contact_email_clean : contact_email_src;
     contact_email_tex = latex_escape(contact_email_text);
     free(contact_email_clean);
     if (!contact_email_tex) goto cleanup;
 
-    asset_location_tex = strdup(address_tex);
+    const char *asset_location_src = (cover_address_plain && cover_address_plain[0]) ? cover_address_plain : address_text;
+    char *asset_location_clean = sanitize_ascii(asset_location_src);
+    const char *asset_location_text = asset_location_clean ? asset_location_clean : asset_location_src;
+    asset_location_tex = latex_escape(asset_location_text);
+    free(asset_location_clean);
     if (!asset_location_tex) goto cleanup;
 
     if (!buffer_append_cstr(&buf,
@@ -5972,6 +6118,7 @@ cleanup:
     free(contact_email_env);
     free(contact_email_tex);
     free(asset_location_tex);
+    free(cover_address_plain);
     buffer_free(&buf);
     if (!success && error_out && !*error_out) {
         *error_out = strdup("Failed to build LaTeX report");
@@ -6168,23 +6315,88 @@ static void handle_client(int client_fd, void *ctx) {
                     }
                 }
 
+                char *cover_owner_value = NULL;
+                char *cover_street_value = NULL;
+                char *cover_city_value = NULL;
+                char *cover_state_value = NULL;
+                char *cover_zip_value = NULL;
+                char *cover_contact_name_value = NULL;
+                char *cover_contact_email_value = NULL;
+
+                const struct {
+                    const char *key;
+                    char **target;
+                } cover_fields[] = {
+                    {"cover_building_owner", &cover_owner_value},
+                    {"cover_street", &cover_street_value},
+                    {"cover_city", &cover_city_value},
+                    {"cover_state", &cover_state_value},
+                    {"cover_zip", &cover_zip_value},
+                    {"cover_contact_name", &cover_contact_name_value},
+                    {"cover_contact_email", &cover_contact_email_value}
+                };
+
+                for (size_t i = 0; i < sizeof(cover_fields) / sizeof(cover_fields[0]); ++i) {
+                    JsonValue *field_val = json_object_get(root, cover_fields[i].key);
+                    const char *raw = json_as_string(field_val);
+                    if (!raw) {
+                        continue;
+                    }
+                    char *trimmed = trim_copy(raw);
+                    if (!trimmed || trimmed[0] == '\0') {
+                        free(trimmed);
+                        continue;
+                    }
+                    *cover_fields[i].target = trimmed;
+                }
+
+                bool has_cover_overrides =
+                    (cover_owner_value && cover_owner_value[0]) ||
+                    (cover_street_value && cover_street_value[0]) ||
+                    (cover_city_value && cover_city_value[0]) ||
+                    (cover_state_value && cover_state_value[0]) ||
+                    (cover_zip_value && cover_zip_value[0]) ||
+                    (cover_contact_name_value && cover_contact_name_value[0]) ||
+                    (cover_contact_email_value && cover_contact_email_value[0]);
+
                 json_free(root);
                 free(parse_error);
                 free(body_json);
+
+                ReportJob request;
+                report_job_init(&request);
+                request.address = address_value;
+                address_value = NULL;
+                request.notes = notes_value;
+                notes_value = NULL;
+                request.recommendations = recs_value;
+                recs_value = NULL;
+                request.cover_building_owner = cover_owner_value;
+                cover_owner_value = NULL;
+                request.cover_street = cover_street_value;
+                cover_street_value = NULL;
+                request.cover_city = cover_city_value;
+                cover_city_value = NULL;
+                request.cover_state = cover_state_value;
+                cover_state_value = NULL;
+                request.cover_zip = cover_zip_value;
+                cover_zip_value = NULL;
+                request.cover_contact_name = cover_contact_name_value;
+                cover_contact_name_value = NULL;
+                request.cover_contact_email = cover_contact_email_value;
+                cover_contact_email_value = NULL;
 
                 char *existing_job_id = NULL;
                 char *existing_status = NULL;
                 char *existing_output_path = NULL;
                 char *lookup_error = NULL;
-                int existing = db_find_existing_report_job(conn, address_value, &existing_job_id, &existing_status, &existing_output_path, &lookup_error);
+                int existing = db_find_existing_report_job(conn, request.address, &existing_job_id, &existing_status, &existing_output_path, &lookup_error);
                 if (existing < 0) {
                     char *body = build_error_response(lookup_error ? lookup_error : "Failed to check existing reports");
                     send_http_json(client_fd, 500, "Internal Server Error", body);
                     free(body);
                     free(lookup_error);
-                    free(address_value);
-                    free(notes_value);
-                    free(recs_value);
+                    report_job_clear(&request);
                     return;
                 }
                 free(lookup_error);
@@ -6200,21 +6412,23 @@ static void handle_client(int client_fd, void *ctx) {
                     }
                 }
 
+                if (has_cover_overrides) {
+                    reuse_job = false;
+                }
+
                 if (reuse_job) {
                     char *download_url = artifact_ready ? build_download_url(existing_job_id) : NULL;
                     int http_status = artifact_ready ? 200 : 202;
                     send_report_job_response(client_fd, http_status,
                                              existing_status ? existing_status : (artifact_ready ? "completed" : "queued"),
                                              existing_job_id,
-                                             address_value,
+                                             request.address,
                                              download_url);
                     free(download_url);
                     free(existing_job_id);
                     free(existing_status);
                     free(existing_output_path);
-                    free(address_value);
-                    free(notes_value);
-                    free(recs_value);
+                    report_job_clear(&request);
                     return;
                 }
 
@@ -6224,9 +6438,7 @@ static void handle_client(int client_fd, void *ctx) {
 
                 char job_id[37];
                 if (!generate_uuid_v4(job_id)) {
-                    free(address_value);
-                    free(notes_value);
-                    free(recs_value);
+                    report_job_clear(&request);
                     char *body = build_error_response("Failed to create job id");
                     send_http_json(client_fd, 500, "Internal Server Error", body);
                     free(body);
@@ -6234,22 +6446,18 @@ static void handle_client(int client_fd, void *ctx) {
                 }
 
                 char *insert_error = NULL;
-                if (!db_insert_report_job(conn, job_id, address_value, notes_value, recs_value, &insert_error)) {
+                if (!db_insert_report_job(conn, job_id, &request, &insert_error)) {
                     char *body = build_error_response(insert_error ? insert_error : "Failed to create report job");
                     send_http_json(client_fd, 500, "Internal Server Error", body);
                     free(body);
                     free(insert_error);
-                    free(address_value);
-                    free(notes_value);
-                    free(recs_value);
+                    report_job_clear(&request);
                     return;
                 }
                 free(insert_error);
-                free(notes_value);
-                free(recs_value);
 
-                send_report_job_response(client_fd, 202, "queued", job_id, address_value, NULL);
-                free(address_value);
+                send_report_job_response(client_fd, 202, "queued", job_id, request.address, NULL);
+                report_job_clear(&request);
                 signal_report_worker();
                 return;
             }

@@ -182,6 +182,19 @@ export interface LocationDetail {
   devices: LocationDevice[];
 }
 
+export interface ReportJobCreateRequest {
+  address: string;
+  notes?: string;
+  recommendations?: string;
+  coverBuildingOwner?: string;
+  coverStreet?: string;
+  coverCity?: string;
+  coverState?: string;
+  coverZip?: string;
+  coverContactName?: string;
+  coverContactEmail?: string;
+}
+
 export interface ReportJobCreateResponse {
   status: string;
   job_id: string;

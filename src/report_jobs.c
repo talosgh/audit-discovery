@@ -15,6 +15,13 @@ void report_job_init(ReportJob *job) {
     job->address = NULL;
     job->notes = NULL;
     job->recommendations = NULL;
+    job->cover_building_owner = NULL;
+    job->cover_street = NULL;
+    job->cover_city = NULL;
+    job->cover_state = NULL;
+    job->cover_zip = NULL;
+    job->cover_contact_name = NULL;
+    job->cover_contact_email = NULL;
 }
 
 void report_job_clear(ReportJob *job) {
@@ -24,24 +31,51 @@ void report_job_clear(ReportJob *job) {
     free(job->address);
     free(job->notes);
     free(job->recommendations);
+    free(job->cover_building_owner);
+    free(job->cover_street);
+    free(job->cover_city);
+    free(job->cover_state);
+    free(job->cover_zip);
+    free(job->cover_contact_name);
+    free(job->cover_contact_email);
     job->address = NULL;
     job->notes = NULL;
     job->recommendations = NULL;
+    job->cover_building_owner = NULL;
+    job->cover_street = NULL;
+    job->cover_city = NULL;
+    job->cover_state = NULL;
+    job->cover_zip = NULL;
+    job->cover_contact_name = NULL;
+    job->cover_contact_email = NULL;
     job->job_id[0] = '\0';
 }
 
-int db_insert_report_job(PGconn *conn, const char *job_id, const char *address, const char *notes, const char *recs, char **error_out) {
-    if (!conn || !job_id || !address || address[0] == '\0') {
+int db_insert_report_job(PGconn *conn, const char *job_id, const ReportJob *job, char **error_out) {
+    if (!conn || !job_id || !job || !job->address || job->address[0] == '\0') {
         if (error_out && !*error_out) {
             *error_out = strdup("Invalid report job parameters");
         }
         return 0;
     }
     const char *sql =
-        "INSERT INTO report_jobs (job_id, address, notes, recommendations) "
-        "VALUES ($1::uuid, $2, $3, $4)";
-    const char *params[4] = { job_id, address, notes, recs };
-    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, NULL, NULL, 0);
+        "INSERT INTO report_jobs (job_id, address, notes, recommendations, "
+        "cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email) "
+        "VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
+    const char *params[11] = {
+        job_id,
+        job->address,
+        job->notes,
+        job->recommendations,
+        job->cover_building_owner,
+        job->cover_street,
+        job->cover_city,
+        job->cover_state,
+        job->cover_zip,
+        job->cover_contact_name,
+        job->cover_contact_email
+    };
+    PGresult *res = PQexecParams(conn, sql, 11, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(res);
@@ -63,7 +97,8 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
     }
     const char *sql =
         "WITH job AS ("
-        "    SELECT id, job_id::text AS job_id_text, address, notes, recommendations "
+        "    SELECT id, job_id::text AS job_id_text, address, notes, recommendations, "
+        "           cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email "
         "    FROM report_jobs "
         "    WHERE status = 'queued' "
         "    ORDER BY created_at "
@@ -74,7 +109,8 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
         "SET status = 'processing', started_at = COALESCE(r.started_at, NOW()), updated_at = NOW() "
         "FROM job "
         "WHERE r.id = job.id "
-        "RETURNING job.job_id_text, job.address, job.notes, job.recommendations";
+        "RETURNING job.job_id_text, job.address, job.notes, job.recommendations, "
+        "          job.cover_building_owner, job.cover_street, job.cover_city, job.cover_state, job.cover_zip, job.cover_contact_name, job.cover_contact_email";
     PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
@@ -128,6 +164,76 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
             PQclear(res);
             if (error_out && !*error_out) {
                 *error_out = strdup("Out of memory copying recommendations");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 4)) {
+        job->cover_building_owner = strdup(PQgetvalue(res, 0, 4));
+        if (!job->cover_building_owner) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying cover owner");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 5)) {
+        job->cover_street = strdup(PQgetvalue(res, 0, 5));
+        if (!job->cover_street) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying cover street");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 6)) {
+        job->cover_city = strdup(PQgetvalue(res, 0, 6));
+        if (!job->cover_city) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying cover city");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 7)) {
+        job->cover_state = strdup(PQgetvalue(res, 0, 7));
+        if (!job->cover_state) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying cover state");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 8)) {
+        job->cover_zip = strdup(PQgetvalue(res, 0, 8));
+        if (!job->cover_zip) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying cover zip");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 9)) {
+        job->cover_contact_name = strdup(PQgetvalue(res, 0, 9));
+        if (!job->cover_contact_name) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying cover contact name");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 10)) {
+        job->cover_contact_email = strdup(PQgetvalue(res, 0, 10));
+        if (!job->cover_contact_email) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying cover contact email");
             }
             return -1;
         }

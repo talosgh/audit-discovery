@@ -3,6 +3,7 @@ import type {
   AuditSummary,
   LocationDetail,
   LocationSummary,
+  ReportJobCreateRequest,
   ReportJobCreateResponse,
   ReportJobStatus
 } from './types';
@@ -61,13 +62,57 @@ export function fetchLocationDetail(address: string): Promise<LocationDetail> {
   return fetchJSON<LocationDetail>(`/locations?${query}`);
 }
 
-export async function createReportJob(address: string, notes?: string, recommendations?: string): Promise<ReportJobCreateResponse> {
-  const payload: Record<string, unknown> = { address };
-  if (notes && notes.trim().length > 0) {
-    payload.notes = notes.trim();
+export async function createReportJob(request: ReportJobCreateRequest): Promise<ReportJobCreateResponse> {
+  const trimmedAddress = request.address?.trim() ?? '';
+  if (!trimmedAddress) {
+    throw new Error('Address is required');
   }
-  if (recommendations && recommendations.trim().length > 0) {
-    payload.recommendations = recommendations.trim();
+
+  const payload: Record<string, unknown> = { address: trimmedAddress };
+
+  const trimmedNotes = request.notes?.trim();
+  if (trimmedNotes) {
+    payload.notes = trimmedNotes;
+  }
+
+  const trimmedRecommendations = request.recommendations?.trim();
+  if (trimmedRecommendations) {
+    payload.recommendations = trimmedRecommendations;
+  }
+
+  const owner = request.coverBuildingOwner?.trim();
+  if (owner) {
+    payload.cover_building_owner = owner;
+  }
+
+  const street = request.coverStreet?.trim();
+  if (street) {
+    payload.cover_street = street;
+  }
+
+  const city = request.coverCity?.trim();
+  if (city) {
+    payload.cover_city = city;
+  }
+
+  const state = request.coverState?.trim();
+  if (state) {
+    payload.cover_state = state;
+  }
+
+  const zip = request.coverZip?.trim();
+  if (zip) {
+    payload.cover_zip = zip;
+  }
+
+  const contactName = request.coverContactName?.trim();
+  if (contactName) {
+    payload.cover_contact_name = contactName;
+  }
+
+  const contactEmail = request.coverContactEmail?.trim();
+  if (contactEmail) {
+    payload.cover_contact_email = contactEmail;
   }
 
   const response = await fetch(buildUrl('/reports'), {

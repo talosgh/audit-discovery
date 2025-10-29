@@ -18,7 +18,17 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [isGenerating, setIsGenerating] = createSignal(false);
   const [jobId, setJobId] = createSignal<string | null>(null);
   const [jobStatus, setJobStatus] = createSignal<ReportJobStatus | null>(null);
+  const [showReportModal, setShowReportModal] = createSignal(false);
+  const [coverOwner, setCoverOwner] = createSignal('');
+  const [coverStreet, setCoverStreet] = createSignal('');
+  const [coverCity, setCoverCity] = createSignal('');
+  const [coverState, setCoverState] = createSignal('');
+  const [coverZip, setCoverZip] = createSignal('');
+  const [coverContactName, setCoverContactName] = createSignal('');
+  const [coverContactEmail, setCoverContactEmail] = createSignal('');
+  const [formError, setFormError] = createSignal<string | null>(null);
   const [detail, { refetch }] = createResource<LocationDetailType, string>(() => props.address, fetchLocationDetail);
+  let ownerInputRef: HTMLInputElement | undefined;
 
   const summary = createMemo(() => detail()?.summary);
   const devices = createMemo(() => detail()?.devices ?? []);
@@ -82,23 +92,131 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setIsGenerating(false);
     setMessage(null);
     setErrorMessage(null);
+    setShowReportModal(false);
+    setFormError(null);
+    setCoverOwner('');
+    setCoverStreet('');
+    setCoverCity('');
+    setCoverState('');
+    setCoverZip('');
+    setCoverContactName('');
+    setCoverContactEmail('');
   });
 
-  const handleGenerateReport = async () => {
+  createEffect(() => {
+    if (!showReportModal()) {
+      return;
+    }
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !isGenerating()) {
+        setFormError(null);
+        setShowReportModal(false);
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    onCleanup(() => window.removeEventListener('keydown', handleKey));
+  });
+
+  createEffect(() => {
+    if (!showReportModal()) {
+      return;
+    }
+    requestAnimationFrame(() => {
+      if (showReportModal()) {
+        ownerInputRef?.focus();
+        ownerInputRef?.select();
+      }
+    });
+  });
+
+  const openReportModal = () => {
+    if (isGenerating()) {
+      return;
+    }
+    setMessage(null);
+    setErrorMessage(null);
+    setFormError(null);
+    const ownerSuggestion = summary()?.building_owner ?? '';
+    if (!coverOwner() && ownerSuggestion) {
+      setCoverOwner(ownerSuggestion);
+    }
+    const addressSuggestion = summary()?.address ?? '';
+    if (!coverStreet() && addressSuggestion) {
+      setCoverStreet(addressSuggestion);
+    }
+    setShowReportModal(true);
+  };
+
+  const closeReportModal = () => {
+    if (isGenerating()) {
+      return;
+    }
+    setShowReportModal(false);
+    setFormError(null);
+  };
+
+  const handleSubmitReportForm = async (event: SubmitEvent) => {
+    event.preventDefault();
+    if (isGenerating()) {
+      return;
+    }
+    setFormError(null);
+
+    const owner = coverOwner().trim();
+    const street = coverStreet().trim();
+    const city = coverCity().trim();
+    const state = coverState().trim();
+    const zip = coverZip().trim();
+    const contactName = coverContactName().trim();
+    const contactEmail = coverContactEmail().trim();
+
+    if (!owner || !street || !city || !state || !zip || !contactName || !contactEmail) {
+      setFormError('Please complete all cover page fields.');
+      return;
+    }
+
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailPattern.test(contactEmail)) {
+      setFormError('Please provide a valid contact email address.');
+      return;
+    }
+
+    setCoverOwner(owner);
+    setCoverStreet(street);
+    setCoverCity(city);
+    setCoverState(state);
+    setCoverZip(zip);
+    setCoverContactName(contactName);
+    setCoverContactEmail(contactEmail);
+
     setMessage(null);
     setErrorMessage(null);
     setJobStatus(null);
+    setJobId(null);
     stopPolling();
+
     try {
       setIsGenerating(true);
-      const response = await createReportJob(props.address);
+      const response = await createReportJob({
+        address: props.address,
+        coverBuildingOwner: owner,
+        coverStreet: street,
+        coverCity: city,
+        coverState: state,
+        coverZip: zip,
+        coverContactName: contactName,
+        coverContactEmail: contactEmail
+      });
       setJobId(response.job_id);
       setMessage('Report request queued. We will notify when it is ready.');
+      setShowReportModal(false);
+      setFormError(null);
       startPolling(response.job_id);
     } catch (error) {
       setIsGenerating(false);
       const message = error instanceof Error ? error.message : 'Failed to queue report';
       setErrorMessage(message);
+      setFormError(message);
     }
   };
 
@@ -171,7 +289,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
             type="button"
             class="action-button"
             disabled={isGenerating()}
-            onClick={handleGenerateReport}
+            onClick={openReportModal}
           >
             {isGenerating() ? 'Generating…' : 'Generate Report'}
           </button>
@@ -319,6 +437,109 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
           </div>
         </Match>
       </Switch>
+      <Show when={showReportModal()}>
+        <div
+          class="report-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="report-modal-title"
+          onClick={closeReportModal}
+        >
+          <div class="report-modal-content" role="document" onClick={(event) => event.stopPropagation()}>
+            <header class="report-modal-header">
+              <h2 id="report-modal-title">Generate Report</h2>
+              <p>Provide the cover page information for this location&apos;s report.</p>
+            </header>
+            <form class="report-modal-form" noValidate onSubmit={handleSubmitReportForm}>
+              <div class="report-modal-grid">
+                <label class="modal-field">
+                  <span>Building Owner</span>
+                  <input
+                    ref={ownerInputRef}
+                    type="text"
+                    value={coverOwner()}
+                    onInput={(event) => setCoverOwner(event.currentTarget.value)}
+                    autoComplete="organization"
+                    required
+                  />
+                </label>
+                <label class="modal-field">
+                  <span>Street Address</span>
+                  <input
+                    type="text"
+                    value={coverStreet()}
+                    onInput={(event) => setCoverStreet(event.currentTarget.value)}
+                    autoComplete="address-line1"
+                    required
+                  />
+                </label>
+                <label class="modal-field">
+                  <span>City</span>
+                  <input
+                    type="text"
+                    value={coverCity()}
+                    onInput={(event) => setCoverCity(event.currentTarget.value)}
+                    autoComplete="address-level2"
+                    required
+                  />
+                </label>
+                <label class="modal-field">
+                  <span>State</span>
+                  <input
+                    type="text"
+                    value={coverState()}
+                    onInput={(event) => setCoverState(event.currentTarget.value)}
+                    autoComplete="address-level1"
+                    maxLength={64}
+                    required
+                  />
+                </label>
+                <label class="modal-field">
+                  <span>ZIP Code</span>
+                  <input
+                    type="text"
+                    value={coverZip()}
+                    onInput={(event) => setCoverZip(event.currentTarget.value)}
+                    autoComplete="postal-code"
+                    required
+                  />
+                </label>
+                <label class="modal-field">
+                  <span>Contact Name</span>
+                  <input
+                    type="text"
+                    value={coverContactName()}
+                    onInput={(event) => setCoverContactName(event.currentTarget.value)}
+                    autoComplete="name"
+                    required
+                  />
+                </label>
+                <label class="modal-field">
+                  <span>Contact Email</span>
+                  <input
+                    type="email"
+                    value={coverContactEmail()}
+                    onInput={(event) => setCoverContactEmail(event.currentTarget.value)}
+                    autoComplete="email"
+                    required
+                  />
+                </label>
+              </div>
+              <Show when={formError()}>
+                {(msg) => <p class="modal-error" role="alert">{msg()}</p>}
+              </Show>
+              <div class="report-modal-actions">
+                <button type="button" class="modal-button" onClick={closeReportModal} disabled={isGenerating()}>
+                  Cancel
+                </button>
+                <button type="submit" class="action-button" disabled={isGenerating()}>
+                  {isGenerating() ? 'Submitting…' : 'Queue Report'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      </Show>
     </section>
   );
 };

@@ -8,12 +8,19 @@ typedef struct {
     char *address;
     char *notes;
     char *recommendations;
+    char *cover_building_owner;
+    char *cover_street;
+    char *cover_city;
+    char *cover_state;
+    char *cover_zip;
+    char *cover_contact_name;
+    char *cover_contact_email;
 } ReportJob;
 
 void report_job_init(ReportJob *job);
 void report_job_clear(ReportJob *job);
 
-int db_insert_report_job(PGconn *conn, const char *job_id, const char *address, const char *notes, const char *recs, char **error_out);
+int db_insert_report_job(PGconn *conn, const char *job_id, const ReportJob *job, char **error_out);
 int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out);
 int db_complete_report_job(PGconn *conn, const char *job_id, const char *status, const char *error_text, const char *output_path, char **error_out);
 char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *path_prefix, char **error_out);
