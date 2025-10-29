@@ -5814,7 +5814,9 @@ static int build_report_latex(const ReportData *report,
         "\\geometry{a4paper, left=0.5in, right=0.5in, top=1in, bottom=1in}\n"
         "\\setlength{\\headheight}{26pt}\n"
         "\\pgfplotsset{compat=1.18}\n"
-        "\\graphicspath{{.}{./assets/}}\n")) goto cleanup;
+        "\\graphicspath{{./}{./assets/}}\n"
+        "\\usepgfplotslibrary{colorbrewer}\n"
+        "\\definecolor{tabblue}{RGB}{31,119,180}\n")) goto cleanup;
 
     if (!buffer_append_cstr(&buf, "\\newcommand{\\clientname}{")) goto cleanup;
     if (!buffer_appendf(&buf, "%s", client_name_tex)) goto cleanup;
