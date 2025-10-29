@@ -86,7 +86,8 @@ const App = () => {
     <div class="app-shell">
       <header class="app-header">
         <button type="button" class="brand" onClick={navigateToList}>
-          Audit Discovery
+          <img src="/square.png" alt="Citywide logo" />
+          <span>Citywide Audit Services</span>
         </button>
         <nav class="nav-links">
           <button type="button" class={!selectedLocation() && !selectedAudit() ? 'active' : ''} onClick={navigateToList}>

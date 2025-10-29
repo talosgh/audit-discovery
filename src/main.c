@@ -191,6 +191,7 @@ typedef struct {
     ReportDeficiencyList deficiencies;
     const char *docstring;
     const char *deficiencies_docstring;
+    char *narrative;
 } ReportDevice;
 
 typedef struct {
@@ -440,6 +441,15 @@ static char *sanitize_path_component(const char *input);
 static int copy_file_contents(const char *src_path, const char *dst_path);
 static int create_report_archive(PGconn *conn, const ReportJob *job, const ReportData *report,
                                  const char *job_dir, const char *pdf_path, char **zip_path_out, char **error_out);
+static const char *determine_consultant_type(const ReportSummary *summary);
+static char *build_device_system_prompt(const char *consultant_type);
+static char *build_device_prompt(const ReportData *report, const ReportDevice *device, const ReportJob *job, const char *consultant_type);
+static char *build_device_narrative_fallback(const ReportDevice *device);
+typedef enum {
+    NARRATIVE_TASK_SECTION,
+    NARRATIVE_TASK_DEVICE
+} NarrativeTaskKind;
+
 typedef struct {
     const char *system_prompt;
     char *prompt;
@@ -448,6 +458,9 @@ typedef struct {
     int success;
     pthread_t thread;
     bool thread_started;
+    NarrativeTaskKind kind;
+    ReportDevice *device;
+    char *system_prompt_owned;
 } NarrativeTask;
 
 static void narrative_task_execute(NarrativeTask *task);
@@ -974,6 +987,324 @@ static int buffer_append_string_array(Buffer *buf, const StringArray *array) {
     }
     if (!buffer_append_char(buf, ']')) return 0;
     return 1;
+}
+
+static const char *determine_consultant_type(const ReportSummary *summary) {
+    if (!summary) {
+        return "elevator safety consultant";
+    }
+    bool has_elevators = summary->elevator_count > 0;
+    bool has_escalators = summary->escalator_count > 0;
+    if (has_elevators && has_escalators) {
+        return "vertical transportation safety consultant";
+    }
+    if (has_escalators) {
+        return "escalator safety consultant";
+    }
+    return "elevator safety consultant";
+}
+
+static char *build_device_system_prompt(const char *consultant_type) {
+    const char *type = consultant_type ? consultant_type : "elevator safety consultant";
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        return NULL;
+    }
+    if (!buffer_appendf(&buf,
+        "You are a %s. Write clear, specific narrative text about this device. NEVER mention building location, address, or property names. Focus only on the technical condition and maintenance issues of the specific device.",
+        type)) {
+        buffer_free(&buf);
+        return NULL;
+    }
+    char *prompt = buf.data;
+    buf.data = NULL;
+    buffer_free(&buf);
+    return prompt;
+}
+
+static char *to_upper_ascii(const char *text) {
+    if (!text) {
+        return NULL;
+    }
+    size_t len = strlen(text);
+    char *out = malloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+    for (size_t i = 0; i < len; ++i) {
+        out[i] = (char)toupper((unsigned char)text[i]);
+    }
+    out[len] = '\0';
+    return out;
+}
+
+static int append_prompt_line(Buffer *buf, const char *label, const char *value) {
+    if (!value || !value[0]) {
+        return 1;
+    }
+    char *clean = sanitize_ascii(value);
+    const char *text = clean ? clean : value;
+    int ok = buffer_appendf(buf, "- %s: %s\n", label, text);
+    free(clean);
+    return ok;
+}
+
+static int append_prompt_optional_int(Buffer *buf, const char *label, const OptionalInt *opt) {
+    char temp[32];
+    const char *text = optional_int_to_text(opt, temp, sizeof(temp));
+    if (!text || strcmp(text, "—") == 0) {
+        return 1;
+    }
+    return buffer_appendf(buf, "- %s: %s\n", label, text);
+}
+
+static int append_prompt_optional_bool(Buffer *buf, const char *label, const OptionalBool *opt) {
+    const char *text = optional_bool_to_text(opt);
+    if (!text || strcmp(text, "—") == 0) {
+        return 1;
+    }
+    return buffer_appendf(buf, "- %s: %s\n", label, text);
+}
+
+static char *build_device_prompt(const ReportData *report, const ReportDevice *device, const ReportJob *job, const char *consultant_type) {
+    if (!report || !device) {
+        return NULL;
+    }
+    const char *device_type_raw = device->device_type ? device->device_type : "Device";
+    char *device_type_ascii = sanitize_ascii(device_type_raw);
+    const char *device_type_text = device_type_ascii ? device_type_ascii : device_type_raw;
+    char *device_type_case = normalize_caps_if_all_upper(device_type_text);
+    const char *device_type_display = device_type_case ? device_type_case : device_type_text;
+
+    const char *device_id_raw = device->device_id ? device->device_id : (device->submission_id ? device->submission_id : "Device");
+    char *device_id_ascii = sanitize_ascii(device_id_raw);
+    const char *device_id_display = device_id_ascii ? device_id_ascii : device_id_raw;
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        free(device_type_ascii);
+        free(device_type_case);
+        free(device_id_ascii);
+        return NULL;
+    }
+
+    const char *consultant_text = consultant_type ? consultant_type : "elevator safety consultant";
+    if (!buffer_appendf(&buf, "Analyze the condition of %s %s ONLY using your expertise as a %s:\n\n",
+                        device_type_display, device_id_display, consultant_text)) {
+        goto fail;
+    }
+
+    if (!buffer_append_cstr(&buf, "Device Summary:\n")) {
+        goto fail;
+    }
+
+    if (!append_prompt_line(&buf, "Device type", device_type_display)) goto fail;
+    if (!append_prompt_line(&buf, "Bank", device->bank_name)) goto fail;
+    if (!append_prompt_line(&buf, "City ID", device->city_id)) goto fail;
+    if (!append_prompt_line(&buf, "Controller manufacturer", device->controller_manufacturer)) goto fail;
+    if (!append_prompt_line(&buf, "Controller model", device->controller_model)) goto fail;
+    if (!append_prompt_line(&buf, "Controller type", device->controller_type)) goto fail;
+    if (!append_prompt_line(&buf, "Controller power system", device->controller_power_system)) goto fail;
+    if (!append_prompt_line(&buf, "Machine manufacturer", device->machine_manufacturer)) goto fail;
+    if (!append_prompt_line(&buf, "Machine type", device->machine_type)) goto fail;
+    if (!append_prompt_line(&buf, "Roping", device->roping)) goto fail;
+    if (!append_prompt_line(&buf, "Door operation", device->door_operation)) goto fail;
+    if (!append_prompt_line(&buf, "Door operation type", device->door_operation_type)) goto fail;
+    if (!append_prompt_line(&buf, "Submitted", device->submitted_on_iso)) goto fail;
+
+    if (!append_prompt_optional_int(&buf, "Controller installation year", &device->metrics.controller_install_year)) goto fail;
+    if (!append_prompt_optional_int(&buf, "Controller age", &device->metrics.controller_age)) goto fail;
+    if (!append_prompt_optional_int(&buf, "Capacity", &device->metrics.capacity)) goto fail;
+    if (!append_prompt_optional_int(&buf, "Car speed", &device->metrics.car_speed)) goto fail;
+    if (!append_prompt_optional_int(&buf, "Number of stops", &device->metrics.number_of_stops)) goto fail;
+    if (!append_prompt_optional_int(&buf, "Code data year", &device->metrics.code_data_year)) goto fail;
+    if (!append_prompt_optional_int(&buf, "Ride quality score", &device->metrics.ride_quality)) goto fail;
+
+    if (device->metrics.door_opening_width.has_value) {
+        if (!buffer_appendf(&buf, "- Door opening width: %.2f\n", device->metrics.door_opening_width.value)) goto fail;
+    }
+
+    if (!append_prompt_optional_bool(&buf, "Door lock monitoring compliant", &device->metrics.dlm_compliant)) goto fail;
+    if (!append_prompt_optional_bool(&buf, "Maintenance log up to date", &device->metrics.maintenance_log_up_to_date)) goto fail;
+    if (!append_prompt_optional_bool(&buf, "Cat 1 tag current", &device->metrics.cat1_tag_current)) goto fail;
+    if (!append_prompt_optional_bool(&buf, "Cat 5 tag current", &device->metrics.cat5_tag_current)) goto fail;
+    if (!append_prompt_optional_bool(&buf, "Code data plate present", &device->metrics.code_data_plate_present)) goto fail;
+    if (!append_prompt_optional_bool(&buf, "Is first car", &device->metrics.is_first_car)) goto fail;
+
+    char *cars = string_array_join(&device->cars_in_bank, ", ");
+    if (cars) {
+        char *cars_clean = sanitize_ascii(cars);
+        const char *cars_text = cars_clean ? cars_clean : cars;
+        if (!buffer_appendf(&buf, "- Cars in bank: %s\n", cars_text)) {
+            free(cars_clean);
+            free(cars);
+            goto fail;
+        }
+        free(cars_clean);
+        free(cars);
+    }
+
+    char *floors = string_array_join(&device->floors_served, ", ");
+    if (floors) {
+        char *floors_clean = sanitize_ascii(floors);
+        const char *floors_text = floors_clean ? floors_clean : floors;
+        if (!buffer_appendf(&buf, "- Floors served: %s\n", floors_text)) {
+            free(floors_clean);
+            free(floors);
+            goto fail;
+        }
+        free(floors_clean);
+        free(floors);
+    }
+
+    char *stops = string_array_join(&device->total_floor_stop_names, ", ");
+    if (stops) {
+        char *stops_clean = sanitize_ascii(stops);
+        const char *stops_text = stops_clean ? stops_clean : stops;
+        if (!buffer_appendf(&buf, "- Total floor stop names: %s\n", stops_text)) {
+            free(stops_clean);
+            free(stops);
+            goto fail;
+        }
+        free(stops_clean);
+        free(stops);
+    }
+
+    if (!buffer_append_cstr(&buf, "\nDeficiencies Found:\n")) {
+        goto fail;
+    }
+    if (device->deficiencies.count == 0) {
+        if (!buffer_append_cstr(&buf, "None\n")) goto fail;
+    } else {
+        for (size_t i = 0; i < device->deficiencies.count; ++i) {
+            ReportDeficiency *def = &device->deficiencies.items[i];
+            char *equip = sanitize_ascii(def->equipment ? def->equipment : "—");
+            char *cond = sanitize_ascii(def->condition ? def->condition : "—");
+            char *remedy = sanitize_ascii(def->remedy ? def->remedy : "—");
+            char *note = sanitize_ascii(def->note ? def->note : "—");
+            const char *equip_text = equip ? equip : (def->equipment ? def->equipment : "—");
+            const char *cond_text = cond ? cond : (def->condition ? def->condition : "—");
+            const char *remedy_text = remedy ? remedy : (def->remedy ? def->remedy : "—");
+            const char *note_text = note ? note : (def->note ? def->note : "—");
+            if (!buffer_appendf(&buf, "- Deficiency %zu: Equipment=%s; Condition=%s; Remedy=%s; Note=%s\n",
+                                i + 1, equip_text, cond_text, remedy_text, note_text)) {
+                free(equip);
+                free(cond);
+                free(remedy);
+                free(note);
+                goto fail;
+            }
+            free(equip);
+            free(cond);
+            free(remedy);
+            free(note);
+        }
+    }
+
+    if (device->general_notes && device->general_notes[0]) {
+        char *notes_clean = sanitize_ascii(device->general_notes);
+        const char *notes_text = notes_clean ? notes_clean : device->general_notes;
+        if (!buffer_appendf(&buf, "\nInspector context (do not quote verbatim):\n%s\n", notes_text)) {
+            free(notes_clean);
+            goto fail;
+        }
+        free(notes_clean);
+    }
+
+    if (job && job->notes && job->notes[0]) {
+        char *job_notes = sanitize_ascii(job->notes);
+        const char *job_notes_text = job_notes ? job_notes : job->notes;
+        if (!buffer_appendf(&buf, "\nGlobal inspection notes:\n%s\n", job_notes_text)) {
+            free(job_notes);
+            goto fail;
+        }
+        free(job_notes);
+    }
+
+    if (!buffer_append_cstr(&buf, "\n")) {
+        goto fail;
+    }
+
+    char *type_upper = to_upper_ascii(device_type_display);
+    const char *type_upper_text = type_upper ? type_upper : device_type_display;
+    if (!buffer_appendf(&buf,
+        "Write a detailed narrative (2-3 paragraphs) about THIS SPECIFIC %s %s ONLY:\n"
+        "1. The overall condition of this %s\n"
+        "2. Key maintenance issues and their safety implications\n"
+        "3. Priority repairs or replacements needed\n"
+        "4. Any patterns in this equipment's deficiencies that indicate maintenance concerns\n\n"
+        "CRITICAL WRITING REQUIREMENTS:\n"
+        "- Do not mention building location, address, or property names\n"
+        "- Do not include boilerplate openings; begin with technical analysis\n"
+        "- Reference the actual deficiencies where relevant\n"
+        "- Maintain a professional tone appropriate for ownership\n",
+        type_upper_text, device_id_display, device_type_display)) {
+        free(type_upper);
+        goto fail;
+    }
+    free(type_upper);
+
+    if (!buffer_append_cstr(&buf,
+        "- Use inspector notes and global context only as supplemental guidance; do not quote them verbatim\n"
+        "- Avoid discussing other devices or general site conditions\n")) {
+        goto fail;
+    }
+
+    char *result = buf.data;
+    buf.data = NULL;
+    buffer_free(&buf);
+    free(device_type_ascii);
+    free(device_type_case);
+    free(device_id_ascii);
+    return result;
+
+fail:
+    buffer_free(&buf);
+    free(device_type_ascii);
+    free(device_type_case);
+    free(device_id_ascii);
+    return NULL;
+}
+
+static char *build_device_narrative_fallback(const ReportDevice *device) {
+    if (!device) {
+        return NULL;
+    }
+    const char *device_type_raw = device->device_type ? device->device_type : "Device";
+    char *device_type_case = normalize_caps_if_all_upper(device_type_raw);
+    const char *device_type = device_type_case ? device_type_case : device_type_raw;
+    const char *device_id = device->device_id ? device->device_id : (device->submission_id ? device->submission_id : "Device");
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        free(device_type_case);
+        return NULL;
+    }
+
+    size_t deficiency_count = device->deficiencies.count;
+    if (deficiency_count > 0) {
+        if (!buffer_appendf(&buf,
+                "%s %s has %zu documented deficiencies that require targeted maintenance attention. The detailed findings listed above should be prioritized to keep the unit compliant and operating reliably.\n",
+                device_type, device_id, deficiency_count)) {
+            buffer_free(&buf);
+            free(device_type_case);
+            return NULL;
+        }
+    } else {
+        if (!buffer_appendf(&buf,
+                "%s %s did not present any documented deficiencies during this audit. Continue routine maintenance and monitoring to preserve the current condition.\n",
+                device_type, device_id)) {
+            buffer_free(&buf);
+            free(device_type_case);
+            return NULL;
+        }
+    }
+
+    char *result = buf.data;
+    buf.data = NULL;
+    buffer_free(&buf);
+    free(device_type_case);
+    return result;
 }
 
 static char *build_location_detail_json(const ReportData *report) {
@@ -1634,6 +1965,7 @@ static int load_report_for_building(PGconn *conn, const char *building_address, 
             PQclear(res);
             return 0;
         }
+        normalize_caps_inplace(&report->summary.building_address);
         if (!report->summary.building_owner && !assign_string_from_pg(&report->summary.building_owner, res, row, 34)) {
             if (error_out && !*error_out) {
                 *error_out = strdup("Out of memory copying building owner");
@@ -1642,6 +1974,7 @@ static int load_report_for_building(PGconn *conn, const char *building_address, 
             PQclear(res);
             return 0;
         }
+        normalize_caps_inplace(&report->summary.building_owner);
         if (!report->summary.elevator_contractor && !assign_string_from_pg(&report->summary.elevator_contractor, res, row, 35)) {
             if (error_out && !*error_out) {
                 *error_out = strdup("Out of memory copying elevator contractor");
@@ -1650,6 +1983,7 @@ static int load_report_for_building(PGconn *conn, const char *building_address, 
             PQclear(res);
             return 0;
         }
+        normalize_caps_inplace(&report->summary.elevator_contractor);
         if (!report->summary.city_id && !assign_string_from_pg(&report->summary.city_id, res, row, 36)) {
             if (error_out && !*error_out) {
                 *error_out = strdup("Out of memory copying city id");
@@ -2053,6 +2387,7 @@ static void report_device_init(ReportDevice *device) {
     report_deficiency_list_init(&device->deficiencies);
     device->docstring = REPORT_DEVICE_DOCSTRING;
     device->deficiencies_docstring = REPORT_DEFICIENCIES_DOCSTRING;
+    device->narrative = NULL;
 }
 
 static void report_device_clear(ReportDevice *device) {
@@ -2083,6 +2418,8 @@ static void report_device_clear(ReportDevice *device) {
     report_device_metrics_init(&device->metrics);
     device->docstring = REPORT_DEVICE_DOCSTRING;
     device->deficiencies_docstring = REPORT_DEFICIENCIES_DOCSTRING;
+    free(device->narrative);
+    device->narrative = NULL;
 }
 
 static void report_device_list_init(ReportDeviceList *list) {
@@ -4624,10 +4961,9 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
     NarrativeSet narratives;
     narrative_set_init(&narratives);
 
-    const size_t SECTION_COUNT = 6;
-    NarrativeTask tasks[6];
-    memset(tasks, 0, sizeof(tasks));
-    size_t section_count = SECTION_COUNT;
+    NarrativeTask *tasks = NULL;
+    size_t section_count = 0;
+    size_t total_task_slots = 0;
     size_t tasks_created = 0;
     char *narrative_build_error = NULL;
 
@@ -4731,6 +5067,17 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
     };
 
     section_count = sizeof(sections) / sizeof(sections[0]);
+    total_task_slots = section_count + report.devices.count;
+    if (total_task_slots == 0) {
+        narrative_build_error = strdup("No narrative tasks to execute");
+        goto cleanup;
+    }
+
+    tasks = calloc(total_task_slots, sizeof(NarrativeTask));
+    if (!tasks) {
+        narrative_build_error = strdup("Out of memory");
+        goto cleanup;
+    }
 
     for (size_t i = 0; i < section_count; ++i) {
         Buffer prompt;
@@ -4778,26 +5125,79 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
             goto narrative_join;
         }
 
-        tasks[i].system_prompt = system_prompt;
-        tasks[i].prompt = prompt_str;
-        tasks[i].slot = sections[i].slot;
-        tasks[i].error = NULL;
-        tasks[i].success = 0;
-        tasks[i].thread_started = false;
+        NarrativeTask *task = &tasks[tasks_created];
+        task->system_prompt = system_prompt;
+        task->prompt = prompt_str;
+        task->slot = sections[i].slot;
+        task->error = NULL;
+        task->success = 0;
+        task->thread_started = false;
+        task->kind = NARRATIVE_TASK_SECTION;
+        task->device = NULL;
+        task->system_prompt_owned = NULL;
 
-        if (pthread_create(&tasks[i].thread, NULL, narrative_thread_main, &tasks[i]) == 0) {
-            tasks[i].thread_started = true;
+        if (pthread_create(&task->thread, NULL, narrative_thread_main, task) == 0) {
+            task->thread_started = true;
         } else {
-            narrative_task_execute(&tasks[i]);
+            narrative_task_execute(task);
         }
-        tasks_created = i + 1;
+        tasks_created += 1;
+    }
+
+    const char *consultant_type = determine_consultant_type(&report.summary);
+    for (size_t i = 0; i < report.devices.count; ++i) {
+        ReportDevice *device = &report.devices.items[i];
+        char *prompt_str = build_device_prompt(&report, device, job, consultant_type);
+        if (!prompt_str) {
+            if (!narrative_build_error) {
+                narrative_build_error = strdup("Out of memory");
+            }
+            goto narrative_join;
+        }
+        char *system_prompt_device = build_device_system_prompt(consultant_type);
+        if (!system_prompt_device) {
+            free(prompt_str);
+            if (!narrative_build_error) {
+                narrative_build_error = strdup("Out of memory");
+            }
+            goto narrative_join;
+        }
+
+        if (tasks_created >= total_task_slots) {
+            free(prompt_str);
+            free(system_prompt_device);
+            if (!narrative_build_error) {
+                narrative_build_error = strdup("Task overflow");
+            }
+            goto narrative_join;
+        }
+
+        NarrativeTask *task = &tasks[tasks_created];
+        task->system_prompt = system_prompt_device;
+        task->system_prompt_owned = system_prompt_device;
+        task->prompt = prompt_str;
+        task->slot = &device->narrative;
+        task->error = NULL;
+        task->success = 0;
+        task->thread_started = false;
+        task->kind = NARRATIVE_TASK_DEVICE;
+        task->device = device;
+
+        if (pthread_create(&task->thread, NULL, narrative_thread_main, task) == 0) {
+            task->thread_started = true;
+        } else {
+            narrative_task_execute(task);
+        }
+        tasks_created += 1;
     }
 
 narrative_join:
-    for (size_t i = 0; i < tasks_created; ++i) {
-        if (tasks[i].thread_started) {
-            pthread_join(tasks[i].thread, NULL);
-            tasks[i].thread_started = false;
+    if (tasks) {
+        for (size_t i = 0; i < tasks_created; ++i) {
+            if (tasks[i].thread_started) {
+                pthread_join(tasks[i].thread, NULL);
+                tasks[i].thread_started = false;
+            }
         }
     }
 
@@ -4812,20 +5212,49 @@ narrative_join:
     }
 
     for (size_t i = 0; i < tasks_created; ++i) {
-        if (!tasks[i].success) {
-            if (error_out && !*error_out) {
-                if (tasks[i].error) {
-                    *error_out = tasks[i].error;
-                    tasks[i].error = NULL;
-                } else {
-                    *error_out = strdup("Narrative generation failed");
-                }
-            } else {
-                free(tasks[i].error);
-                tasks[i].error = NULL;
-            }
-            goto cleanup;
+        NarrativeTask *task = &tasks[i];
+        if (task->success) {
+            continue;
         }
+        if (task->kind == NARRATIVE_TASK_DEVICE && task->device) {
+            if (task->slot && !*(task->slot)) {
+                char *fallback = build_device_narrative_fallback(task->device);
+                if (!fallback) {
+                    if (error_out && !*error_out) {
+                        if (task->error) {
+                            *error_out = task->error;
+                            task->error = NULL;
+                        } else {
+                            *error_out = strdup("Device narrative fallback failed");
+                        }
+                    } else {
+                        free(task->error);
+                        task->error = NULL;
+                    }
+                    goto cleanup;
+                }
+                *(task->slot) = fallback;
+            }
+            if (task->error) {
+                const char *device_id = task->device->device_id ? task->device->device_id : "unknown";
+                log_info("Falling back to deterministic narrative for device %s: %s", device_id, task->error);
+                free(task->error);
+                task->error = NULL;
+            }
+            continue;
+        }
+        if (error_out && !*error_out) {
+            if (task->error) {
+                *error_out = task->error;
+                task->error = NULL;
+            } else {
+                *error_out = strdup("Narrative generation failed");
+            }
+        } else {
+            free(task->error);
+            task->error = NULL;
+        }
+        goto cleanup;
     }
 
     char *latex_error = NULL;
@@ -4872,11 +5301,17 @@ cleanup:
         free(*output_path_out);
         *output_path_out = NULL;
     }
-    for (size_t i = 0; i < section_count; ++i) {
-        free(tasks[i].prompt);
-        tasks[i].prompt = NULL;
-        free(tasks[i].error);
-        tasks[i].error = NULL;
+    if (tasks) {
+        for (size_t i = 0; i < total_task_slots; ++i) {
+            free(tasks[i].prompt);
+            tasks[i].prompt = NULL;
+            free(tasks[i].error);
+            tasks[i].error = NULL;
+            free(tasks[i].system_prompt_owned);
+            tasks[i].system_prompt_owned = NULL;
+        }
+        free(tasks);
+        tasks = NULL;
     }
     free(zip_path);
     free(report_json);
@@ -5445,8 +5880,23 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
             return 0;
         }
 
+        if (device->narrative && device->narrative[0]) {
+            char *narrative_clean = sanitize_ascii(device->narrative);
+            const char *narrative_text = narrative_clean ? narrative_clean : device->narrative;
+            char *narrative_tex = latex_escape_with_markdown(narrative_text);
+            free(narrative_clean);
+            if (!narrative_tex) {
+                return 0;
+            }
+            int ok = buffer_appendf(buf, "%s\n\n", narrative_tex);
+            free(narrative_tex);
+            if (!ok) {
+                return 0;
+            }
+        }
+
         if (device->deficiencies.count > 0) {
-            if (!buffer_append_cstr(buf, "\\paragraph{Documented Deficiencies}\n\n")) {
+            if (!buffer_append_cstr(buf, "\\subsubsection*{Documented Deficiencies}\n\n")) {
                 return 0;
             }
             if (!buffer_append_cstr(buf,
@@ -5500,7 +5950,7 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
                 return 0;
             }
         } else {
-            if (!buffer_append_cstr(buf, "\\paragraph{Documented Deficiencies}\n\n\\textit{No deficiencies recorded for this device.}\n\n")) {
+            if (!buffer_append_cstr(buf, "\\subsubsection*{Documented Deficiencies}\n\n\\textit{No deficiencies recorded for this device.}\n\n")) {
                 return 0;
             }
         }
@@ -5543,7 +5993,6 @@ static int append_narrative_block(Buffer *buf, const char *content) {
         while (*p == ' ' || *p == '\t') {
             p++;
         }
-
         if (*p == '\0') {
             free(trimmed);
             if (in_list) {
@@ -5598,11 +6047,23 @@ static int append_narrative_block(Buffer *buf, const char *content) {
             while (*p == ' ' || *p == '\t') {
                 p++;
             }
+            if (*p == '*' && p[1] != '*') {
+                p++;
+                while (*p == ' ' || *p == '\t') {
+                    p++;
+                }
+            }
         } else if ((*p == 'o' || *p == 'O') && (p[1] == ' ' || p[1] == '\t')) {
             bullet = true;
             p += 2;
             while (*p == ' ' || *p == '\t') {
                 p++;
+            }
+            if (*p == '*' && p[1] != '*') {
+                p++;
+                while (*p == ' ' || *p == '\t') {
+                    p++;
+                }
             }
         }
 
@@ -5734,9 +6195,12 @@ static int build_report_latex(const ReportData *report,
     const char *address_src = (report->summary.building_address && report->summary.building_address[0])
         ? report->summary.building_address
         : (job->address && job->address[0] ? job->address : "Unknown address");
-    address_clean = sanitize_ascii(address_src);
-    const char *address_text = address_clean ? address_clean : address_src;
+    char *address_case = normalize_caps_if_all_upper(address_src);
+    const char *address_source = address_case ? address_case : address_src;
+    address_clean = sanitize_ascii(address_source);
+    const char *address_text = address_clean ? address_clean : address_source;
     address_tex = latex_escape(address_text);
+    free(address_case);
     if (!address_tex) goto cleanup;
 
     const char *owner_src = (report->summary.building_owner && report->summary.building_owner[0])
@@ -5995,7 +6459,7 @@ static int build_report_latex(const ReportData *report,
         "}\n"
         "\\fancypagestyle{mainstyle}{%\n"
         "    \\fancyhf{}%\n"
-        "    \\fancyhead[R]{\\includegraphics[width=0.0375\\textwidth]{square.png}}%\n"
+        "    \\fancyhead[R]{\\includegraphics[width=0.045\\textwidth]{square.png}}%\n"
         "    \\fancyfoot[L]{%\n"
         "        \\scriptsize\n"
         "        \\clientname\\\\\n"
@@ -6044,7 +6508,6 @@ static int build_report_latex(const ReportData *report,
     if (!buffer_appendf(&buf, "Address & %s \\\\ \n", address_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "Owner & %s \\\\ \n", owner_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "Elevator Contractor & %s \\\\ \n", contractor_tex)) goto cleanup;
-    if (!buffer_appendf(&buf, "City ID & %s \\\\ \n", city_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "Audit Date Range & %s \\\\ \n", date_range_tex)) goto cleanup;
     snprintf(number_buf, sizeof(number_buf), "%d", report->summary.total_devices);
     if (!buffer_appendf(&buf, "Total Devices & %s \\\\ \n", number_buf)) goto cleanup;

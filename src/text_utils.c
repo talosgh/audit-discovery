@@ -2,6 +2,7 @@
 
 #include "buffer.h"
 
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -193,4 +194,129 @@ char *latex_escape_with_markdown(const char *text) {
         escaped = strdup("");
     }
     return escaped;
+}
+
+static bool is_all_upper_alpha(const char *text) {
+    bool has_alpha = false;
+    for (const unsigned char *ptr = (const unsigned char *)text; *ptr; ++ptr) {
+        if (isalpha(*ptr)) {
+            has_alpha = true;
+            if (!isupper(*ptr)) {
+                return false;
+            }
+        }
+    }
+    return has_alpha;
+}
+
+static bool is_acronym_word(const char *text, size_t start, size_t end) {
+    static const char *const acronyms[] = {"LLC", "LLP", "INC", "USA", "NYC", "HVAC", "ADA", "DOB"};
+    size_t len = end - start;
+    if (len == 0) {
+        return false;
+    }
+    if (len <= 3) {
+        return true;
+    }
+    for (size_t i = 0; i < sizeof(acronyms) / sizeof(acronyms[0]); ++i) {
+        const char *acro = acronyms[i];
+        size_t acro_len = strlen(acro);
+        if (acro_len == len) {
+            bool match = true;
+            for (size_t j = 0; j < len; ++j) {
+                unsigned char orig = (unsigned char)text[start + j];
+                if (toupper(orig) != (unsigned char)acro[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+char *normalize_caps_if_all_upper(const char *text) {
+    if (!text) {
+        return NULL;
+    }
+    if (!is_all_upper_alpha(text)) {
+        char *copy = strdup(text);
+        return copy;
+    }
+
+    size_t len = strlen(text);
+    char *result = malloc(len + 1);
+    if (!result) {
+        return NULL;
+    }
+
+    bool start_word = true;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char orig = (unsigned char)text[i];
+        if (isalpha(orig)) {
+            unsigned char lower = (unsigned char)tolower(orig);
+            result[i] = (char)(start_word ? toupper(lower) : lower);
+            start_word = false;
+        } else {
+            result[i] = (char)orig;
+            switch (orig) {
+                case ' ':
+                case '\t':
+                case '\n':
+                case '-':
+                case '/':
+                case '(':
+                case ')':
+                case '\'':
+                case '&':
+                case '.':
+                    start_word = true;
+                    break;
+                default:
+                    start_word = false;
+                    break;
+            }
+        }
+    }
+    result[len] = '\0';
+
+    size_t pos = 0;
+    while (pos < len) {
+        while (pos < len && !isalpha((unsigned char)text[pos])) {
+            pos++;
+        }
+        size_t word_start = pos;
+        while (pos < len && isalpha((unsigned char)text[pos])) {
+            pos++;
+        }
+        size_t word_end = pos;
+        if (word_end > word_start && is_all_upper_alpha(text + word_start)) {
+            if (is_acronym_word(text, word_start, word_end)) {
+                for (size_t j = word_start; j < word_end; ++j) {
+                    result[j] = (char)toupper((unsigned char)result[j]);
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+void normalize_caps_inplace(char **text) {
+    if (!text || !*text) {
+        return;
+    }
+    char *normalized = normalize_caps_if_all_upper(*text);
+    if (!normalized) {
+        return;
+    }
+    if (strcmp(normalized, *text) != 0) {
+        free(*text);
+        *text = normalized;
+    } else {
+        free(normalized);
+    }
 }

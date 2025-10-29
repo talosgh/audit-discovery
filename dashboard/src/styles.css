@@ -36,11 +36,22 @@ body {
 .brand {
   background: none;
   border: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0;
   font-size: 1.25rem;
   font-weight: 700;
   color: #38bdf8;
   text-decoration: none;
   cursor: pointer;
+}
+
+.brand img {
+  height: 28px;
+  width: 28px;
+  border-radius: 6px;
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.35);
 }
 
 .nav-links {
