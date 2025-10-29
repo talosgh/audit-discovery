@@ -126,6 +126,7 @@ export interface LocationSummary {
   location_code: string | null;
   location_row_id: number | null;
   address: string;
+  formatted_address?: string | null;
   site_name: string | null;
   street: string | null;
   city: string | null;

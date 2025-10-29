@@ -167,6 +167,7 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         "    l.street, "
         "    l.city, "
         "    l.state, "
+        "    CONCAT_WS(', ', NULLIF(l.street, ''), NULLIF(l.city, ''), NULLIF(l.state, '')) AS formatted_address, "
         "    l.zip_code, "
         "    l.owner_name, "
         "    l.vendor_name, "
@@ -226,11 +227,12 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         const char *street = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
         const char *city = PQgetisnull(res, row, 4) ? NULL : PQgetvalue(res, row, 4);
         const char *state = PQgetisnull(res, row, 5) ? NULL : PQgetvalue(res, row, 5);
-        const char *zip = PQgetisnull(res, row, 6) ? NULL : PQgetvalue(res, row, 6);
-        const char *owner = PQgetisnull(res, row, 7) ? NULL : PQgetvalue(res, row, 7);
-        const char *vendor = PQgetisnull(res, row, 8) ? NULL : PQgetvalue(res, row, 8);
-        const char *device_count = PQgetisnull(res, row, 9) ? "0" : PQgetvalue(res, row, 9);
-        const char *open_def = PQgetisnull(res, row, 10) ? "0" : PQgetvalue(res, row, 10);
+        const char *formatted = PQgetisnull(res, row, 6) ? NULL : PQgetvalue(res, row, 6);
+        const char *zip = PQgetisnull(res, row, 7) ? NULL : PQgetvalue(res, row, 7);
+        const char *owner = PQgetisnull(res, row, 8) ? NULL : PQgetvalue(res, row, 8);
+        const char *vendor = PQgetisnull(res, row, 9) ? NULL : PQgetvalue(res, row, 9);
+        const char *device_count = PQgetisnull(res, row, 10) ? "0" : PQgetvalue(res, row, 10);
+        const char *open_def = PQgetisnull(res, row, 11) ? "0" : PQgetvalue(res, row, 11);
 
         if (!first) {
             if (!buffer_append_char(&buf, ',')) goto oom;
@@ -246,8 +248,13 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         } else {
             if (!buffer_append_cstr(&buf, "null")) goto oom;
         }
+        const char *display_address = (formatted && formatted[0])
+            ? formatted
+            : (street && street[0] ? street : (site_name && site_name[0] ? site_name : location_code));
         if (!buffer_append_cstr(&buf, ",\"address\":")) goto oom;
-        if (!buffer_append_json_string(&buf, street ? street : (site_name ? site_name : location_code))) goto oom;
+        if (!buffer_append_json_string(&buf, display_address)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"formatted_address\":")) goto oom;
+        if (!buffer_append_json_string(&buf, display_address)) goto oom;
         if (!buffer_append_cstr(&buf, ",\"site_name\":")) goto oom;
         if (!buffer_append_json_string(&buf, site_name)) goto oom;
         if (!buffer_append_cstr(&buf, ",\"street\":")) goto oom;

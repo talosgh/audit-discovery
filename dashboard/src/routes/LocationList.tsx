@@ -105,6 +105,9 @@ const LocationList: Component<LocationListProps> = (props) => {
               <thead>
                 <tr>
                   <th scope="col">Location</th>
+                  <th scope="col">Street</th>
+                  <th scope="col">City</th>
+                  <th scope="col">State</th>
                   <th scope="col">Owner</th>
                   <th scope="col">Vendor</th>
                   <th scope="col">Devices</th>
@@ -116,13 +119,15 @@ const LocationList: Component<LocationListProps> = (props) => {
                   {(location) => {
                     const openCount = location.open_deficiencies ?? 0;
                     const deviceCount = location.device_count ?? 0;
+                    const detailParts = [location.street, location.city, location.state].filter(Boolean).join(', ');
+                    const displayName = location.site_name ?? location.formatted_address ?? location.address;
 
                     return (
                       <tr
                         class="table-row"
                         role="link"
                         tabIndex={0}
-                        aria-label={`View location ${location.site_name ?? location.address}`}
+                        aria-label={`View location ${displayName}`}
                         onClick={() => props.onSelect(location)}
                         onKeyDown={(event) => {
                           if (event.key === 'Enter' || event.key === ' ') {
@@ -132,9 +137,9 @@ const LocationList: Component<LocationListProps> = (props) => {
                         }}
                       >
                         <td class={openCount > 0 ? 'location-cell has-open-deficiencies' : 'location-cell'}>
-                          <span class="location-name">{location.site_name ?? location.address}</span>
-                          <Show when={location.site_name && location.site_name !== location.address}>
-                            <span class="location-subtext">{location.address}</span>
+                          <span class="location-name">{displayName ?? '—'}</span>
+                          <Show when={detailParts}>
+                            <span class="location-subtext">{detailParts}</span>
                           </Show>
                           <Show when={location.location_code}>
                             <span class="location-subtext">ID: {location.location_code}</span>
@@ -143,6 +148,9 @@ const LocationList: Component<LocationListProps> = (props) => {
                             <span class="deficiency-chip" role="img" aria-label="Open deficiencies">⚠</span>
                           </Show>
                         </td>
+                        <td>{location.street ?? '—'}</td>
+                        <td>{location.city ?? '—'}</td>
+                        <td>{location.state ?? '—'}</td>
                         <td>{location.building_owner ?? '—'}</td>
                         <td>{location.vendor_name ?? '—'}</td>
                         <td>{deviceCount}</td>
