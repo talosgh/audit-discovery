@@ -14,6 +14,9 @@
 #ifndef INT8OID
 #define INT8OID 20
 #endif
+#ifndef INT4OID
+#define INT4OID 23
+#endif
 
 char *db_fetch_audit_list(PGconn *conn, char **error_out) {
     const char *sql =
@@ -98,11 +101,9 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
     if (page_size < 1) page_size = 25;
     if (page_size > 200) page_size = 200;
 
-    long long offset = (long long)(page - 1) * page_size;
-
-    char offset_buf[32];
+    char page_buf[32];
     char limit_buf[32];
-    snprintf(offset_buf, sizeof(offset_buf), "%lld", offset);
+    snprintf(page_buf, sizeof(page_buf), "%d", page);
     snprintf(limit_buf, sizeof(limit_buf), "%d", page_size);
 
     char *pattern = NULL;
@@ -185,10 +186,11 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         "       l.owner_name ILIKE $3 OR "
         "       l.vendor_name ILIKE $3) "
         "ORDER BY lower(COALESCE(NULLIF(l.site_name, ''), NULLIF(l.street, ''), l.city, l.state, l.location_id)), l.id "
-        "OFFSET $1::bigint LIMIT $2::bigint";
+        "OFFSET GREATEST($1::int - 1, 0) * $2::int "
+        "LIMIT $2::int";
 
-    const char *item_params[3] = { offset_buf, limit_buf, pattern };
-    const Oid item_types[3] = { INT8OID, INT8OID, TEXTOID };
+    const char *item_params[3] = { page_buf, limit_buf, pattern };
+    const Oid item_types[3] = { INT4OID, INT4OID, TEXTOID };
     PGresult *res = PQexecParams(conn, ITEM_SQL, 3, item_types, item_params, NULL, NULL, 0);
     free(pattern);
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
