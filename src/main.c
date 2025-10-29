@@ -7091,6 +7091,7 @@ static int build_report_latex(const ReportData *report,
     if (!asset_location_tex) goto cleanup;
 
     if (!buffer_append_cstr(&buf,
+        "\\PassOptionsToPackage{table}{xcolor}\n"
         "\\documentclass[12pt]{article}\n"
         "\\usepackage[utf8]{inputenc}\n"
         "\\usepackage[T1]{fontenc}\n"
@@ -7107,8 +7108,7 @@ static int build_report_latex(const ReportData *report,
         "\\usepackage{pgfplots}\n"
         "\\usepackage{tikz}\n"
         "\\usepackage{lmodern}\n"
-        "\\usepackage[table]{xcolor}\n"
-        "\\usepackage[normalem]{ulem}\n"
+        "\\usepackage{xcolor}\n"
         "\\usepackage{float}\n"
         "\\usepackage{eso-pic}\n"
         "\\geometry{a4paper, left=0.5in, right=0.5in, top=1in, bottom=1in}\n"
@@ -7147,7 +7147,7 @@ static int build_report_latex(const ReportData *report,
         "\\definecolor{DeviceRow}{HTML}{EEF2F7}\n"
         "\\renewcommand{\\labelitemi}{\\textcolor{CitywideAccent}{\\large\\textbullet}}\n"
         "\\renewcommand{\\labelitemii}{\\textcolor{CitywideAccent}{\\textbullet}}\n"
-        "\\newcommand{\\ClosedText}[1]{\\textcolor{gray}{\\sout{#1}}}\n"
+        "\\newcommand{\\ClosedText}[1]{\\tikz[baseline=(txt.base)]{\\node[inner sep=0pt, outer sep=0pt](txt){#1};\\draw[gray,line width=0.4pt] (txt.south west) -- (txt.north east);}}\n"
         "\\newcommand{\\ClosedMarker}{\\textcolor{gray}{(Closed)}}\n"
         "\\newcommand{\\applydeficiencywatermark}{%\n"
         "    \\AddToShipoutPictureBG*{%\n"

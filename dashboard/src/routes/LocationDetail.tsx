@@ -42,9 +42,25 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const devices = createMemo(() => detail()?.devices ?? []);
   const reports = createMemo<ReportVersion[]>(() => detail()?.reports ?? []);
   const deficiencyReports = createMemo<ReportVersion[]>(() => detail()?.deficiency_reports ?? []);
+  const currentAuditId = createMemo(() => reports()[0]?.job_id ?? null);
+  const currentDeficiencyId = createMemo(() => deficiencyReports()[0]?.job_id ?? null);
+  const reportTimeline = createMemo(() => {
+    const auditEntries = reports().map((report) => ({ type: 'audit' as const, report }));
+    const deficiencyEntries = deficiencyReports().map((report) => ({ type: 'deficiency' as const, report }));
+    const combined = [...auditEntries, ...deficiencyEntries];
+    return combined.sort((a, b) => {
+      const aTimestamp = a.report.completed_at ?? a.report.created_at ?? '';
+      const bTimestamp = b.report.completed_at ?? b.report.created_at ?? '';
+      const aDate = aTimestamp ? Date.parse(aTimestamp) : 0;
+      const bDate = bTimestamp ? Date.parse(bTimestamp) : 0;
+      return bDate - aDate;
+    });
+  });
 
   const [showResolvedDeficiencies, setShowResolvedDeficiencies] = createSignal(false);
   const [pendingDeficiencyKey, setPendingDeficiencyKey] = createSignal<string | null>(null);
+  const [showDeficiencySection, setShowDeficiencySection] = createSignal(false);
+  const [collapsedDevices, setCollapsedDevices] = createSignal<Record<string, boolean>>({});
 
   let pollTimer: number | null = null;
 
@@ -129,6 +145,27 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setRecommendationsSeed('');
     setReportMode('full');
   });
+
+  createEffect(() => {
+    const currentDevices = devices();
+    setCollapsedDevices((prev) => {
+      const next: Record<string, boolean> = {};
+      currentDevices.forEach((device, index) => {
+        const key = device.audit_uuid ?? device.device_id ?? `device-${index}`;
+        next[key] = prev[key] ?? true;
+      });
+      return next;
+    });
+  });
+
+  const isDeviceCollapsed = (key: string) => collapsedDevices()[key] ?? true;
+
+  const toggleDeviceCollapsed = (key: string) => {
+    setCollapsedDevices((prev) => ({
+      ...prev,
+      [key]: !(prev[key] ?? true)
+    }));
+  };
 
   createEffect(() => {
     if (!showReportModal()) {
@@ -476,18 +513,25 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
               </div>
             </Show>
 
-            <Show when={reports().length > 0}>
+            <Show when={reportTimeline().length > 0}>
               <div class="summary-section">
                 <h2>Generated reports</h2>
                 <ul class="reports-list">
-                  <For each={reports()}>
-                    {(report: ReportVersion, index) => {
-                      const isCurrent = index() === 0;
+                  <For each={reportTimeline()}>
+                    {(entry) => {
+                      const report = entry.report;
+                      const isCurrent =
+                        (entry.type === 'audit' && currentAuditId() === report.job_id) ||
+                        (entry.type === 'deficiency' && currentDeficiencyId() === report.job_id);
+                      const versionLabel = report.version != null
+                        ? `${entry.type === 'audit' ? 'Audit' : 'Deficiency'} v${report.version}`
+                        : entry.type === 'audit' ? 'Audit' : 'Deficiency';
+                      const buttonLabel = entry.type === 'audit' ? 'Report' : 'Deficiency list';
                       return (
                         <li class={`report-item${isCurrent ? ' report-item--current' : ''}`}>
                           <div class="report-meta">
                             <span class="report-title">
-                              Version {report.version ?? '—'}
+                              {versionLabel}
                               <Show when={isCurrent}>
                                 <span class="report-badge">Current</span>
                               </Show>
@@ -495,43 +539,11 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                             <span class="report-date">{formatDateTime(report.completed_at ?? report.created_at)}</span>
                           </div>
                           <div class="report-actions">
-                            <span class="report-size">{formatFileSize(report.size_bytes)}</span>
-                            <button type="button" class="action-button" onClick={() => void handleDownloadExisting(report.job_id, 'Report')}>
-                              Download
-                            </button>
-                          </div>
-                        </li>
-                      );
-                    }}
-                  </For>
-                </ul>
-              </div>
-            </Show>
-
-            <Show when={deficiencyReports().length > 0}>
-              <div class="summary-section">
-                <h2>Generated deficiency lists</h2>
-                <ul class="reports-list">
-                  <For each={deficiencyReports()}>
-                    {(report: ReportVersion, index) => {
-                      const isCurrent = index() === 0;
-                      return (
-                        <li class={`report-item${isCurrent ? ' report-item--current' : ''}`}>
-                          <div class="report-meta">
-                            <span class="report-title">
-                              Version {report.version ?? '—'}
-                              <Show when={isCurrent}>
-                                <span class="report-badge">Current</span>
-                              </Show>
-                            </span>
-                            <span class="report-date">{formatDateTime(report.completed_at ?? report.created_at)}</span>
-                          </div>
-                          <div class="report-actions">
-                            <span class="report-size">{formatFileSize(report.size_bytes)}</span>
+                            <span class="report-size">{report.size_bytes != null ? formatFileSize(report.size_bytes) : '—'}</span>
                             <button
                               type="button"
                               class="action-button"
-                              onClick={() => void handleDownloadExisting(report.job_id, 'Deficiency list')}
+                              onClick={() => void handleDownloadExisting(report.job_id, buttonLabel)}
                             >
                               Download
                             </button>
@@ -639,93 +651,122 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
           <div class="detail-card full-span deficiency-section">
             <div class="deficiency-header">
-              <h2>Deficiencies by device</h2>
-              <button
-                type="button"
-                class="deficiency-toggle"
-                onClick={() => setShowResolvedDeficiencies((value) => !value)}
-              >
-                {showResolvedDeficiencies() ? 'Hide resolved' : 'Show resolved'}
-              </button>
+              <div>
+                <h2>Deficiencies by device</h2>
+                <p class="deficiency-subtitle">Manage open and resolved findings across every unit.</p>
+              </div>
+              <div class="deficiency-header-actions">
+                <button
+                  type="button"
+                  class="deficiency-toggle"
+                  onClick={() => setShowDeficiencySection((value) => !value)}
+                >
+                  {showDeficiencySection() ? 'Collapse section' : 'Expand section'}
+                </button>
+                <button
+                  type="button"
+                  class="deficiency-toggle"
+                  onClick={() => setShowResolvedDeficiencies((value) => !value)}
+                  disabled={!showDeficiencySection()}
+                >
+                  {showResolvedDeficiencies() ? 'Hide resolved' : 'Show resolved'}
+                </button>
+              </div>
             </div>
-            <Show when={devices().length > 0} fallback={<p class="deficiency-empty">No devices found.</p>}>
+            <Show when={showDeficiencySection()} fallback={<p class="deficiency-empty">Deficiency details are collapsed.</p>}>
+              <Show when={devices().length > 0} fallback={<p class="deficiency-empty">No devices found.</p>}>
               <For each={devices()}>
-                {(device: LocationDevice) => {
-                  const filtered = (device.deficiencies ?? []).filter(
-                    (def) => showResolvedDeficiencies() || !def.resolved
-                  );
+                {(device: LocationDevice, index) => {
+                  const deviceKey = device.audit_uuid ?? device.device_id ?? `device-${index()}`;
+                  const filtered = () =>
+                    (device.deficiencies ?? []).filter((def) => showResolvedDeficiencies() || !def.resolved);
+                  const totalDeficiencies = device.total_deficiencies ?? (device.deficiencies?.length ?? 0);
+                  const openDeficiencies = device.open_deficiencies ?? (device.deficiencies ?? []).filter((def) => !def.resolved).length;
+                  const collapsed = () => isDeviceCollapsed(deviceKey);
                   return (
                     <section class="deficiency-device-card">
                       <div class="deficiency-device-heading">
-                        <div class="deficiency-device-title">Unit {device.device_id ?? '—'}</div>
-                        <div class="deficiency-device-meta">
-                          <span>{device.device_type ?? '—'}</span>
-                          <span>{device.bank_name ?? '—'}</span>
-                          <span>
-                            Showing {filtered.length} of {device.total_deficiencies ?? filtered.length}
-                          </span>
+                        <div>
+                          <div class="deficiency-device-title">Unit {device.device_id ?? '—'}</div>
+                          <div class="deficiency-device-meta">
+                            <span>{device.device_type ?? '—'}</span>
+                            <span>{device.bank_name ?? '—'}</span>
+                          </div>
+                        </div>
+                        <div class="deficiency-device-controls">
+                          <span class="deficiency-count-badge">Open {openDeficiencies} / {totalDeficiencies}</span>
+                          <button
+                            type="button"
+                            class="deficiency-device-toggle"
+                            onClick={() => toggleDeviceCollapsed(deviceKey)}
+                          >
+                            {collapsed() ? 'Expand' : 'Collapse'}
+                          </button>
                         </div>
                       </div>
-                      <Show
-                        when={filtered.length > 0}
-                        fallback={<p class="deficiency-empty">No deficiencies to display.</p>}
-                      >
-                        <ul class="deficiency-list">
-                          <For each={filtered}>
-                            {(def) => {
-                              const key = `${device.audit_uuid}:${def.id}`;
-                              return (
-                                <li class={`deficiency-item${def.resolved ? ' deficiency-item--resolved' : ''}`}>
-                                  <div class="deficiency-main">
-                                    <div class="deficiency-title">{def.condition ?? 'Condition unspecified'}</div>
-                                    <div class="deficiency-meta">
-                                      <Show when={def.condition_code}>
-                                        {(code) => <span class="deficiency-code">{code()}</span>}
+                      <Show when={!collapsed()} fallback={<p class="deficiency-empty">Device collapsed.</p>}>
+                        <Show
+                          when={filtered().length > 0}
+                          fallback={<p class="deficiency-empty">No deficiencies to display.</p>}
+                        >
+                          <ul class="deficiency-list">
+                            <For each={filtered()}>
+                              {(def) => {
+                                const key = `${device.audit_uuid}:${def.id}`;
+                                return (
+                                  <li class={`deficiency-item${def.resolved ? ' deficiency-item--resolved' : ''}`}>
+                                    <div class="deficiency-main">
+                                      <div class="deficiency-title">{def.condition ?? 'Condition unspecified'}</div>
+                                      <div class="deficiency-meta">
+                                        <Show when={def.condition_code}>
+                                          {(code) => <span class="deficiency-code">{code()}</span>}
+                                        </Show>
+                                        <Show when={def.equipment}>
+                                          {(equipment) => <span>{equipment()}</span>}
+                                        </Show>
+                                        <span>Audit ID {device.audit_uuid.slice(0, 8)}…</span>
+                                        <Show when={def.resolved && def.resolved_at}>
+                                          {(resolvedAt) => <span>Closed {formatDateTime(resolvedAt())}</span>}
+                                        </Show>
+                                      </div>
+                                      <Show when={def.remedy}>
+                                        {(remedy) => (
+                                          <p class="deficiency-note">
+                                            <strong>Remedy:</strong> {remedy()}
+                                          </p>
+                                        )}
                                       </Show>
-                                      <Show when={def.equipment}>
-                                        {(equipment) => <span>{equipment()}</span>}
-                                      </Show>
-                                      <span>Audit ID {device.audit_uuid.slice(0, 8)}…</span>
-                                      <Show when={def.resolved && def.resolved_at}>
-                                        {(resolvedAt) => <span>Closed {formatDateTime(resolvedAt())}</span>}
+                                      <Show when={def.note}>
+                                        {(note) => <p class="deficiency-note">{note()}</p>}
                                       </Show>
                                     </div>
-                                    <Show when={def.remedy}>
-                                      {(remedy) => (
-                                        <p class="deficiency-note">
-                                          <strong>Remedy:</strong> {remedy()}
-                                        </p>
-                                      )}
-                                    </Show>
-                                    <Show when={def.note}>
-                                      {(note) => <p class="deficiency-note">{note()}</p>}
-                                    </Show>
-                                  </div>
-                                  <div class="deficiency-actions">
-                                    <button
-                                      type="button"
-                                      class="deficiency-action-button"
-                                      aria-label={def.resolved ? 'Reopen deficiency' : 'Mark deficiency closed'}
-                                      disabled={pendingDeficiencyKey() === key}
-                                      onClick={() => void handleToggleDeficiency(device.audit_uuid, def.id, !def.resolved)}
-                                    >
-                                      {pendingDeficiencyKey() === key
-                                        ? 'Updating…'
-                                        : def.resolved
-                                        ? 'Reopen'
-                                        : 'Mark closed'}
-                                    </button>
-                                  </div>
-                                </li>
-                              );
-                            }}
-                          </For>
-                        </ul>
+                                    <div class="deficiency-actions">
+                                      <button
+                                        type="button"
+                                        class="deficiency-action-button"
+                                        aria-label={def.resolved ? 'Reopen deficiency' : 'Mark deficiency closed'}
+                                        disabled={pendingDeficiencyKey() === key}
+                                        onClick={() => void handleToggleDeficiency(device.audit_uuid, def.id, !def.resolved)}
+                                      >
+                                        {pendingDeficiencyKey() === key
+                                          ? 'Updating…'
+                                          : def.resolved
+                                          ? 'Reopen'
+                                          : 'Mark closed'}
+                                      </button>
+                                    </div>
+                                  </li>
+                                );
+                              }}
+                            </For>
+                          </ul>
+                        </Show>
                       </Show>
                     </section>
                   );
                 }}
               </For>
+              </Show>
             </Show>
           </div>
         </Match>
