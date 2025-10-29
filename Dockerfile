@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libcurl4-openssl-dev \
     ca-certificates \
     unzip \
+    zip \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Makefile README.md env.example ./
@@ -32,12 +33,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     texlive-latex-extra \
     ghostscript \
     unzip \
+    zip \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /srv/audit-webhook
 COPY --from=build /app/audit_webhook ./
 COPY --from=build /app/sql ./sql
 COPY --from=build /app/README.md ./
 COPY --from=ui-build /dashboard/dist ./static
+COPY assets/ ./assets
 ENV WEBHOOK_PORT=8080 \
     API_PREFIX=/webhook \
     STATIC_DIR=/srv/audit-webhook/static

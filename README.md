@@ -46,12 +46,14 @@ Required variables
 
 Optional variables
 
-| Variable       | Description                                    |
-|----------------|------------------------------------------------|
-| `WEBHOOK_PORT` | Listening port (default `8080`).                |
-| `ENV_FILE`     | Path to env file (defaults to `.env`).          |
-| `API_PREFIX`   | URL prefix for API routes (default `/webhook`). |
-| `STATIC_DIR`   | Directory containing built dashboard assets (default `./static`). |
+| Variable             | Description                                                                           |
+|----------------------|---------------------------------------------------------------------------------------|
+| `WEBHOOK_PORT`       | Listening port (default `8080`).                                                      |
+| `ENV_FILE`           | Path to env file (defaults to `.env`).                                                |
+| `API_PREFIX`         | URL prefix for API routes (default `/webhook`).                                       |
+| `STATIC_DIR`         | Directory containing built dashboard assets (default `./static`).                     |
+| `REPORT_OUTPUT_DIR`  | Filesystem directory where generated report artifacts are persisted (default `./reports`). |
+| `REPORT_ASSETS_DIR`  | Directory containing static assets used by the report generator (default `./assets`). |
 
 ## Running
 

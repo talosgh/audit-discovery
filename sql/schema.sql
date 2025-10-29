@@ -140,6 +140,10 @@ CREATE TABLE IF NOT EXISTS report_jobs (
     status TEXT NOT NULL DEFAULT 'queued',
     error TEXT,
     output_path TEXT,
+    artifact_filename TEXT,
+    artifact_mime TEXT,
+    artifact_bytes BYTEA,
+    artifact_size BIGINT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at TIMESTAMPTZ,
@@ -148,3 +152,9 @@ CREATE TABLE IF NOT EXISTS report_jobs (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_report_jobs_job_id ON report_jobs (job_id);
 CREATE INDEX IF NOT EXISTS idx_report_jobs_status ON report_jobs (status);
+
+ALTER TABLE report_jobs
+    ADD COLUMN IF NOT EXISTS artifact_filename TEXT,
+    ADD COLUMN IF NOT EXISTS artifact_mime TEXT,
+    ADD COLUMN IF NOT EXISTS artifact_bytes BYTEA,
+    ADD COLUMN IF NOT EXISTS artifact_size BIGINT;

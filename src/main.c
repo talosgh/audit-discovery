@@ -23,22 +23,27 @@
 #include <pthread.h>
 #include <curl/curl.h>
 
+#include "buffer.h"
+#include "config.h"
 #include "csv.h"
+#include "db_helpers.h"
+#include "fsutil.h"
+#include "http.h"
 #include "json.h"
+#include "json_utils.h"
+#include "log.h"
+#include "routes.h"
+#include "report_jobs.h"
+#include "server.h"
+#include "text_utils.h"
+#include "narrative.h"
+#include "util.h"
 
 #define DEFAULT_PORT 8080
 #define MAX_HEADER_SIZE 65536
 #define READ_BUFFER_SIZE 8192
 #define TEMP_FILE_TEMPLATE "/tmp/audit_zip_XXXXXX"
 #define TEMP_DIR_TEMPLATE  "/tmp/audit_unpack_XXXXXX"
-static char *g_api_key = NULL;
-static char *g_api_prefix = NULL;
-static size_t g_api_prefix_len = 0;
-static char *g_static_dir = NULL;
-static char *g_database_dsn = NULL;
-static char *g_report_output_dir = NULL;
-static char *g_xai_api_key = NULL;
-
 static pthread_t g_report_thread;
 static pthread_mutex_t g_report_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_report_cond = PTHREAD_COND_INITIALIZER;
@@ -66,12 +71,6 @@ typedef struct {
     bool has_value;
     bool value;
 } OptionalBool;
-
-typedef struct {
-    char **values;
-    size_t count;
-    size_t capacity;
-} StringArray;
 
 typedef struct {
     int section_counter;
@@ -104,6 +103,12 @@ typedef struct {
     size_t count;
     size_t capacity;
 } PhotoCollection;
+
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} AllocationList;
 
 typedef struct {
     char *equipment;
@@ -374,19 +379,6 @@ typedef struct {
 } AuditRecord;
 
 typedef struct {
-    char **items;
-    size_t count;
-    size_t capacity;
-} AllocationList;
-
-typedef struct {
-    char job_id[37];
-    char *address;
-    char *notes;
-    char *recommendations;
-} ReportJob;
-
-typedef struct {
     char *executive_summary;
     char *key_findings;
     char *methodology;
@@ -395,23 +387,11 @@ typedef struct {
     char *conclusion;
 } NarrativeSet;
 
-static bool is_valid_uuid(const char *uuid);
 static void handle_options_request(int client_fd);
 static void handle_get_request(int client_fd, PGconn *conn, const char *path, const char *query_string);
-static char *db_fetch_audit_list(PGconn *conn, char **error_out);
-static char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out);
-static void serve_static_file(int client_fd, const char *path);
-static void send_file_download(int client_fd, const char *path, const char *content_type, const char *filename);
-static const char *mime_type_for(const char *path);
-static bool path_is_safe(const char *path);
-static int ensure_directory_exists(const char *path);
-static char *join_path(const char *dir, const char *filename);
-static int write_buffer_to_file(const char *path, const char *data, size_t len);
+static void handle_client(int client_fd, void *ctx);
 static const char *optional_bool_to_text(const OptionalBool *value);
 static const char *optional_int_to_text(const OptionalInt *value, char *buffer, size_t buffer_len);
-static bool audit_exists(PGconn *conn, const char *uuid);
-static bool db_update_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool resolved, char **resolved_at_out, char **error_out);
-static bool db_fetch_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool *resolved_out, char **error_out);
 static char *build_deficiency_key(const char *overlay_code, const char *device_id, const char *equipment, const char *condition, const char *remedy, const char *note);
 static OptionalInt parse_optional_int(const char *text);
 static OptionalDouble parse_optional_double(const char *text);
@@ -422,123 +402,48 @@ static void report_data_clear(ReportData *data);
 static void report_device_init(ReportDevice *device);
 static void report_device_clear(ReportDevice *device);
 static int report_device_list_append_move(ReportDeviceList *list, ReportDevice *device);
-static bool extract_resolved_flag(const char *body, bool *resolved_out);
-static char *extract_query_param(const char *query_string, const char *key);
-static char *db_fetch_location_list(PGconn *conn, char **error_out);
 static char *build_location_detail_json(const ReportData *report);
-static void report_job_init(ReportJob *job);
-static void report_job_clear(ReportJob *job);
 static int generate_uuid_v4(char out[37]);
-static char *string_array_join(const StringArray *array, const char *separator);
-static int db_insert_report_job(PGconn *conn, const char *job_id, const char *address, const char *notes, const char *recs, char **error_out);
-static int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out);
-static int db_complete_report_job(PGconn *conn, const char *job_id, const char *status, const char *error_text, const char *output_path, char **error_out);
-static char *db_fetch_report_job_status(PGconn *conn, const char *job_id, char **error_out);
-static int db_fetch_report_download_path(PGconn *conn, const char *job_id, char **path_out, char **error_out);
 static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out);
 static void *report_worker_main(void *arg);
 static void signal_report_worker(void);
-static int generate_grok_completion(const char *system_prompt, const char *user_prompt, char **response_out, char **error_out);
 static void narrative_set_init(NarrativeSet *set);
 static void narrative_set_clear(NarrativeSet *set);
 static int build_report_latex(const ReportData *report, const NarrativeSet *narratives, const ReportJob *job, const char *output_path, char **error_out);
 static int run_pdflatex(const char *working_dir, const char *tex_filename, char **error_out);
-static char *latex_escape(const char *text);
-static char *sanitize_ascii(const char *text);
-
-static void log_error(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    fprintf(stderr, "[ERROR] ");
-    vfprintf(stderr, fmt, args);
-    fprintf(stderr, "\n");
-    va_end(args);
-}
-
-static void log_info(const char *fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    fprintf(stderr, "[INFO] ");
-    vfprintf(stderr, fmt, args);
-    fprintf(stderr, "\n");
-    va_end(args);
-}
+static bool read_request_body(int client_fd,
+                              const char *header_lines,
+                              char *body_start,
+                              size_t leftover,
+                              char saved_body_char,
+                              long max_length,
+                              char **body_out,
+                              long *length_out,
+                              int *status_out,
+                              const char **error_out);
+static bool read_request_body(int client_fd,
+                              const char *header_lines,
+                              char *body_start,
+                              size_t leftover,
+                              char saved_body_char,
+                              long max_length,
+                              char **body_out,
+                              long *length_out,
+                              int *status_out,
+                              const char **error_out);
 
 static void optional_int_clear(OptionalInt *value) { value->has_value = false; value->value = 0; }
 static void optional_long_clear(OptionalLong *value) { value->has_value = false; value->value = 0; }
 static void optional_double_clear(OptionalDouble *value) { value->has_value = false; value->value = 0.0; }
 static void optional_bool_clear(OptionalBool *value) { value->has_value = false; value->value = false; }
 
-static void string_array_init(StringArray *array) {
-    array->values = NULL;
-    array->count = 0;
-    array->capacity = 0;
-}
 
-static int string_array_append_copy(StringArray *array, const char *value) {
-    if (!value) {
-        return 1;
-    }
-    if (array->count == array->capacity) {
-        size_t new_cap = array->capacity == 0 ? 4 : array->capacity * 2;
-        char **tmp = realloc(array->values, new_cap * sizeof(char *));
-        if (!tmp) {
-            return 0;
-        }
-        array->values = tmp;
-        array->capacity = new_cap;
-    }
-    array->values[array->count] = strdup(value);
-    if (!array->values[array->count]) {
-        return 0;
-    }
-    array->count++;
-    return 1;
-}
 
-static void string_array_clear(StringArray *array) {
-    if (!array) {
-        return;
-    }
-    for (size_t i = 0; i < array->count; ++i) {
-        free(array->values[i]);
-    }
-    free(array->values);
-    array->values = NULL;
-    array->count = 0;
-    array->capacity = 0;
-}
 
-static char *string_array_join(const StringArray *array, const char *separator) {
-    if (!array || array->count == 0) {
-        return NULL;
-    }
-    const char *sep = separator ? separator : ", ";
-    size_t sep_len = strlen(sep);
-    size_t total = 1;
-    for (size_t i = 0; i < array->count; ++i) {
-        if (array->values[i]) {
-            total += strlen(array->values[i]);
-        }
-        if (i + 1 < array->count) {
-            total += sep_len;
-        }
-    }
-    char *result = malloc(total);
-    if (!result) {
-        return NULL;
-    }
-    result[0] = '\0';
-    for (size_t i = 0; i < array->count; ++i) {
-        if (array->values[i]) {
-            strcat(result, array->values[i]);
-        }
-        if (i + 1 < array->count) {
-            strcat(result, sep);
-        }
-    }
-    return result;
-}
+
+
+
+
 
 static const char *optional_bool_to_text(const OptionalBool *value) {
     if (!value || !value->has_value) {
@@ -558,25 +463,6 @@ static const char *optional_int_to_text(const OptionalInt *value, char *buffer, 
     return buffer;
 }
 
-
-static void report_job_init(ReportJob *job) {
-    if (!job) return;
-    job->job_id[0] = '\0';
-    job->address = NULL;
-    job->notes = NULL;
-    job->recommendations = NULL;
-}
-
-static void report_job_clear(ReportJob *job) {
-    if (!job) return;
-    free(job->address);
-    free(job->notes);
-    free(job->recommendations);
-    job->address = NULL;
-    job->notes = NULL;
-    job->recommendations = NULL;
-    job->job_id[0] = '\0';
-}
 
 static void narrative_set_init(NarrativeSet *set) {
     if (!set) return;
@@ -1026,290 +912,6 @@ static int assign_string_from_pg(char **dest, PGresult *res, int row, int col) {
     return assign_string(dest, PQgetvalue(res, row, col));
 }
 
-static int hex_digit_value(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-    return -1;
-}
-
-static char *url_decode(const char *input) {
-    if (!input) return NULL;
-    size_t len = strlen(input);
-    char *output = malloc(len + 1);
-    if (!output) return NULL;
-    char *out_ptr = output;
-    for (size_t i = 0; i < len; ++i) {
-        char c = input[i];
-        if (c == '%' && i + 2 < len) {
-            int hi = hex_digit_value(input[i + 1]);
-            int lo = hex_digit_value(input[i + 2]);
-            if (hi >= 0 && lo >= 0) {
-                *out_ptr++ = (char)((hi << 4) | lo);
-                i += 2;
-                continue;
-            }
-        }
-        if (c == '+') {
-            *out_ptr++ = ' ';
-        } else {
-            *out_ptr++ = c;
-        }
-    }
-    *out_ptr = '\0';
-    return output;
-}
-
-static bool extract_resolved_flag(const char *body, bool *resolved_out) {
-    if (!body || !resolved_out) {
-        return false;
-    }
-
-    char *parse_error = NULL;
-    JsonValue *root = json_parse(body, &parse_error);
-    if (root) {
-        bool found = false;
-        if (root->type == JSON_OBJECT) {
-            JsonValue *resolved_val = json_object_get(root, "resolved");
-            if (resolved_val) {
-                if (resolved_val->type == JSON_BOOL) {
-                    *resolved_out = resolved_val->value.boolean;
-                    found = true;
-                } else if (resolved_val->type == JSON_STRING && resolved_val->value.string) {
-                    const char *val = resolved_val->value.string;
-                    if (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0) {
-                        *resolved_out = true;
-                        found = true;
-                    } else if (strcasecmp(val, "false") == 0 || strcmp(val, "0") == 0) {
-                        *resolved_out = false;
-                        found = true;
-                    }
-                } else if (resolved_val->type == JSON_NUMBER) {
-                    *resolved_out = resolved_val->value.number != 0.0;
-                    found = true;
-                }
-            }
-        }
-        json_free(root);
-        if (parse_error) free(parse_error);
-        return found;
-    }
-    if (parse_error) {
-        free(parse_error);
-    }
-
-    const char *needle = "\"resolved\"";
-    const char *pos = body;
-    while ((pos = strstr(pos, needle)) != NULL) {
-        const char *after = pos + strlen(needle);
-        while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') {
-            after++;
-        }
-        if (*after != ':') {
-            pos = after;
-            continue;
-        }
-        after++;
-        while (*after == ' ' || *after == '\t' || *after == '\r' || *after == '\n') {
-            after++;
-        }
-        if (strncasecmp(after, "true", 4) == 0) {
-            *resolved_out = true;
-            return true;
-        }
-        if (strncasecmp(after, "false", 5) == 0) {
-            *resolved_out = false;
-            return true;
-        }
-        if (*after == '"') {
-            after++;
-            if (strncasecmp(after, "true\"", 5) == 0) {
-                *resolved_out = true;
-                return true;
-            }
-            if (strncasecmp(after, "false\"", 6) == 0) {
-                *resolved_out = false;
-                return true;
-            }
-        }
-        if (*after == '0' || *after == '1') {
-            *resolved_out = (*after != '0');
-            return true;
-        }
-        pos = after;
-    }
-    return false;
-}
-
-static char *extract_query_param(const char *query_string, const char *key) {
-    if (!query_string || !key) {
-        return NULL;
-    }
-    char *copy = strdup(query_string);
-    if (!copy) {
-        return NULL;
-    }
-    char *token = strtok(copy, "&");
-    char *result = NULL;
-    while (token) {
-        char *eq = strchr(token, '=');
-        if (eq) {
-            *eq = '\0';
-            const char *param_key = token;
-            const char *param_value = eq + 1;
-            if (strcmp(param_key, key) == 0) {
-                result = url_decode(param_value);
-                break;
-            }
-        }
-        token = strtok(NULL, "&");
-    }
-    free(copy);
-    return result;
-}
-
-typedef struct {
-    char *data;
-    size_t length;
-    size_t capacity;
-} Buffer;
-
-static int buffer_init(Buffer *buf) {
-    if (!buf) return 0;
-    buf->capacity = 1024;
-    buf->length = 0;
-    buf->data = malloc(buf->capacity);
-    if (!buf->data) {
-        buf->capacity = 0;
-        return 0;
-    }
-    buf->data[0] = '\0';
-    return 1;
-}
-
-static void buffer_free(Buffer *buf) {
-    if (!buf) return;
-    free(buf->data);
-    buf->data = NULL;
-    buf->length = 0;
-    buf->capacity = 0;
-}
-
-static int buffer_reserve(Buffer *buf, size_t extra) {
-    if (!buf) return 0;
-    if (buf->length + extra + 1 <= buf->capacity) {
-        return 1;
-    }
-    size_t new_cap = buf->capacity ? buf->capacity : 1024;
-    while (buf->length + extra + 1 > new_cap) {
-        new_cap *= 2;
-    }
-    char *tmp = realloc(buf->data, new_cap);
-    if (!tmp) {
-        return 0;
-    }
-    buf->data = tmp;
-    buf->capacity = new_cap;
-    return 1;
-}
-
-static int buffer_append(Buffer *buf, const char *data, size_t len) {
-    if (!buf || !data) return 0;
-    if (!buffer_reserve(buf, len)) {
-        return 0;
-    }
-    memcpy(buf->data + buf->length, data, len);
-    buf->length += len;
-    buf->data[buf->length] = '\0';
-    return 1;
-}
-
-static int buffer_append_cstr(Buffer *buf, const char *text) {
-    if (!text) return buffer_append(buf, "", 0);
-    return buffer_append(buf, text, strlen(text));
-}
-
-static int buffer_append_char(Buffer *buf, char c) {
-    if (!buf) return 0;
-    if (!buffer_reserve(buf, 1)) {
-        return 0;
-    }
-    buf->data[buf->length++] = c;
-    buf->data[buf->length] = '\0';
-    return 1;
-}
-
-static int buffer_appendf(Buffer *buf, const char *fmt, ...) {
-    if (!buf || !fmt) return 0;
-    va_list args;
-    va_start(args, fmt);
-    va_list args_copy;
-    va_copy(args_copy, args);
-    int needed = vsnprintf(NULL, 0, fmt, args_copy);
-    va_end(args_copy);
-    if (needed < 0) {
-        va_end(args);
-        return 0;
-    }
-    if (!buffer_reserve(buf, (size_t)needed)) {
-        va_end(args);
-        return 0;
-    }
-    vsnprintf(buf->data + buf->length, buf->capacity - buf->length, fmt, args);
-    buf->length += (size_t)needed;
-    va_end(args);
-    return 1;
-}
-
-static int buffer_append_json_string(Buffer *buf, const char *text) {
-    if (!buf) return 0;
-    if (!text) {
-        return buffer_append_cstr(buf, "null");
-    }
-    if (!buffer_append_char(buf, '"')) {
-        return 0;
-    }
-    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
-        unsigned char c = *p;
-        switch (c) {
-            case '"':
-                if (!buffer_append_cstr(buf, "\\\"")) return 0;
-                break;
-            case '\\':
-                if (!buffer_append_cstr(buf, "\\\\")) return 0;
-                break;
-            case '\b':
-                if (!buffer_append_cstr(buf, "\\b")) return 0;
-                break;
-            case '\f':
-                if (!buffer_append_cstr(buf, "\\f")) return 0;
-                break;
-            case '\n':
-                if (!buffer_append_cstr(buf, "\\n")) return 0;
-                break;
-            case '\r':
-                if (!buffer_append_cstr(buf, "\\r")) return 0;
-                break;
-            case '\t':
-                if (!buffer_append_cstr(buf, "\\t")) return 0;
-                break;
-            default:
-                if (c < 0x20) {
-                    char esc[7];
-                    snprintf(esc, sizeof(esc), "\\u%04x", c);
-                    if (!buffer_append_cstr(buf, esc)) return 0;
-                } else {
-                    if (!buffer_append_char(buf, (char)c)) return 0;
-                }
-                break;
-        }
-    }
-    if (!buffer_append_char(buf, '"')) {
-        return 0;
-    }
-    return 1;
-}
-
 static int buffer_append_optional_int(Buffer *buf, const OptionalInt *value) {
     if (!value || !value->has_value) {
         return buffer_append_cstr(buf, "null");
@@ -1341,84 +943,6 @@ static int buffer_append_string_array(Buffer *buf, const StringArray *array) {
     }
     if (!buffer_append_char(buf, ']')) return 0;
     return 1;
-}
-
-static const char *const CP1252_REPLACEMENTS[32] = {
-    "EUR",  NULL,   ",",    "f",    "\"",   "...",  "+",    "++",
-    "^",    "%",    "S",    "<",    "OE",   NULL,   "Z",    NULL,
-    NULL,   "'",    "'",    "\"",   "--",   "*",    "-",    "--",
-    "~",    "(TM)", "s",    ">",    "oe",   NULL,   "z",    "Y"
-};
-
-static char *sanitize_ascii(const char *text) {
-    if (!text) return NULL;
-    size_t len = strlen(text);
-    char *out = malloc(len * 4 + 1);
-    if (!out) {
-        return NULL;
-    }
-    size_t o = 0;
-    for (size_t i = 0; i < len; ++i) {
-        unsigned char c = (unsigned char)text[i];
-        if (c == '\r') {
-            continue;
-        }
-        if (c < 0x80) {
-            if (c >= 0x20 || c == '\n' || c == '\t') {
-                out[o++] = (char)c;
-            }
-            continue;
-        }
-        if ((c & 0xE0) == 0xC0 && i + 1 < len) {
-            unsigned char c1 = (unsigned char)text[i + 1];
-            if ((c1 & 0xC0) == 0x80) {
-                out[o++] = (char)c;
-                out[o++] = (char)c1;
-                i += 1;
-                continue;
-            }
-        }
-        if ((c & 0xF0) == 0xE0 && i + 2 < len) {
-            unsigned char c1 = (unsigned char)text[i + 1];
-            unsigned char c2 = (unsigned char)text[i + 2];
-            if (((c1 & 0xC0) == 0x80) && ((c2 & 0xC0) == 0x80)) {
-                out[o++] = (char)c;
-                out[o++] = (char)c1;
-                out[o++] = (char)c2;
-                i += 2;
-                continue;
-            }
-        }
-        if ((c & 0xF8) == 0xF0 && i + 3 < len) {
-            unsigned char c1 = (unsigned char)text[i + 1];
-            unsigned char c2 = (unsigned char)text[i + 2];
-            unsigned char c3 = (unsigned char)text[i + 3];
-            if (((c1 & 0xC0) == 0x80) && ((c2 & 0xC0) == 0x80) && ((c3 & 0xC0) == 0x80)) {
-                out[o++] = (char)c;
-                out[o++] = (char)c1;
-                out[o++] = (char)c2;
-                out[o++] = (char)c3;
-                i += 3;
-                continue;
-            }
-        }
-        if (c >= 0x80 && c <= 0x9F) {
-            const char *replacement = CP1252_REPLACEMENTS[c - 0x80];
-            if (replacement) {
-                size_t rlen = strlen(replacement);
-                memcpy(out + o, replacement, rlen);
-                o += rlen;
-            }
-            continue;
-        }
-        out[o++] = '?';
-    }
-    out[o] = '\0';
-    char *shrunk = realloc(out, o + 1);
-    if (shrunk) {
-        out = shrunk;
-    }
-    return out;
 }
 
 static char *build_location_detail_json(const ReportData *report) {
@@ -2680,23 +2204,7 @@ static void audit_record_free(AuditRecord *record) {
     string_array_clear(&record->floors_served);
 }
 
-static char *trim_copy(const char *input) {
-    if (!input) return NULL;
-    const char *start = input;
-    while (*start && isspace((unsigned char)*start)) {
-        start++;
-    }
-    const char *end = input + strlen(input);
-    while (end > start && isspace((unsigned char)*(end - 1))) {
-        end--;
-    }
-    size_t len = (size_t)(end - start);
-    char *out = malloc(len + 1);
-    if (!out) return NULL;
-    memcpy(out, start, len);
-    out[len] = '\0';
-    return out;
-}
+
 
 static int assign_string(char **dest, const char *value) {
     if (!value) {
@@ -2711,75 +2219,6 @@ static int assign_string(char **dest, const char *value) {
     }
     free(*dest);
     *dest = copy;
-    return 1;
-}
-
-static void trim_inplace(char *str) {
-    if (!str) return;
-    size_t len = strlen(str);
-    size_t start = 0;
-    while (start < len && isspace((unsigned char)str[start])) start++;
-    size_t end = len;
-    while (end > start && isspace((unsigned char)str[end - 1])) end--;
-    if (start > 0) {
-        memmove(str, str + start, end - start);
-    }
-    str[end - start] = '\0';
-}
-
-static void strip_quotes_inplace(char *str) {
-    trim_inplace(str);
-    size_t len = strlen(str);
-    if (len >= 2 && ((str[0] == '"' && str[len - 1] == '"') || (str[0] == '\'' && str[len - 1] == '\''))) {
-        memmove(str, str + 1, len - 2);
-        str[len - 2] = '\0';
-    }
-}
-
-static int load_env_file(const char *path) {
-    if (!path || path[0] == '\0') {
-        return 1;
-    }
-    FILE *fp = fopen(path, "r");
-    if (!fp) {
-        if (errno == ENOENT) {
-            log_info("Env file %s not found, skipping", path);
-            return 1;
-        }
-        log_error("Failed to open env file %s: %s", path, strerror(errno));
-        return 0;
-    }
-    char line[1024];
-    int line_number = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        line_number++;
-        char *newline = strpbrk(line, "\r\n");
-        if (newline) *newline = '\0';
-        trim_inplace(line);
-        if (line[0] == '\0' || line[0] == '#') {
-            continue;
-        }
-        char *eq = strchr(line, '=');
-        if (!eq) {
-            log_info("Ignoring malformed env line %d in %s", line_number, path);
-            continue;
-        }
-        *eq = '\0';
-        char *key = line;
-        char *value = eq + 1;
-        trim_inplace(key);
-        trim_inplace(value);
-        strip_quotes_inplace(value);
-        if (key[0] == '\0') {
-            continue;
-        }
-        if (setenv(key, value, 1) != 0) {
-            log_error("Failed to set env %s from %s: %s", key, path, strerror(errno));
-            fclose(fp);
-            return 0;
-        }
-    }
-    fclose(fp);
     return 1;
 }
 
@@ -3044,48 +2483,6 @@ static char *pg_array_from_string_array(const StringArray *array) {
     return buffer;
 }
 
-static char *json_escape_string(const char *input) {
-    if (!input) {
-        return strdup("");
-    }
-    size_t capacity = strlen(input) * 2 + 16;
-    char *buffer = malloc(capacity);
-    if (!buffer) {
-        return NULL;
-    }
-    size_t pos = 0;
-    for (const unsigned char *p = (const unsigned char *)input; *p; ++p) {
-        unsigned char c = *p;
-        if (pos + 6 >= capacity) {
-            capacity *= 2;
-            char *tmp = realloc(buffer, capacity);
-            if (!tmp) {
-                free(buffer);
-                return NULL;
-            }
-            buffer = tmp;
-        }
-        switch (c) {
-            case '"': buffer[pos++] = '\\'; buffer[pos++] = '"'; break;
-            case '\\': buffer[pos++] = '\\'; buffer[pos++] = '\\'; break;
-            case '\b': buffer[pos++] = '\\'; buffer[pos++] = 'b'; break;
-            case '\f': buffer[pos++] = '\\'; buffer[pos++] = 'f'; break;
-            case '\n': buffer[pos++] = '\\'; buffer[pos++] = 'n'; break;
-            case '\r': buffer[pos++] = '\\'; buffer[pos++] = 'r'; break;
-            case '\t': buffer[pos++] = '\\'; buffer[pos++] = 't'; break;
-            default:
-                if (c < 0x20) {
-                    snprintf(buffer + pos, 7, "\\u%04x", c);
-                    pos += 6;
-                } else {
-                    buffer[pos++] = (char)c;
-                }
-                break;
-        }
-    }
-    buffer[pos] = '\0';
-    return buffer;
-}
 static int read_file_to_string(const char *path, char **out_text) {
     *out_text = NULL;
     FILE *fp = fopen(path, "rb");
@@ -4387,344 +3784,8 @@ static int process_zip_file(const char *zip_path, PGconn *conn, StringArray *pro
     free(temp_dir);
     return 1;
 }
-static char *build_success_response(const StringArray *audits) {
-    size_t capacity = 64;
-    char *buffer = malloc(capacity);
-    if (!buffer) return NULL;
-    size_t pos = 0;
-    const char *prefix = "{\"status\":\"ok\",\"audits\":[";
-    size_t prefix_len = strlen(prefix);
-    if (pos + prefix_len + 1 > capacity) {
-        capacity = prefix_len + 64;
-        char *tmp = realloc(buffer, capacity);
-        if (!tmp) { free(buffer); return NULL; }
-        buffer = tmp;
-    }
-    memcpy(buffer + pos, prefix, prefix_len);
-    pos += prefix_len;
-
-    if (audits) {
-        for (size_t i = 0; i < audits->count; ++i) {
-            char *escaped = json_escape_string(audits->values[i]);
-            if (!escaped) { free(buffer); return NULL; }
-            size_t needed = strlen(escaped) + 4;
-            if (pos + needed + 1 > capacity) {
-                size_t new_cap = capacity * 2;
-                while (pos + needed + 1 > new_cap) new_cap *= 2;
-                char *tmp = realloc(buffer, new_cap);
-                if (!tmp) { free(escaped); free(buffer); return NULL; }
-                buffer = tmp;
-                capacity = new_cap;
-            }
-            buffer[pos++] = '"';
-            memcpy(buffer + pos, escaped, strlen(escaped));
-            pos += strlen(escaped);
-            buffer[pos++] = '"';
-            if (i + 1 < audits->count) {
-                buffer[pos++] = ',';
-            }
-            free(escaped);
-        }
-    }
-    if (pos + 3 >= capacity) {
-        char *tmp = realloc(buffer, capacity + 8);
-        if (!tmp) { free(buffer); return NULL; }
-        buffer = tmp;
-        capacity += 8;
-    }
-    buffer[pos++] = ']';
-    buffer[pos++] = '}';
-    buffer[pos] = '\0';
-    return buffer;
-}
-
-static char *build_error_response(const char *message) {
-    char *escaped = json_escape_string(message ? message : "Unknown error");
-    if (!escaped) return NULL;
-    size_t needed = strlen(escaped) + 32;
-    char *buffer = malloc(needed);
-    if (!buffer) {
-        free(escaped);
-        return NULL;
-    }
-    snprintf(buffer, needed, "{\"status\":\"error\",\"message\":\"%s\"}", escaped);
-    free(escaped);
-    return buffer;
-}
-
-static void send_http_response(int client_fd, int status_code, const char *status_text, const char *content_type, const void *body, size_t body_len) {
-    if (!status_text) status_text = "OK";
-    if (!content_type) content_type = "application/json";
-    char header[512];
-    int header_len = snprintf(header, sizeof(header),
-                              "HTTP/1.1 %d %s\r\n"
-                              "Content-Type: %s\r\n"
-                              "Content-Length: %zu\r\n"
-                              "Access-Control-Allow-Origin: *\r\n"
-                              "Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS\r\n"
-                              "Access-Control-Allow-Headers: Content-Type, X-API-Key\r\n"
-                              "Connection: close\r\n\r\n",
-                              status_code, status_text, content_type, body_len);
-    if (header_len < 0) return;
-    (void)send(client_fd, header, (size_t)header_len, 0);
-    if (body_len > 0 && body) {
-        (void)send(client_fd, body, body_len, 0);
-    }
-}
-
-static void send_http_json(int client_fd, int status_code, const char *status_text, const char *json_body) {
-    size_t len = json_body ? strlen(json_body) : 0;
-    send_http_response(client_fd, status_code, status_text, "application/json", json_body, len);
-}
-
-static bool is_valid_uuid(const char *uuid) {
-    if (!uuid) return false;
-    size_t len = strlen(uuid);
-    if (len != 36) {
-        return false;
-    }
-    for (size_t i = 0; i < len; ++i) {
-        char c = uuid[i];
-        if (i == 8 || i == 13 || i == 18 || i == 23) {
-            if (c != '-') return false;
-        } else if (!isxdigit((unsigned char)c)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static void handle_options_request(int client_fd) {
     send_http_response(client_fd, 204, "No Content", "application/json", NULL, 0);
-}
-
-static char *db_fetch_audit_list(PGconn *conn, char **error_out) {
-    const char *sql =
-        "SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)::text "
-        "FROM ("
-        "  SELECT "
-        "    a.audit_uuid,"
-        "    a.building_address,"
-        "    a.building_owner,"
-        "    a.device_type,"
-        "    a.bank_name,"
-        "    a.city_id,"
-        "    a.submitted_on,"
-        "    a.updated_at,"
-        "    COALESCE((SELECT COUNT(*) FROM audit_deficiencies d WHERE d.audit_uuid = a.audit_uuid AND d.resolved_at IS NULL), 0) AS deficiency_count "
-        "  FROM audits a "
-        "  ORDER BY a.submitted_on DESC NULLS LAST "
-        "  LIMIT 100"
-        ") t;";
-    PGresult *res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Database query failed");
-        }
-        PQclear(res);
-        return NULL;
-    }
-    char *json = NULL;
-    if (PQntuples(res) > 0 && !PQgetisnull(res, 0, 0)) {
-        const char *value = PQgetvalue(res, 0, 0);
-        json = strdup(value ? value : "[]");
-    } else {
-        json = strdup("[]");
-    }
-    PQclear(res);
-    return json;
-}
-
-static char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out) {
-    const char *paramValues[1] = { uuid };
-    const char *sql =
-        "SELECT json_build_object("
-        "  'audit', row_to_json(a),"
-        "  'deficiencies', COALESCE((SELECT json_agg(row_to_json(d)) FROM audit_deficiencies d WHERE d.audit_uuid = a.audit_uuid), '[]'::json),"
-        "  'photos', COALESCE((SELECT json_agg(json_build_object("
-        "     'photo_filename', p.photo_filename,"
-        "     'content_type', p.content_type,"
-        "     'photo_bytes', encode(p.photo_bytes, 'base64')"
-        "  )) FROM audit_photos p WHERE p.audit_uuid = a.audit_uuid), '[]'::json)"
-        ")::text "
-        "FROM audits a "
-        "WHERE audit_uuid = $1::uuid;";
-    PGresult *res = PQexecParams(conn, sql, 1, NULL, paramValues, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Database query failed");
-        }
-        PQclear(res);
-        return NULL;
-    }
-    if (PQntuples(res) == 0 || PQgetisnull(res, 0, 0)) {
-        PQclear(res);
-        return NULL; // not found
-    }
-    const char *value = PQgetvalue(res, 0, 0);
-    char *json = strdup(value ? value : "{}");
-    PQclear(res);
-    return json;
-}
-
-static char *db_fetch_location_list(PGconn *conn, char **error_out) {
-    const char *sql =
-        "SELECT "
-        "  a.building_address,"
-        "  MAX(a.building_owner) AS building_owner,"
-        "  MAX(a.elevator_contractor) AS elevator_contractor,"
-        "  MAX(a.city_id) AS city_id,"
-        "  COUNT(*) AS audit_count,"
-        "  COUNT(DISTINCT a.building_id) AS device_count,"
-        "  MAX(a.submitted_on) AS last_audit,"
-        "  MIN(a.submitted_on) AS first_audit,"
-        "  COALESCE(SUM(d.open_def_count), 0) AS open_deficiencies"
-        " FROM audits a"
-        " LEFT JOIN ("
-        "   SELECT audit_uuid, COUNT(*) FILTER (WHERE resolved_at IS NULL) AS open_def_count"
-        "   FROM audit_deficiencies"
-        "   GROUP BY audit_uuid"
-        " ) d ON d.audit_uuid = a.audit_uuid"
-        " WHERE a.building_address IS NOT NULL AND a.building_address <> ''"
-        " GROUP BY a.building_address"
-        " ORDER BY MAX(a.submitted_on) DESC NULLS LAST, a.building_address";
-
-    PGresult *res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Failed to query locations");
-        }
-        PQclear(res);
-        return NULL;
-    }
-
-    Buffer buf;
-    if (!buffer_init(&buf)) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory building location response");
-        }
-        PQclear(res);
-        return NULL;
-    }
-
-    if (!buffer_append_char(&buf, '[')) {
-        buffer_free(&buf);
-        PQclear(res);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory building location response");
-        }
-        return NULL;
-    }
-
-    int rows = PQntuples(res);
-    bool first = true;
-    for (int row = 0; row < rows; ++row) {
-        const char *address = PQgetisnull(res, row, 0) ? NULL : PQgetvalue(res, row, 0);
-        if (!address || address[0] == '\0') {
-            continue;
-        }
-        const char *owner = PQgetisnull(res, row, 1) ? NULL : PQgetvalue(res, row, 1);
-        const char *contractor = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
-        const char *city_id = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
-        const char *audit_count_str = PQgetisnull(res, row, 4) ? "0" : PQgetvalue(res, row, 4);
-        const char *device_count_str = PQgetisnull(res, row, 5) ? "0" : PQgetvalue(res, row, 5);
-        const char *last_audit = PQgetisnull(res, row, 6) ? NULL : PQgetvalue(res, row, 6);
-        const char *first_audit = PQgetisnull(res, row, 7) ? NULL : PQgetvalue(res, row, 7);
-        const char *open_def_str = PQgetisnull(res, row, 8) ? "0" : PQgetvalue(res, row, 8);
-
-        if (!first) {
-            if (!buffer_append_char(&buf, ',')) {
-                buffer_free(&buf);
-                PQclear(res);
-                if (error_out && !*error_out) {
-                    *error_out = strdup("Out of memory building location response");
-                }
-                return NULL;
-            }
-        }
-        first = false;
-
-        if (!buffer_append_char(&buf, '{')) goto oom;
-        if (!buffer_append_cstr(&buf, "\"address\":")) goto oom;
-        if (!buffer_append_json_string(&buf, address)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"building_owner\":")) goto oom;
-        if (!buffer_append_json_string(&buf, owner)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"elevator_contractor\":")) goto oom;
-        if (!buffer_append_json_string(&buf, contractor)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"city_id\":")) goto oom;
-        if (!buffer_append_json_string(&buf, city_id)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"audit_count\":")) goto oom;
-        if (!buffer_append_cstr(&buf, audit_count_str)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"device_count\":")) goto oom;
-        if (!buffer_append_cstr(&buf, device_count_str)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"open_deficiencies\":")) goto oom;
-        if (!buffer_append_cstr(&buf, open_def_str)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"last_audit\":")) goto oom;
-        if (!buffer_append_json_string(&buf, last_audit)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-
-        if (!buffer_append_cstr(&buf, "\"first_audit\":")) goto oom;
-        if (!buffer_append_json_string(&buf, first_audit)) goto oom;
-        if (!buffer_append_char(&buf, '}')) goto oom;
-        continue;
-
-oom:
-        buffer_free(&buf);
-        PQclear(res);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory building location response");
-        }
-        return NULL;
-    }
-
-    if (!buffer_append_char(&buf, ']')) {
-        buffer_free(&buf);
-        PQclear(res);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory building location response");
-        }
-        return NULL;
-    }
-
-    PQclear(res);
-    char *json = buf.data;
-    buf.data = NULL;
-    buffer_free(&buf);
-    return json;
-}
-
-static bool audit_exists(PGconn *conn, const char *uuid) {
-    if (!uuid || !*uuid) {
-        return false;
-    }
-    const char *sql = "SELECT 1 FROM audits WHERE audit_uuid = $1::uuid LIMIT 1";
-    const char *params[1] = { uuid };
-    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        log_error("Failed to check for existing audit %s: %s", uuid, PQresultErrorMessage(res));
-        PQclear(res);
-        return false;
-    }
-    bool exists = PQntuples(res) > 0;
-    PQclear(res);
-    return exists;
 }
 
 static char *build_deficiency_key(const char *overlay_code, const char *device_id, const char *equipment, const char *condition, const char *remedy, const char *note) {
@@ -4750,322 +3811,89 @@ static char *build_deficiency_key(const char *overlay_code, const char *device_i
     return key;
 }
 
-static bool db_update_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool resolved, char **resolved_at_out, char **error_out) {
-    const char *sql =
-        "UPDATE audit_deficiencies "
-        "SET resolved_at = CASE WHEN $3::boolean THEN COALESCE(resolved_at, NOW()) ELSE NULL END "
-        "WHERE audit_uuid = $1::uuid AND id = $2 "
-        "RETURNING resolved_at";
-    char id_buf[32];
-    snprintf(id_buf, sizeof(id_buf), "%ld", deficiency_id);
-    const char *params[3] = { uuid, id_buf, resolved ? "true" : "false" };
-    PGresult *res = PQexecParams(conn, sql, 3, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Failed updating deficiency");
+static bool read_request_body(int client_fd,
+                              const char *header_lines,
+                              char *body_start,
+                              size_t leftover,
+                              char saved_body_char,
+                              long max_length,
+                              char **body_out,
+                              long *length_out,
+                              int *status_out,
+                              const char **error_out) {
+    if (body_out) *body_out = NULL;
+    if (length_out) *length_out = 0;
+    if (status_out) *status_out = 400;
+    if (error_out) *error_out = NULL;
+
+    long content_length = -1;
+    const char *line = header_lines;
+    while (line && *line) {
+        const char *next = strstr(line, "\r\n");
+        size_t len = next ? (size_t)(next - line) : strlen(line);
+        if (len == 0) {
+            break;
         }
-        PQclear(res);
+        if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
+            const char *value = line + 15;
+            while (*value == ' ' || *value == '\t') value++;
+            content_length = strtol(value, NULL, 10);
+        }
+        if (!next) {
+            break;
+        }
+        line = next + 2;
+    }
+
+    if (content_length < 0) {
+        if (status_out) *status_out = 411;
+        if (error_out) *error_out = "Content-Length required";
+        if (body_start) *body_start = saved_body_char;
         return false;
     }
-    if (PQntuples(res) == 0) {
-        PQclear(res);
-        if (error_out) {
-            *error_out = strdup("Deficiency not found");
-        }
+    if (content_length > max_length) {
+        if (status_out) *status_out = 400;
+        if (error_out) *error_out = "Invalid request body length";
+        if (body_start) *body_start = saved_body_char;
         return false;
     }
-    if (resolved_at_out) {
-        if (PQgetisnull(res, 0, 0)) {
-            *resolved_at_out = NULL;
-        } else {
-            const char *value = PQgetvalue(res, 0, 0);
-            *resolved_at_out = value ? strdup(value) : NULL;
-        }
+
+    char *body = malloc((size_t)content_length + 1);
+    if (!body) {
+        if (status_out) *status_out = 500;
+        if (error_out) *error_out = "Out of memory";
+        if (body_start) *body_start = saved_body_char;
+        return false;
     }
-    PQclear(res);
+
+    if (body_start) {
+        *body_start = saved_body_char;
+    }
+    size_t offset = 0;
+    if (leftover > 0 && body_start) {
+        size_t copy_len = leftover > (size_t)content_length ? (size_t)content_length : leftover;
+        memcpy(body, body_start, copy_len);
+        offset += copy_len;
+    }
+
+    while ((long)offset < content_length) {
+        ssize_t read_bytes = recv(client_fd, body + offset, (size_t)content_length - offset, 0);
+        if (read_bytes <= 0) {
+            free(body);
+            if (status_out) *status_out = 400;
+            if (error_out) *error_out = "Unexpected end of stream";
+            return false;
+        }
+        offset += (size_t)read_bytes;
+    }
+
+    body[content_length] = '\0';
+    if (body_out) *body_out = body;
+    else free(body);
+    if (length_out) *length_out = content_length;
+    if (status_out) *status_out = 200;
+    if (error_out) *error_out = NULL;
     return true;
-}
-
-static bool db_fetch_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool *resolved_out, char **error_out) {
-    if (!conn || !uuid || !resolved_out) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Invalid parameters while reading deficiency");
-        }
-        return false;
-    }
-
-    const char *sql =
-        "SELECT resolved_at IS NOT NULL "
-        "FROM audit_deficiencies "
-        "WHERE audit_uuid = $1::uuid AND id = $2";
-    char id_buf[32];
-    snprintf(id_buf, sizeof(id_buf), "%ld", deficiency_id);
-    const char *params[2] = { uuid, id_buf };
-    PGresult *res = PQexecParams(conn, sql, 2, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Failed to read deficiency status");
-        }
-        PQclear(res);
-        return false;
-    }
-    if (PQntuples(res) == 0) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Deficiency not found");
-        }
-        PQclear(res);
-        return false;
-    }
-    *resolved_out = !PQgetisnull(res, 0, 0) ? (strcmp(PQgetvalue(res, 0, 0), "t") == 0 || strcmp(PQgetvalue(res, 0, 0), "1") == 0) : false;
-    PQclear(res);
-    return true;
-}
-
-static int db_insert_report_job(PGconn *conn, const char *job_id, const char *address, const char *notes, const char *recs, char **error_out) {
-    if (!conn || !job_id || !address || address[0] == '\0') {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Invalid report job parameters");
-        }
-        return 0;
-    }
-    const char *sql =
-        "INSERT INTO report_jobs (job_id, address, notes, recommendations) "
-        "VALUES ($1::uuid, $2, $3, $4)";
-    const char *params[4] = { job_id, address, notes, recs };
-    const int formats[4] = { 0, 0, 0, 0 };
-    const int lengths[4] = { 0, 0, 0, 0 };
-    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, lengths, formats, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Failed to insert report job");
-        }
-        PQclear(res);
-        return 0;
-    }
-    PQclear(res);
-    return 1;
-}
-
-static int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
-    if (!conn || !job) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Invalid report job request");
-        }
-        return -1;
-    }
-    const char *sql =
-        "WITH job AS ("
-        "    SELECT id, job_id::text AS job_id_text, address, notes, recommendations "
-        "    FROM report_jobs "
-        "    WHERE status = 'queued' "
-        "    ORDER BY created_at "
-        "    LIMIT 1 "
-        "    FOR UPDATE SKIP LOCKED"
-        ") "
-        "UPDATE report_jobs r "
-        "SET status = 'processing', started_at = COALESCE(r.started_at, NOW()), updated_at = NOW() "
-        "FROM job "
-        "WHERE r.id = job.id "
-        "RETURNING job.job_id_text, job.address, job.notes, job.recommendations";
-    PGresult *res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Failed to claim report job");
-        }
-        PQclear(res);
-        return -1;
-    }
-    int rows = PQntuples(res);
-    if (rows == 0) {
-        PQclear(res);
-        return 0;
-    }
-    report_job_clear(job);
-    report_job_init(job);
-    const char *job_id = PQgetvalue(res, 0, 0);
-    if (!job_id || strlen(job_id) >= sizeof(job->job_id)) {
-        PQclear(res);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Invalid job identifier");
-        }
-        return -1;
-    }
-    strncpy(job->job_id, job_id, sizeof(job->job_id));
-    job->job_id[36] = '\0';
-
-    if (!PQgetisnull(res, 0, 1)) {
-        job->address = strdup(PQgetvalue(res, 0, 1));
-        if (!job->address) {
-            PQclear(res);
-            if (error_out && !*error_out) {
-                *error_out = strdup("Out of memory copying address");
-            }
-            return -1;
-        }
-    }
-    if (!PQgetisnull(res, 0, 2)) {
-        job->notes = strdup(PQgetvalue(res, 0, 2));
-        if (!job->notes) {
-            PQclear(res);
-            if (error_out && !*error_out) {
-                *error_out = strdup("Out of memory copying notes");
-            }
-            return -1;
-        }
-    }
-    if (!PQgetisnull(res, 0, 3)) {
-        job->recommendations = strdup(PQgetvalue(res, 0, 3));
-        if (!job->recommendations) {
-            PQclear(res);
-            if (error_out && !*error_out) {
-                *error_out = strdup("Out of memory copying recommendations");
-            }
-            return -1;
-        }
-    }
-    PQclear(res);
-    return 1;
-}
-
-static int db_complete_report_job(PGconn *conn, const char *job_id, const char *status, const char *error_text, const char *output_path, char **error_out) {
-    if (!conn || !job_id || !status) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Invalid report job completion parameters");
-        }
-        return 0;
-    }
-    const char *sql =
-        "UPDATE report_jobs "
-        "SET status = $2, "
-        "    error = $3, "
-        "    output_path = $4, "
-        "    completed_at = CASE WHEN $2 IN ('completed','failed') THEN NOW() ELSE completed_at END, "
-        "    updated_at = NOW() "
-        "WHERE job_id = $1::uuid";
-    const char *params[4] = { job_id, status, error_text, output_path };
-    const int formats[4] = { 0, 0, 0, 0 };
-    const int lengths[4] = { 0, 0, 0, 0 };
-    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, lengths, formats, 0);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Failed updating report job");
-        }
-        PQclear(res);
-        return 0;
-    }
-    if (PQcmdTuples(res)[0] == '0') {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Report job not found");
-        }
-        PQclear(res);
-        return 0;
-    }
-    PQclear(res);
-    return 1;
-}
-
-static char *db_fetch_report_job_status(PGconn *conn, const char *job_id, char **error_out) {
-    if (!conn || !job_id) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Job id required");
-        }
-        return NULL;
-    }
-    const char *sql =
-        "SELECT json_build_object("
-        "  'job_id', job_id::text,"
-        "  'status', status,"
-        "  'address', address,"
-        "  'created_at', created_at,"
-        "  'started_at', started_at,"
-        "  'completed_at', completed_at,"
-        "  'error', error,"
-        "  'download_ready', (status = 'completed' AND output_path IS NOT NULL)"
-        ")::text "
-        "FROM report_jobs "
-        "WHERE job_id = $1::uuid";
-    const char *params[1] = { job_id };
-    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Failed to fetch report job");
-        }
-        PQclear(res);
-        return NULL;
-    }
-    if (PQntuples(res) == 0 || PQgetisnull(res, 0, 0)) {
-        PQclear(res);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Report job not found");
-        }
-        return NULL;
-    }
-    const char *value = PQgetvalue(res, 0, 0);
-    char *json = strdup(value ? value : "{}");
-    PQclear(res);
-    return json;
-}
-
-static int db_fetch_report_download_path(PGconn *conn, const char *job_id, char **path_out, char **error_out) {
-    if (!conn || !job_id || !path_out) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Job id required");
-        }
-        return 0;
-    }
-    const char *sql =
-        "SELECT status, output_path "
-        "FROM report_jobs "
-        "WHERE job_id = $1::uuid";
-    const char *params[1] = { job_id };
-    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Failed to fetch download path");
-        }
-        PQclear(res);
-        return 0;
-    }
-    if (PQntuples(res) == 0) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Report job not found");
-        }
-        PQclear(res);
-        return 0;
-    }
-    const char *status = PQgetvalue(res, 0, 0);
-    bool completed = status && strcmp(status, "completed") == 0;
-    if (!completed) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Report not ready");
-        }
-        PQclear(res);
-        return 0;
-    }
-    if (PQgetisnull(res, 0, 1)) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Report artifact missing");
-        }
-        PQclear(res);
-        return 0;
-    }
-    const char *path = PQgetvalue(res, 0, 1);
-    *path_out = strdup(path);
-    PQclear(res);
-    if (!*path_out) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory copying path");
-        }
-        return 0;
-    }
-    return 1;
 }
 
 static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out) {
@@ -5338,7 +4166,7 @@ static void handle_get_request(int client_fd, PGconn *conn, const char *path, co
     }
 
     if (strcmp(path, "/locations") == 0) {
-        char *address_value = extract_query_param(query_string, "address");
+        char *address_value = http_extract_query_param(query_string, "address");
         if (address_value && address_value[0] != '\0') {
             ReportData report;
             report_data_init(&report);
@@ -5388,7 +4216,7 @@ static void handle_get_request(int client_fd, PGconn *conn, const char *path, co
     }
 
     if (strcmp(path, "/reports") == 0) {
-        char *address_value = extract_query_param(query_string, "address");
+        char *address_value = http_extract_query_param(query_string, "address");
 
         if (!address_value || address_value[0] == '\0') {
             free(address_value);
@@ -5488,35 +4316,6 @@ static void handle_get_request(int client_fd, PGconn *conn, const char *path, co
     char *body = build_error_response("Not Found");
     send_http_json(client_fd, 404, "Not Found", body);
     free(body);
-}
-
-static const char *mime_type_for(const char *path) {
-    const char *ext = strrchr(path, '.');
-    if (!ext || ext[1] == '\0') {
-        return "text/plain; charset=utf-8";
-    }
-    ext++;
-    if (strcasecmp(ext, "html") == 0) return "text/html; charset=utf-8";
-    if (strcasecmp(ext, "css") == 0) return "text/css; charset=utf-8";
-    if (strcasecmp(ext, "js") == 0) return "text/javascript; charset=utf-8";
-    if (strcasecmp(ext, "mjs") == 0) return "text/javascript; charset=utf-8";
-    if (strcasecmp(ext, "json") == 0) return "application/json; charset=utf-8";
-    if (strcasecmp(ext, "svg") == 0) return "image/svg+xml";
-    if (strcasecmp(ext, "png") == 0) return "image/png";
-    if (strcasecmp(ext, "jpg") == 0 || strcasecmp(ext, "jpeg") == 0) return "image/jpeg";
-    if (strcasecmp(ext, "webp") == 0) return "image/webp";
-    if (strcasecmp(ext, "ico") == 0) return "image/x-icon";
-    if (strcasecmp(ext, "txt") == 0) return "text/plain; charset=utf-8";
-    if (strcasecmp(ext, "map") == 0) return "application/json; charset=utf-8";
-    if (strcasecmp(ext, "woff2") == 0) return "font/woff2";
-    return "application/octet-stream";
-}
-
-static bool path_is_safe(const char *path) {
-    if (!path) return false;
-    if (strstr(path, "..")) return false;
-    if (strchr(path, '\\')) return false;
-    return true;
 }
 
 static void signal_report_worker(void) {
@@ -5627,388 +4426,6 @@ static void *report_worker_main(void *arg) {
     return NULL;
 }
 
-static void send_file_download(int client_fd, const char *path, const char *content_type, const char *filename) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        char *body = build_error_response("File not found");
-        send_http_json(client_fd, 404, "Not Found", body);
-        free(body);
-        return;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) != 0) {
-        close(fd);
-        char *body = build_error_response("Failed to read file");
-        send_http_json(client_fd, 500, "Internal Server Error", body);
-        free(body);
-        return;
-    }
-
-    if (!S_ISREG(st.st_mode)) {
-        close(fd);
-        char *body = build_error_response("Invalid file");
-        send_http_json(client_fd, 400, "Bad Request", body);
-        free(body);
-        return;
-    }
-
-    const char *ctype = content_type ? content_type : "application/octet-stream";
-    const char *name = filename ? filename : "download.bin";
-
-    char header[1024];
-    int header_len = snprintf(header, sizeof(header),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: %s\r\n"
-                              "Content-Length: %lld\r\n"
-                              "Content-Disposition: attachment; filename=\"%s\"\r\n"
-                              "Access-Control-Allow-Origin: *\r\n"
-                              "Access-Control-Allow-Methods: GET, POST, PATCH, OPTIONS\r\n"
-                              "Access-Control-Allow-Headers: Content-Type, X-API-Key\r\n"
-                              "Connection: close\r\n\r\n",
-                              ctype,
-                              (long long)st.st_size,
-                              name);
-    if (header_len < 0 || header_len >= (int)sizeof(header)) {
-        close(fd);
-        char *body = build_error_response("Failed to send headers");
-        send_http_json(client_fd, 500, "Internal Server Error", body);
-        free(body);
-        return;
-    }
-
-    if (send(client_fd, header, (size_t)header_len, 0) < 0) {
-        close(fd);
-        return;
-    }
-
-    off_t offset = 0;
-    while (offset < st.st_size) {
-        ssize_t sent = sendfile(client_fd, fd, &offset, (size_t)(st.st_size - offset));
-        if (sent <= 0) {
-            if (sent < 0 && errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-    }
-
-    close(fd);
-}
-
-static int ensure_directory_exists(const char *path) {
-    if (!path || *path == '\0') {
-        errno = EINVAL;
-        return -1;
-    }
-
-    char temp[PATH_MAX];
-    size_t len = strlen(path);
-    if (len >= sizeof(temp)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-    memcpy(temp, path, len + 1);
-
-    for (size_t i = 1; i < len; ++i) {
-        if (temp[i] == '/' || temp[i] == '\\') {
-            char saved = temp[i];
-            temp[i] = '\0';
-            if (temp[0] != '\0') {
-                if (mkdir(temp, 0775) != 0 && errno != EEXIST) {
-                    temp[i] = saved;
-                    return -1;
-                }
-            }
-            temp[i] = saved;
-        }
-    }
-
-    if (mkdir(temp, 0775) != 0 && errno != EEXIST) {
-        return -1;
-    }
-
-    struct stat st;
-    if (stat(temp, &st) != 0) {
-        return -1;
-    }
-    if (!S_ISDIR(st.st_mode)) {
-        errno = ENOTDIR;
-        return -1;
-    }
-    return 0;
-}
-
-static char *join_path(const char *dir, const char *filename) {
-    if (!dir || !filename) {
-        return NULL;
-    }
-    size_t dir_len = strlen(dir);
-    size_t file_len = strlen(filename);
-    size_t needs_sep = (dir_len > 0 && dir[dir_len - 1] != '/' && dir[dir_len - 1] != '\\') ? 1 : 0;
-    size_t total = dir_len + needs_sep + file_len + 1;
-    if (total >= PATH_MAX) {
-        return NULL;
-    }
-    char *out = malloc(total);
-    if (!out) {
-        return NULL;
-    }
-    memcpy(out, dir, dir_len);
-    size_t pos = dir_len;
-    if (needs_sep) {
-        out[pos++] = '/';
-    }
-    memcpy(out + pos, filename, file_len + 1);
-    return out;
-}
-
-static int write_buffer_to_file(const char *path, const char *data, size_t len) {
-    if (!path || !data) {
-        errno = EINVAL;
-        return -1;
-    }
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        return -1;
-    }
-    size_t written = fwrite(data, 1, len, fp);
-    if (written != len) {
-        fclose(fp);
-        errno = EIO;
-        return -1;
-    }
-    if (fclose(fp) != 0) {
-        return -1;
-    }
-    return 0;
-}
-
-#define GROK_API_URL "https://api.x.ai/v1/chat/completions"
-#define GROK_MODEL "grok-3-mini-latest"
-
-typedef struct {
-    char *data;
-    size_t length;
-    size_t capacity;
-} HttpBuffer;
-
-static void http_buffer_init(HttpBuffer *buf) {
-    buf->data = NULL;
-    buf->length = 0;
-    buf->capacity = 0;
-}
-
-static void http_buffer_free(HttpBuffer *buf) {
-    if (!buf) return;
-    free(buf->data);
-    buf->data = NULL;
-    buf->length = 0;
-    buf->capacity = 0;
-}
-
-static int http_buffer_reserve(HttpBuffer *buf, size_t additional) {
-    if (buf->length + additional + 1 <= buf->capacity) {
-        return 1;
-    }
-    size_t new_cap = buf->capacity == 0 ? (additional + 1024) : buf->capacity * 2;
-    while (buf->length + additional + 1 > new_cap) {
-        new_cap *= 2;
-    }
-    char *tmp = realloc(buf->data, new_cap);
-    if (!tmp) {
-        return 0;
-    }
-    buf->data = tmp;
-    buf->capacity = new_cap;
-    return 1;
-}
-
-static size_t curl_response_write(void *contents, size_t size, size_t nmemb, void *userp) {
-    size_t total = size * nmemb;
-    HttpBuffer *buf = (HttpBuffer *)userp;
-    if (!http_buffer_reserve(buf, total)) {
-        return 0;
-    }
-    memcpy(buf->data + buf->length, contents, total);
-    buf->length += total;
-    buf->data[buf->length] = '\0';
-    return total;
-}
-
-static int generate_grok_completion(const char *system_prompt, const char *user_prompt, char **response_out, char **error_out) {
-    if (!system_prompt || !user_prompt || !response_out) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Invalid narrative parameters");
-        }
-        return 0;
-    }
-    if (!g_xai_api_key) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("XAI_API_KEY not configured");
-        }
-        return 0;
-    }
-
-    CURL *curl = curl_easy_init();
-    if (!curl) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Failed to initialize HTTP client");
-        }
-        return 0;
-    }
-
-    Buffer body;
-    if (!buffer_init(&body)) {
-        curl_easy_cleanup(curl);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory");
-        }
-        return 0;
-    }
-
-    char *system_json = json_escape_string(system_prompt);
-    char *user_json = json_escape_string(user_prompt);
-    if (!system_json || !user_json) {
-        free(system_json);
-        free(user_json);
-        buffer_free(&body);
-        curl_easy_cleanup(curl);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory");
-        }
-        return 0;
-    }
-
-    buffer_append_cstr(&body, "{");
-    buffer_append_cstr(&body, "\"model\":\"");
-    buffer_append_cstr(&body, GROK_MODEL);
-    buffer_append_cstr(&body, "\",");
-    buffer_append_cstr(&body, "\"temperature\":0.1,");
-    buffer_append_cstr(&body, "\"max_tokens\":4000,");
-    buffer_append_cstr(&body, "\"messages\":[");
-    buffer_append_cstr(&body, "{\"role\":\"system\",\"content\":\"");
-    buffer_append_cstr(&body, system_json);
-    buffer_append_cstr(&body, "\"},");
-    buffer_append_cstr(&body, "{\"role\":\"user\",\"content\":\"");
-    buffer_append_cstr(&body, user_json);
-    buffer_append_cstr(&body, "\"}]}");
-
-    free(system_json);
-    free(user_json);
-
-    char *auth_header = NULL;
-    size_t auth_len = strlen(g_xai_api_key) + strlen("Authorization: Bearer ") + 1;
-    auth_header = malloc(auth_len);
-    if (!auth_header) {
-        buffer_free(&body);
-        curl_easy_cleanup(curl);
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory");
-        }
-        return 0;
-    }
-    snprintf(auth_header, auth_len, "Authorization: Bearer %s", g_xai_api_key);
-
-    struct curl_slist *headers = NULL;
-    headers = curl_slist_append(headers, "Content-Type: application/json");
-    headers = curl_slist_append(headers, "Accept: application/json");
-    headers = curl_slist_append(headers, auth_header);
-
-    HttpBuffer response;
-    http_buffer_init(&response);
-
-    curl_easy_setopt(curl, CURLOPT_URL, GROK_API_URL);
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_response_write);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = curl_easy_strerror(res);
-            size_t len = msg ? strlen(msg) : 0;
-            char *copy = malloc(len + 32);
-            if (copy) {
-                snprintf(copy, len + 32, "HTTP request failed: %s", msg ? msg : "unknown error");
-                *error_out = copy;
-            }
-        }
-        http_buffer_free(&response);
-        curl_slist_free_all(headers);
-        free(auth_header);
-        buffer_free(&body);
-        curl_easy_cleanup(curl);
-        return 0;
-    }
-
-    long status_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status_code);
-
-    curl_slist_free_all(headers);
-    free(auth_header);
-    buffer_free(&body);
-    curl_easy_cleanup(curl);
-
-    if (status_code != 200) {
-        if (error_out && !*error_out) {
-            if (response.length > 0) {
-                *error_out = strdup(response.data);
-            } else {
-                char *msg = malloc(64);
-                if (msg) {
-                    snprintf(msg, 64, "HTTP status %ld", status_code);
-                    *error_out = msg;
-                }
-            }
-        }
-        http_buffer_free(&response);
-        return 0;
-    }
-
-    char *content_copy = NULL;
-    char *parse_error = NULL;
-    JsonValue *root = json_parse(response.data ? response.data : "", &parse_error);
-    if (root) {
-        JsonValue *choices = json_object_get(root, "choices");
-        if (choices && choices->type == JSON_ARRAY && json_array_size(choices) > 0) {
-            JsonValue *first = json_array_get(choices, 0);
-            JsonValue *message = json_object_get(first, "message");
-            if (message && message->type == JSON_OBJECT) {
-                JsonValue *content = json_object_get(message, "content");
-                const char *text = json_as_string(content);
-                if (text) {
-                    content_copy = strdup(text);
-                }
-            }
-        }
-        json_free(root);
-    }
-    if (parse_error) {
-        free(parse_error);
-    }
-    http_buffer_free(&response);
-
-    if (!content_copy) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Failed to parse Grok response");
-        }
-        return 0;
-    }
-
-    char *sanitized = sanitize_ascii(content_copy);
-    if (sanitized) {
-        free(content_copy);
-        content_copy = sanitized;
-    }
-
-    *response_out = content_copy;
-    return 1;
-}
-
 static int run_pdflatex(const char *working_dir, const char *tex_filename, char **error_out) {
     if (!working_dir || !tex_filename) {
         if (error_out && !*error_out) {
@@ -6050,68 +4467,6 @@ static int run_pdflatex(const char *working_dir, const char *tex_filename, char 
         }
     }
     return 1;
-}
-
-static char *latex_escape(const char *text) {
-    if (!text) {
-        return strdup("");
-    }
-    Buffer buf;
-    if (!buffer_init(&buf)) {
-        return NULL;
-    }
-    for (const unsigned char *ptr = (const unsigned char *)text; *ptr; ++ptr) {
-        unsigned char c = *ptr;
-        switch (c) {
-            case '\\':
-                buffer_append_cstr(&buf, "\\textbackslash{}");
-                break;
-            case '{':
-                buffer_append_cstr(&buf, "\\{");
-                break;
-            case '}':
-                buffer_append_cstr(&buf, "\\}");
-                break;
-            case '#':
-                buffer_append_cstr(&buf, "\\#");
-                break;
-            case '$':
-                buffer_append_cstr(&buf, "\\$");
-                break;
-            case '%':
-                buffer_append_cstr(&buf, "\\%");
-                break;
-            case '&':
-                buffer_append_cstr(&buf, "\\&");
-                break;
-            case '_':
-                buffer_append_cstr(&buf, "\\_");
-                break;
-            case '^':
-                buffer_append_cstr(&buf, "\\textasciicircum{}");
-                break;
-            case '~':
-                buffer_append_cstr(&buf, "\\textasciitilde{}");
-                break;
-            case '\n':
-                buffer_append_cstr(&buf, "\\\\\n");
-                break;
-            default:
-                if (c < 0x20) {
-                    // Skip control characters
-                } else {
-                    buffer_append_char(&buf, (char)c);
-                }
-                break;
-        }
-    }
-    char *escaped = buf.data;
-    buf.data = NULL;
-    buffer_free(&buf);
-    if (!escaped) {
-        escaped = strdup("");
-    }
-    return escaped;
 }
 
 static int append_narrative_section(Buffer *buf, const char *title, const char *content) {
@@ -6519,102 +4874,8 @@ cleanup:
     return success;
 }
 
-static void serve_static_file(int client_fd, const char *path) {
-    if (!g_static_dir) {
-        char *body = build_error_response("Static content unavailable");
-        send_http_json(client_fd, 404, "Not Found", body);
-        free(body);
-        return;
-    }
-
-    char relative[PATH_MAX];
-    const char *requested = path && *path ? path : "/";
-    if (!path_is_safe(requested)) {
-        char *body = build_error_response("Invalid path");
-        send_http_json(client_fd, 400, "Bad Request", body);
-        free(body);
-        return;
-    }
-
-    const char *effective = requested;
-    if (effective[0] == '/') {
-        effective++;
-    }
-
-    if (*effective == '\0') {
-        strncpy(relative, "index.html", sizeof(relative));
-    } else {
-        strncpy(relative, effective, sizeof(relative));
-        relative[sizeof(relative) - 1] = '\0';
-    }
-
-    char full_path[PATH_MAX];
-    int written = snprintf(full_path, sizeof(full_path), "%s/%s", g_static_dir, relative);
-    if (written < 0 || (size_t)written >= sizeof(full_path)) {
-        char *body = build_error_response("Path too long");
-        send_http_json(client_fd, 414, "Request-URI Too Long", body);
-        free(body);
-        return;
-    }
-
-    struct stat st;
-    bool fallback_to_index = false;
-    if (stat(full_path, &st) != 0 || S_ISDIR(st.st_mode)) {
-        const bool looks_like_asset = strchr(relative, '.') != NULL;
-        if (looks_like_asset) {
-            char *body = build_error_response("Not Found");
-            send_http_json(client_fd, 404, "Not Found", body);
-            free(body);
-            return;
-        }
-        fallback_to_index = true;
-    }
-
-    if (fallback_to_index) {
-        written = snprintf(full_path, sizeof(full_path), "%s/index.html", g_static_dir);
-        if (written < 0 || (size_t)written >= sizeof(full_path) || stat(full_path, &st) != 0) {
-            char *body = build_error_response("Static index not found");
-            send_http_json(client_fd, 404, "Not Found", body);
-            free(body);
-            return;
-        }
-    }
-
-    if (!S_ISREG(st.st_mode)) {
-        char *body = build_error_response("Not Found");
-        send_http_json(client_fd, 404, "Not Found", body);
-        free(body);
-        return;
-    }
-
-    int fd = open(full_path, O_RDONLY);
-    if (fd < 0) {
-        char *body = build_error_response("Failed to read static asset");
-        send_http_json(client_fd, 500, "Internal Server Error", body);
-        free(body);
-        return;
-    }
-
-    const char *content_type = mime_type_for(full_path);
-    send_http_response(client_fd, 200, "OK", content_type, NULL, (size_t)st.st_size);
-
-    off_t offset = 0;
-    while (offset < st.st_size) {
-        ssize_t sent = sendfile(client_fd, fd, &offset, (size_t)(st.st_size - offset));
-        if (sent < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-        if (sent == 0) {
-            break;
-        }
-    }
-
-    close(fd);
-}
-static void handle_client(int client_fd, PGconn *conn) {
+static void handle_client(int client_fd, void *ctx) {
+    PGconn *conn = (PGconn *)ctx;
     char header_buffer[MAX_HEADER_SIZE];
     size_t header_len = 0;
     bool header_complete = false;
@@ -6701,205 +4962,52 @@ static void handle_client(int client_fd, PGconn *conn) {
             }
 
             if (strcmp(method, "PATCH") == 0) {
-                if (!is_api_path || strncmp(api_path, "/audits/", 8) != 0) {
+                if (!is_api_path || !api_path) {
                     char *body = build_error_response("Not Found");
                     send_http_json(client_fd, 404, "Not Found", body);
                     free(body);
                     return;
                 }
 
-                const char *rest = api_path + 8;
-                const char *slash = strchr(rest, '/');
-                if (!slash) {
-                    char *body = build_error_response("Invalid deficiency path");
-                    send_http_json(client_fd, 400, "Bad Request", body);
-                    free(body);
-                    return;
-                }
-                size_t uuid_len = (size_t)(slash - rest);
-                if (uuid_len == 0 || uuid_len >= 64) {
-                    char *body = build_error_response("Invalid audit id");
-                    send_http_json(client_fd, 400, "Bad Request", body);
-                    free(body);
-                    return;
-                }
-                char target_uuid[64];
-                memcpy(target_uuid, rest, uuid_len);
-                target_uuid[uuid_len] = '\0';
-                const char *def_path = slash;
-                if (strncmp(def_path, "/deficiencies/", 14) != 0) {
-                    char *body = build_error_response("Invalid deficiency path");
-                    send_http_json(client_fd, 400, "Bad Request", body);
-                    free(body);
-                    return;
-                }
-                const char *id_part = def_path + 14;
-                if (*id_part == '\0') {
-                    char *body = build_error_response("Deficiency id required");
-                    send_http_json(client_fd, 400, "Bad Request", body);
-                    free(body);
-                    return;
-                }
-                char *endptr = NULL;
-                long deficiency_id = strtol(id_part, &endptr, 10);
-                if (deficiency_id <= 0 || (endptr && *endptr != '\0')) {
-                    char *body = build_error_response("Invalid deficiency id");
-                    send_http_json(client_fd, 400, "Bad Request", body);
-                    free(body);
+                char *body_json = NULL;
+                long body_len = 0;
+                int body_status = 400;
+                const char *body_error = NULL;
+                if (!read_request_body(client_fd, header_lines, body_start, leftover, saved_body_char,
+                                       65536, &body_json, &body_len, &body_status, &body_error)) {
+                    char *response = build_error_response(body_error ? body_error : "Invalid request body");
+                    const char *status_text = body_status == 411 ? "Length Required" :
+                                              (body_status == 500 ? "Internal Server Error" : "Bad Request");
+                    send_http_json(client_fd, body_status, status_text, response);
+                    free(response);
                     return;
                 }
 
-                long content_length = -1;
-                char *line = header_lines;
-                while (line && *line) {
-                    char *next = strstr(line, "\r\n");
-                    if (!next) break;
-                    if (next == line) {
-                        break;
-                    }
-                    size_t len = (size_t)(next - line);
-                    if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
-                        const char *value = line + 15;
-                        while (*value == ' ' || *value == '\t') value++;
-                        content_length = strtol(value, NULL, 10);
-                    }
-                    line = next + 2;
-                }
-                if (content_length < 0 || content_length > 65536) {
-                    char *body = build_error_response("Invalid request body length");
-                    send_http_json(client_fd, 411, "Length Required", body);
-                    free(body);
-                    return;
-                }
-
-                char *body_json = malloc((size_t)content_length + 1);
-                if (!body_json) {
-                    char *body = build_error_response("Out of memory");
-                    send_http_json(client_fd, 500, "Internal Server Error", body);
-                    free(body);
-                    return;
-                }
-                size_t offset = 0;
-                if (leftover > 0) {
-                    *body_start = saved_body_char;
-                    size_t copy_len = leftover > (size_t)content_length ? (size_t)content_length : leftover;
-                    memcpy(body_json, body_start, copy_len);
-                    offset += copy_len;
-                } else {
-                    *body_start = saved_body_char;
-                }
-                while ((long)offset < content_length) {
-                    ssize_t read_bytes = recv(client_fd, body_json + offset, (size_t)content_length - offset, 0);
-                    if (read_bytes <= 0) {
-                        free(body_json);
-                        char *body = build_error_response("Unexpected end of stream");
-                        send_http_json(client_fd, 400, "Bad Request", body);
-                        free(body);
-                        return;
-                    }
-                    offset += (size_t)read_bytes;
-                }
-                body_json[content_length] = '\0';
-
-                bool resolved = false;
-                bool resolved_set = extract_resolved_flag(body_json, &resolved);
-                char *precheck_error = NULL;
-                if (!resolved_set) {
-                    bool current_resolved = false;
-                    if (!db_fetch_deficiency_status(conn, target_uuid, deficiency_id, &current_resolved, &precheck_error)) {
-                        free(body_json);
-                        char *body = build_error_response(precheck_error ? precheck_error : "Missing resolved flag");
-                        int status = precheck_error && strcmp(precheck_error, "Deficiency not found") == 0 ? 404 : 400;
-                        send_http_json(client_fd, status, status == 404 ? "Not Found" : "Bad Request", body);
-                        free(body);
-                        free(precheck_error);
-                        return;
-                    }
-                    resolved = !current_resolved;
-                }
-
-                char *resolved_at = NULL;
-                char *update_error = NULL;
-                bool success = db_update_deficiency_status(conn, target_uuid, deficiency_id, resolved, &resolved_at, &update_error);
-                free(precheck_error);
+                bool handled = routes_handle_patch(client_fd, conn, api_path, body_json);
                 free(body_json);
-                if (!success) {
-                    int status = 500;
-                    if (update_error && strcmp(update_error, "Deficiency not found") == 0) {
-                        status = 404;
-                    }
-                    char *body = build_error_response(update_error ? update_error : "Update failed");
-                    send_http_json(client_fd, status, status == 404 ? "Not Found" : "Internal Server Error", body);
+                if (!handled) {
+                    char *body = build_error_response("Not Found");
+                    send_http_json(client_fd, 404, "Not Found", body);
                     free(body);
-                    free(update_error);
-                    free(resolved_at);
-                    return;
                 }
-                free(update_error);
-
-                char response[256];
-                if (resolved_at) {
-                    snprintf(response, sizeof(response), "{\"status\":\"ok\",\"resolved\":%s,\"resolved_at\":\"%s\"}", resolved ? "true" : "false", resolved_at);
-                } else {
-                    snprintf(response, sizeof(response), "{\"status\":\"ok\",\"resolved\":%s,\"resolved_at\":null}", resolved ? "true" : "false");
-                }
-                free(resolved_at);
-                send_http_json(client_fd, 200, "OK", response);
                 return;
             }
 
             if (strcmp(method, "POST") == 0 && is_api_path && api_path && strcmp(api_path, "/reports") == 0) {
-                long content_length = -1;
-                char *line = header_lines;
-                while (line && *line) {
-                    char *next = strstr(line, "\r\n");
-                    if (!next) break;
-                    if (next == line) break;
-                    size_t len = (size_t)(next - line);
-                    if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
-                        const char *value = line + 15;
-                        while (*value == ' ' || *value == '\t') value++;
-                        content_length = strtol(value, NULL, 10);
-                    }
-                    line = next + 2;
-                }
-
-                if (content_length < 0 || content_length > 262144) {
-                    char *body = build_error_response("Invalid request body length");
-                    send_http_json(client_fd, 400, "Bad Request", body);
-                    free(body);
+                char *body_json = NULL;
+                long body_len = 0;
+                int body_status = 400;
+                const char *body_error = NULL;
+                if (!read_request_body(client_fd, header_lines, body_start, leftover, saved_body_char,
+                                       262144, &body_json, &body_len, &body_status, &body_error)) {
+                    char *response = build_error_response(body_error ? body_error : "Invalid JSON payload");
+                    const char *status_text = body_status == 411 ? "Length Required" :
+                                              (body_status == 500 ? "Internal Server Error" : "Bad Request");
+                    send_http_json(client_fd, body_status, status_text, response);
+                    free(response);
                     return;
                 }
-
-                char *body_json = malloc((size_t)content_length + 1);
-                if (!body_json) {
-                    char *body = build_error_response("Out of memory");
-                    send_http_json(client_fd, 500, "Internal Server Error", body);
-                    free(body);
-                    return;
-                }
-                log_info("/reports content-length=%ld leftover=%zu", content_length, leftover);
-                size_t offset = 0;
-                if (leftover > 0) {
-                    *body_start = saved_body_char;
-                    size_t copy_len = leftover > (size_t)content_length ? (size_t)content_length : leftover;
-                    memcpy(body_json, body_start, copy_len);
-                    offset += copy_len;
-                } else {
-                    *body_start = saved_body_char;
-                }
-                while ((long)offset < content_length) {
-                    ssize_t read_bytes = recv(client_fd, body_json + offset, (size_t)content_length - offset, 0);
-                    if (read_bytes <= 0) {
-                        free(body_json);
-                        char *body = build_error_response("Unexpected end of stream");
-                        send_http_json(client_fd, 400, "Bad Request", body);
-                        free(body);
-                        return;
-                    }
-                    offset += (size_t)read_bytes;
-                }
-                body_json[content_length] = '\0';
+                log_info("/reports content-length=%ld leftover=%zu", body_len, leftover);
 
                 char *parse_error = NULL;
                 JsonValue *root = json_parse(body_json, &parse_error);
@@ -6907,7 +5015,7 @@ static void handle_client(int client_fd, PGconn *conn) {
                     const char *reason = parse_error ? parse_error : "parser returned non-object";
                     log_error("/reports payload parse failure: %s", reason);
                     if (body_json) {
-                        log_error("/reports raw payload: %.*s", (int)content_length, body_json);
+                        log_error("/reports raw payload: %.*s", (int)body_len, body_json);
                     }
                     free(body_json);
                     char *body = build_error_response("Invalid JSON payload");
@@ -7145,49 +5253,6 @@ send_http_json(client_fd, 400, "Bad Request", body);
     free(body);
 }
 
-static int run_server(PGconn *conn, int port) {
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        log_error("socket failed: %s", strerror(errno));
-        return 0;
-    }
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons((uint16_t)port);
-
-    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        log_error("bind failed: %s", strerror(errno));
-        close(server_fd);
-        return 0;
-    }
-    if (listen(server_fd, 16) < 0) {
-        log_error("listen failed: %s", strerror(errno));
-        close(server_fd);
-        return 0;
-    }
-    log_info("Webhook server listening on port %d", port);
-
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
-        if (client_fd < 0) {
-            if (errno == EINTR) continue;
-            log_error("accept failed: %s", strerror(errno));
-            break;
-        }
-        handle_client(client_fd, conn);
-        close(client_fd);
-    }
-    close(server_fd);
-    return 1;
-}
-
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -7330,7 +5395,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    exit_code = run_server(conn, port) ? 0 : 1;
+    exit_code = http_server_run(port, handle_client, conn) ? 0 : 1;
 
 cleanup:
     if (conn) {
