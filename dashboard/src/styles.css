@@ -330,6 +330,12 @@ tbody tr:hover {
   min-width: 0;
 }
 
+.location-subtext {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--muted-text);
+}
+
 .has-open-deficiencies .location-name {
   color: #b45309;
   font-weight: 600;

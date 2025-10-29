@@ -57,9 +57,20 @@ export function fetchLocations(): Promise<LocationSummary[]> {
   return fetchJSON<LocationSummary[]>('/locations');
 }
 
-export function fetchLocationDetail(address: string): Promise<LocationDetail> {
-  const query = new URLSearchParams({ address }).toString();
-  return fetchJSON<LocationDetail>(`/locations?${query}`);
+export interface LocationQuery {
+  address: string;
+  locationId?: number | string | null;
+}
+
+export function fetchLocationDetail(params: LocationQuery): Promise<LocationDetail> {
+  const search = new URLSearchParams();
+  if (params.address && params.address.length > 0) {
+    search.set('address', params.address);
+  }
+  if (params.locationId !== undefined && params.locationId !== null) {
+    search.set('location_id', String(params.locationId));
+  }
+  return fetchJSON<LocationDetail>(`/locations?${search.toString()}`);
 }
 
 export async function createReportJob(request: ReportJobCreateRequest): Promise<ReportJobCreateResponse> {
@@ -125,6 +136,10 @@ export async function createReportJob(request: ReportJobCreateRequest): Promise<
 
   if (request.auditIds && request.auditIds.length > 0) {
     payload.audit_ids = request.auditIds;
+  }
+
+  if (request.locationRowId !== undefined && request.locationRowId !== null) {
+    payload.location_id = request.locationRowId;
   }
 
   const response = await fetch(buildUrl('/reports'), {

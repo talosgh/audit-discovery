@@ -123,7 +123,14 @@ export interface AuditDetailResponse {
 }
 
 export interface LocationSummary {
+  location_code: string | null;
+  location_row_id: number | null;
   address: string;
+  site_name: string | null;
+  street: string | null;
+  city: string | null;
+  state: string | null;
+  zip: string | null;
   building_owner: string | null;
   elevator_contractor: string | null;
   city_id: string | null;
@@ -168,6 +175,7 @@ export interface LocationDevice {
 }
 
 export interface LocationProfileInfo {
+  row_id: number | null;
   location_code: string | null;
   site_name: string | null;
   street: string | null;
@@ -255,12 +263,14 @@ export interface ReportVersion {
   filename: string | null;
   size_bytes: number | null;
   download_url: string | null;
-   include_all?: boolean;
-   selected_count?: number;
+  include_all?: boolean;
+  selected_count?: number;
 }
 
 export interface LocationDetail {
   summary: {
+    location_code: string | null;
+    location_row_id: number | null;
     address: string;
     building_owner: string | null;
     elevator_contractor: string | null;
@@ -284,6 +294,7 @@ export interface LocationDetail {
 
 export interface ReportJobCreateRequest {
   address: string;
+  locationRowId?: number | null;
   notes?: string;
   recommendations?: string;
   coverBuildingOwner?: string;

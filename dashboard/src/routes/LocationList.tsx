@@ -7,7 +7,7 @@ import { formatDateTime } from '../utils';
 import type { LocationSummary } from '../types';
 
 interface LocationListProps {
-  onSelect(address: string): void;
+  onSelect(location: LocationSummary): void;
 }
 
 const LocationList: Component<LocationListProps> = (props) => {
@@ -23,9 +23,15 @@ const LocationList: Component<LocationListProps> = (props) => {
     return list.filter((entry) => {
       const parts: (string | null | undefined)[] = [
         entry.address,
+        entry.site_name,
+        entry.street,
+        entry.city,
+        entry.state,
+        entry.zip,
         entry.building_owner,
         entry.elevator_contractor,
-        entry.city_id
+        entry.city_id,
+        entry.location_code ? `#${entry.location_code}` : null
       ];
       return parts.some((value) => value && value.toLowerCase().includes(term));
     });
@@ -91,17 +97,20 @@ const LocationList: Component<LocationListProps> = (props) => {
                         class="table-row"
                         role="link"
                         tabIndex={0}
-                        aria-label={`View location ${location.address}`}
-                        onClick={() => props.onSelect(location.address)}
+                        aria-label={`View location ${location.site_name ?? location.address}`}
+                        onClick={() => props.onSelect(location)}
                         onKeyDown={(event) => {
                           if (event.key === 'Enter' || event.key === ' ') {
                             event.preventDefault();
-                            props.onSelect(location.address);
+                            props.onSelect(location);
                           }
                         }}
                       >
                         <td class={openCount > 0 ? 'location-cell has-open-deficiencies' : 'location-cell'}>
-                          <span class="location-name">{location.address}</span>
+                          <span class="location-name">{location.site_name ?? location.address}</span>
+                          <Show when={location.site_name && location.site_name !== location.address}>
+                            <span class="location-subtext">{location.address}</span>
+                          </Show>
                           <Show when={openCount > 0}>
                             <span class="deficiency-chip" role="img" aria-label="Open deficiencies">⚠</span>
                           </Show>

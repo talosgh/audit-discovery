@@ -23,10 +23,11 @@ import os
 import sys
 import time
 from dataclasses import asdict, dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import psycopg
 import requests
+import random
 
 
 # -----------------------------------------------------------------------------
@@ -89,6 +90,8 @@ class GoogleValidator:
         self.cache_path = cache_path
         self.cache: Dict[str, dict] = {}
         self._dirty = False
+        self.session = requests.Session()
+        self._backoff = 0.5
         if cache_path and os.path.exists(cache_path):
             with open(cache_path, "r", encoding="utf-8") as fh:
                 try:
@@ -128,10 +131,26 @@ class GoogleValidator:
         }
         params = {"key": self.api_key}
 
-        try:
-            resp = requests.post(self.ENDPOINT, params=params, json=payload, timeout=20)
-        except requests.RequestException as exc:
-            print(f"[validator] HTTP error for '{raw_address}': {exc}", file=sys.stderr)
+        resp = None
+        for attempt in range(5):
+            try:
+                resp = self.session.post(self.ENDPOINT, params=params, json=payload, timeout=20)
+            except requests.RequestException as exc:
+                wait = min(self._backoff * (2 ** attempt), 15)
+                print(f"[validator] HTTP error for '{raw_address}': {exc} (retry in {wait:.1f}s)", file=sys.stderr)
+                time.sleep(wait)
+                continue
+
+            if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                wait = min(self._backoff * (2 ** attempt), 15)
+                print(
+                    f"[validator] HTTP {resp.status_code} for '{raw_address}', retry in {wait:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(wait + random.uniform(0, 0.5))
+                continue
+            break
+        else:
             self.cache[key] = "__ERROR__"
             self._dirty = True
             return None
@@ -186,7 +205,7 @@ class GoogleValidator:
 
         self.cache[key] = asdict(normalized)
         self._dirty = True
-        time.sleep(0.15)  # modest pacing
+        time.sleep(0.05)
         return normalized
 
 
@@ -251,6 +270,31 @@ def _extract_float(obj: dict, key: str) -> Optional[float]:
 # Database sanitation operations
 # -----------------------------------------------------------------------------
 
+def normalize_address_set(label: str, addresses: Iterable[str], validator: GoogleValidator) -> Dict[str, Optional[NormalizedAddress]]:
+    unique: list[str] = []
+    seen = set()
+    for addr in addresses:
+        if not addr:
+            continue
+        norm = addr.strip()
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        unique.append(norm)
+
+    total = len(unique)
+    results: Dict[str, Optional[NormalizedAddress]] = {}
+    if not total:
+        return results
+
+    print(f"[validator:{label}] normalizing {total} unique addresses...")
+    for idx, raw in enumerate(unique, 1):
+        results[raw] = validator.validate(raw)
+        if idx % 50 == 0 or idx == total:
+            print(f"[validator:{label}] {idx}/{total}", flush=True)
+    return results
+
+
 def sanitize_locations(conn, validator: GoogleValidator, limit: Optional[int], dry_run: bool) -> Dict[Tuple[str, str, str, str], dict]:
     print("[locations] fetching records...")
     with conn.cursor() as cur:
@@ -263,6 +307,8 @@ def sanitize_locations(conn, validator: GoogleValidator, limit: Optional[int], d
         )
         rows = cur.fetchall()
 
+    address_rows = []
+    raw_addresses = []
     updates = []
     location_index: Dict[Tuple[str, str, str, str], dict] = {}
     processed = 0
@@ -281,7 +327,13 @@ def sanitize_locations(conn, validator: GoogleValidator, limit: Optional[int], d
             else:
                 continue
 
-        normalized = validator.validate(raw_address)
+        address_rows.append((row_id, location_code, raw_address))
+        raw_addresses.append(raw_address)
+
+    normalized_map = normalize_address_set("locations", raw_addresses, validator)
+
+    for row_id, location_code, raw_address in address_rows:
+        normalized = normalized_map.get(raw_address.strip())
         if not normalized:
             print(f"[locations] validation failed for id={row_id} ({raw_address})", file=sys.stderr)
             continue
@@ -306,7 +358,6 @@ def sanitize_locations(conn, validator: GoogleValidator, limit: Optional[int], d
             "postal": normalized.postal_code,
         }
         location_index[key] = entry
-        # allow zip-less fallback
         location_index[(key[0], key[1], key[2], "")] = entry
 
     if not dry_run and updates:
@@ -352,6 +403,8 @@ def sanitize_service_records(
     updates = []
     processed = 0
     matched = 0
+    address_rows = []
+    raw_addresses = []
     for row in rows:
         if limit and processed >= limit:
             break
@@ -363,7 +416,13 @@ def sanitize_service_records(
         if not raw_address:
             continue
 
-        normalized = validator.validate(raw_address)
+        address_rows.append((record_id, current_location_id, raw_address))
+        raw_addresses.append(raw_address)
+
+    normalized_map = normalize_address_set("service", raw_addresses, validator)
+
+    for record_id, current_location_id, raw_address in address_rows:
+        normalized = normalized_map.get(raw_address.strip())
         if not normalized:
             print(f"[service] validation failed for record {record_id}", file=sys.stderr)
             continue
@@ -432,6 +491,8 @@ def sanitize_audits(
     updates = []
     processed = 0
     matched = 0
+    address_rows = []
+    raw_addresses = []
     for row in rows:
         if limit and processed >= limit:
             break
@@ -450,7 +511,13 @@ def sanitize_audits(
         if not raw_address.strip():
             continue
 
-        normalized = validator.validate(raw_address)
+        address_rows.append((audit_uuid, current_location_id, raw_address))
+        raw_addresses.append(raw_address)
+
+    normalized_map = normalize_address_set("audits", raw_addresses, validator)
+
+    for audit_uuid, current_location_id, raw_address in address_rows:
+        normalized = normalized_map.get(raw_address.strip())
         if not normalized:
             print(f"[audits] validation failed for audit {audit_uuid}", file=sys.stderr)
             continue

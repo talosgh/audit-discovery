@@ -465,8 +465,8 @@ static void report_data_clear(ReportData *data);
 static void report_device_init(ReportDevice *device);
 static void report_device_clear(ReportDevice *device);
 static int report_device_list_append_move(ReportDeviceList *list, ReportDevice *device);
-static char *build_location_detail_json(const ReportData *report);
-static int load_report_for_building(PGconn *conn, const char *building_address, const StringArray *audit_filter, ReportData *report, char **error_out);
+static char *build_location_detail_json(const ReportData *report, const LocationProfile *profile);
+static int load_report_for_building(PGconn *conn, const char *building_address, const OptionalInt *location_row_id, const StringArray *audit_filter, ReportData *report, char **error_out);
 static char *report_data_to_json(const ReportData *report);
 static char *pg_array_from_string_array(const StringArray *array);
 static void location_profile_init(LocationProfile *profile);
@@ -531,7 +531,7 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     ReportData report;
     report_data_init(&report);
     char *load_error = NULL;
-    int ok = load_report_for_building(conn, lookup_address, NULL, &report, &load_error);
+    int ok = load_report_for_building(conn, lookup_address, &profile.row_id, NULL, &report, &load_error);
     if (!ok) {
         int status = 500;
         if (load_error && strcmp(load_error, "No audits found for building address") == 0) {
@@ -552,7 +552,7 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     }
     free(load_error);
 
-    char *summary_json = build_location_detail_json(&report);
+    char *summary_json = build_location_detail_json(&report, &profile);
     report_data_clear(&report);
     if (!summary_json) {
         if (error_out && !*error_out) {
@@ -722,7 +722,7 @@ static char *build_report_json_payload(PGconn *conn, const LocationDetailRequest
     ReportData report;
     report_data_init(&report);
     char *load_error = NULL;
-    int ok = load_report_for_building(conn, lookup_address, NULL, &report, &load_error);
+    int ok = load_report_for_building(conn, lookup_address, &profile.row_id, NULL, &report, &load_error);
     if (!ok) {
         int status = 500;
         if (load_error && strcmp(load_error, "No audits found for building address") == 0) {
@@ -1743,7 +1743,7 @@ static char *build_device_narrative_fallback(const ReportDevice *device) {
     return result;
 }
 
-static char *build_location_detail_json(const ReportData *report) {
+static char *build_location_detail_json(const ReportData *report, const LocationProfile *profile) {
     if (!report) {
         return NULL;
     }
@@ -1805,6 +1805,18 @@ static char *build_location_detail_json(const ReportData *report) {
 
     if (!buffer_append_cstr(&buf, "\"open_deficiencies\":")) goto oom;
     if (!buffer_appendf(&buf, "%zu", total_open)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"location_row_id\":")) goto oom;
+    if (profile && profile->row_id.has_value) {
+        if (!buffer_appendf(&buf, "%d", profile->row_id.value)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"location_code\":")) goto oom;
+    if (!buffer_append_json_string(&buf, profile ? profile->location_code : NULL)) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
 
     if (!buffer_append_cstr(&buf, "\"deficiencies_by_code\":{")) goto oom;
@@ -2968,10 +2980,17 @@ fail:
     }
 }
 
-static int load_report_for_building(PGconn *conn, const char *building_address, const StringArray *audit_filter, ReportData *report, char **error_out) {
-    if (!conn || !building_address || !report) {
+static int load_report_for_building(PGconn *conn, const char *building_address, const OptionalInt *location_row_id, const StringArray *audit_filter, ReportData *report, char **error_out) {
+    bool has_location = location_row_id && location_row_id->has_value && location_row_id->value > 0;
+    if (!conn || !report) {
         if (error_out && !*error_out) {
             *error_out = strdup("Invalid parameters while loading report");
+        }
+        return 0;
+    }
+    if (!has_location && (!building_address || building_address[0] == '\0')) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Building address or location id required");
         }
         return 0;
     }
@@ -3065,24 +3084,136 @@ static int load_report_for_building(PGconn *conn, const char *building_address, 
         "   AND a.audit_uuid = ANY($2::uuid[])"
         " ORDER BY a.submitted_on NULLS LAST, a.building_id";
 
+
+    static const char *SQL_LOCATION_ALL =
+        "SELECT "
+        "  a.audit_uuid::text," 
+        "  a.building_id," 
+        "  a.device_type," 
+        "  a.bank_name," 
+        "  a.general_notes," 
+        "  a.controller_install_year," 
+        "  a.controller_manufacturer," 
+        "  a.controller_model," 
+        "  a.controller_type," 
+        "  a.controller_power_system," 
+        "  a.machine_manufacturer," 
+        "  a.machine_type," 
+        "  a.roping," 
+        "  a.door_operation," 
+        "  a.door_operation_type," 
+        "  a.number_of_stops," 
+        "  a.number_of_openings," 
+        "  a.capacity," 
+        "  a.car_speed," 
+        "  a.code_data_year," 
+        "  a.cat1_tag_current," 
+        "  a.cat1_tag_date," 
+        "  a.cat5_tag_current," 
+        "  a.cat5_tag_date," 
+        "  a.dlm_compliant," 
+        "  a.maintenance_log_up_to_date," 
+        "  a.code_data_plate_present," 
+        "  a.door_opening_width," 
+        "  a.rating_overall," 
+        "  a.submitted_on," 
+        "  array_to_json(COALESCE(a.cars_in_bank, ARRAY[]::text[]))::text AS cars_in_bank_json," 
+        "  array_to_json(COALESCE(a.total_floor_stop_names, ARRAY[]::text[]))::text AS total_floor_stop_names_json," 
+        "  array_to_json(COALESCE(a.floors_served, ARRAY[]::text[]))::text AS floors_served_json," 
+        "  a.building_address," 
+        "  a.building_owner," 
+        "  a.elevator_contractor," 
+        "  a.city_id," 
+        "  a.is_first_car" 
+        " FROM audits a" 
+        " WHERE a.location_id = $1::int" 
+        " ORDER BY a.submitted_on NULLS LAST, a.building_id";
+
+    static const char *SQL_LOCATION_FILTERED =
+        "SELECT "
+        "  a.audit_uuid::text," 
+        "  a.building_id," 
+        "  a.device_type," 
+        "  a.bank_name," 
+        "  a.general_notes," 
+        "  a.controller_install_year," 
+        "  a.controller_manufacturer," 
+        "  a.controller_model," 
+        "  a.controller_type," 
+        "  a.controller_power_system," 
+        "  a.machine_manufacturer," 
+        "  a.machine_type," 
+        "  a.roping," 
+        "  a.door_operation," 
+        "  a.door_operation_type," 
+        "  a.number_of_stops," 
+        "  a.number_of_openings," 
+        "  a.capacity," 
+        "  a.car_speed," 
+        "  a.code_data_year," 
+        "  a.cat1_tag_current," 
+        "  a.cat1_tag_date," 
+        "  a.cat5_tag_current," 
+        "  a.cat5_tag_date," 
+        "  a.dlm_compliant," 
+        "  a.maintenance_log_up_to_date," 
+        "  a.code_data_plate_present," 
+        "  a.door_opening_width," 
+        "  a.rating_overall," 
+        "  a.submitted_on," 
+        "  array_to_json(COALESCE(a.cars_in_bank, ARRAY[]::text[]))::text AS cars_in_bank_json," 
+        "  array_to_json(COALESCE(a.total_floor_stop_names, ARRAY[]::text[]))::text AS total_floor_stop_names_json," 
+        "  array_to_json(COALESCE(a.floors_served, ARRAY[]::text[]))::text AS floors_served_json," 
+        "  a.building_address," 
+        "  a.building_owner," 
+        "  a.elevator_contractor," 
+        "  a.city_id," 
+        "  a.is_first_car" 
+        " FROM audits a" 
+        " WHERE a.location_id = $1::int" 
+        "   AND a.audit_uuid = ANY($2::uuid[])" 
+        " ORDER BY a.submitted_on NULLS LAST, a.building_id";
+
     bool has_filter = audit_filter && audit_filter->count > 0;
     char *audit_array = NULL;
-    const char *params[2] = { building_address, NULL };
-    int param_count = 1;
+    const char *params[2] = { NULL, NULL };
+    int param_count = 0;
+    char idbuf[32];
+    const char *sql = NULL;
 
-    if (has_filter) {
-        audit_array = pg_array_from_string_array(audit_filter);
-        if (!audit_array) {
-            if (error_out && !*error_out) {
-                *error_out = strdup("Failed to prepare audit selection");
+    if (has_location) {
+        snprintf(idbuf, sizeof(idbuf), "%d", location_row_id->value);
+        params[0] = idbuf;
+        param_count = 1;
+        if (has_filter) {
+            audit_array = pg_array_from_string_array(audit_filter);
+            if (!audit_array) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Failed to prepare audit selection");
+                }
+                return 0;
             }
-            return 0;
+            params[1] = audit_array;
+            param_count = 2;
         }
-        params[1] = audit_array;
-        param_count = 2;
+        sql = has_filter ? SQL_LOCATION_FILTERED : SQL_LOCATION_ALL;
+    } else {
+        params[0] = building_address;
+        param_count = 1;
+        if (has_filter) {
+            audit_array = pg_array_from_string_array(audit_filter);
+            if (!audit_array) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Failed to prepare audit selection");
+                }
+                return 0;
+            }
+            params[1] = audit_array;
+            param_count = 2;
+        }
+        sql = has_filter ? SQL_FILTERED : SQL_ALL;
     }
 
-    const char *sql = has_filter ? SQL_FILTERED : SQL_ALL;
     PGresult *res = PQexecParams(conn, sql, param_count, NULL, params, NULL, NULL, 0);
     if (audit_array) {
         free(audit_array);
@@ -3098,9 +3229,10 @@ static int load_report_for_building(PGconn *conn, const char *building_address, 
     }
 
     int rows = PQntuples(res);
-    if (rows == 0 && has_filter) {
+    if (rows == 0) {
         if (error_out && !*error_out) {
-            *error_out = strdup("No audits found for selected criteria");
+            const char *not_found = has_location ? "No audits found for location" : "No audits found for building address";
+            *error_out = strdup(has_filter ? "No audits found for selected criteria" : not_found);
         }
         PQclear(res);
         return 0;
@@ -4337,7 +4469,7 @@ static int append_unique_candidate(StringArray *array, const char *value) {
     return string_array_append_copy(array, value);
 }
 
-static int append_audits_for_visits(PGconn *conn, const char *address, const StringArray *visit_ids, StringArray *out, char **error_out) {
+static int append_audits_for_visits(PGconn *conn, const char *address, const OptionalInt *location_row_id, const StringArray *visit_ids, StringArray *out, char **error_out) {
     if (!visit_ids || visit_ids->count == 0) {
         return 1;
     }
@@ -4348,6 +4480,7 @@ static int append_audits_for_visits(PGconn *conn, const char *address, const Str
         return 0;
     }
 
+    bool has_location = location_row_id && location_row_id->has_value && location_row_id->value > 0;
     char *visit_array = pg_array_from_string_array(visit_ids);
     if (!visit_array) {
         if (error_out && !*error_out) {
@@ -4367,9 +4500,29 @@ static int append_audits_for_visits(PGconn *conn, const char *address, const Str
         "WHERE visit_id = ANY($1::uuid[]) "
         "  AND trim(lower(building_address)) = trim(lower($2))";
 
-    const char *params[2] = { visit_array, address };
-    int param_count = (address && address[0]) ? 2 : 1;
-    PGresult *res = PQexecParams(conn, (param_count == 2) ? sql_with_address : sql_base, param_count, NULL, params, NULL, NULL, 0);
+    const char *sql_with_location =
+        "SELECT audit_uuid::text "
+        "FROM audits "
+        "WHERE visit_id = ANY($1::uuid[]) "
+        "  AND location_id = $2::int";
+
+    const char *params[2] = { visit_array, NULL };
+    int param_count = 1;
+    char idbuf[32];
+    const char *sql = sql_base;
+
+    if (has_location) {
+        snprintf(idbuf, sizeof(idbuf), "%d", location_row_id->value);
+        params[1] = idbuf;
+        param_count = 2;
+        sql = sql_with_location;
+    } else if (address && address[0]) {
+        params[1] = address;
+        param_count = 2;
+        sql = sql_with_address;
+    }
+
+    PGresult *res = PQexecParams(conn, sql, param_count, NULL, params, NULL, NULL, 0);
     free(visit_array);
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
@@ -4408,11 +4561,12 @@ static int append_audits_for_visits(PGconn *conn, const char *address, const Str
     return 1;
 }
 
-static int append_valid_audits_for_address(PGconn *conn, const char *address, const StringArray *audit_ids, StringArray *out, char **error_out) {
+static int append_valid_audits_for_address(PGconn *conn, const char *address, const OptionalInt *location_row_id, const StringArray *audit_ids, StringArray *out, char **error_out) {
     if (!audit_ids || audit_ids->count == 0) {
         return 1;
     }
-    if (!conn || !address || !address[0] || !out) {
+    bool has_location = location_row_id && location_row_id->has_value && location_row_id->value > 0;
+    if (!conn || (!has_location && (!address || !address[0])) || !out) {
         if (error_out && !*error_out) {
             *error_out = strdup("Invalid audit selection");
         }
@@ -4427,13 +4581,29 @@ static int append_valid_audits_for_address(PGconn *conn, const char *address, co
         return 0;
     }
 
-    const char *sql =
+    const char *sql_address =
         "SELECT audit_uuid::text "
         "FROM audits "
         "WHERE audit_uuid = ANY($1::uuid[]) "
         "  AND trim(lower(building_address)) = trim(lower($2))";
 
-    const char *params[2] = { audit_array, address };
+    const char *sql_location =
+        "SELECT audit_uuid::text "
+        "FROM audits "
+        "WHERE audit_uuid = ANY($1::uuid[]) "
+        "  AND location_id = $2::int";
+
+    const char *params[2] = { audit_array, NULL };
+    char idbuf[32];
+    const char *sql = sql_address;
+    if (has_location) {
+        snprintf(idbuf, sizeof(idbuf), "%d", location_row_id->value);
+        params[1] = idbuf;
+        sql = sql_location;
+    } else {
+        params[1] = address;
+    }
+
     PGresult *res = PQexecParams(conn, sql, 2, NULL, params, NULL, NULL, 0);
     free(audit_array);
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -5635,6 +5805,14 @@ static char *build_location_profile_json(const LocationProfile *profile) {
     }
 
     if (!buffer_append_char(&buf, '{')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"row_id\":")) goto oom;
+    if (profile && profile->row_id.has_value) {
+        if (!buffer_appendf(&buf, "%d", profile->row_id.value)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
     if (!buffer_append_cstr(&buf, "\"location_code\":")) goto oom;
     if (!buffer_append_json_string(&buf, profile ? profile->location_code : NULL)) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
@@ -8495,7 +8673,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
 
     const char *params[1] = { job_id };
     const char *sql =
-        "SELECT address, status, artifact_filename, artifact_mime, artifact_bytes, artifact_size, artifact_version, deficiency_only, include_all "
+        "SELECT address, status, artifact_filename, artifact_mime, artifact_bytes, artifact_size, artifact_version, deficiency_only, include_all, location_id "
         "FROM report_jobs "
         "WHERE job_id = $1::uuid";
 
@@ -8521,6 +8699,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
     const char *artifact_version_val = PQgetisnull(res, 0, 6) ? NULL : PQgetvalue(res, 0, 6);
     const char *deficiency_only_val = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
     const char *include_all_val = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
+    const char *location_id_val = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
 
     if (!status_val || strcmp(status_val, "completed") != 0) {
         if (error_out && !*error_out) {
@@ -8530,6 +8709,13 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
     }
     bool deficiency_only = deficiency_only_val && (strcmp(deficiency_only_val, "t") == 0 || strcmp(deficiency_only_val, "true") == 0 || strcmp(deficiency_only_val, "1") == 0);
     bool include_all = !(include_all_val && (strcmp(include_all_val, "f") == 0 || strcmp(include_all_val, "false") == 0 || strcmp(include_all_val, "0") == 0));
+
+    OptionalInt job_location_id;
+    optional_int_clear(&job_location_id);
+    if (location_id_val && location_id_val[0]) {
+        job_location_id.has_value = true;
+        job_location_id.value = atoi(location_id_val);
+    }
 
     if (!artifact_bytes_val) {
         if (error_out && !*error_out) {
@@ -8661,7 +8847,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
         PQclear(audit_res);
     }
 
-    if (!load_report_for_building(conn, address_copy, include_all ? NULL : &job_audits, &report, &load_error)) {
+    if (!load_report_for_building(conn, address_copy, &job_location_id, include_all ? NULL : &job_audits, &report, &load_error)) {
         if (error_out && !*error_out) {
             *error_out = load_error ? load_error : strdup("Failed to load report data");
         }
@@ -8806,8 +8992,15 @@ static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char 
     unsigned char *pdf_bytes = NULL;
     size_t pdf_size = 0;
 
+    OptionalInt job_location;
+    optional_int_clear(&job_location);
+    if (job->has_location_id) {
+        job_location.has_value = true;
+        job_location.value = job->location_id;
+    }
+
     char *load_error = NULL;
-    if (!load_report_for_building(conn, job->address, job->include_all ? NULL : &job->audit_ids, &report, &load_error)) {
+    if (!load_report_for_building(conn, job->address, &job_location, job->include_all ? NULL : &job->audit_ids, &report, &load_error)) {
         if (error_out && !*error_out) {
             *error_out = load_error ? load_error : strdup("Failed to load report data");
         } else {
@@ -11131,10 +11324,17 @@ static void handle_client(int client_fd, void *ctx) {
                 location_profile_clear(&profile);
                 free(lookup_address);
 
+                OptionalInt target_location;
+                optional_int_clear(&target_location);
+                if (request.has_location_id) {
+                    target_location.has_value = true;
+                    target_location.value = request.location_id;
+                }
+
                 // Load audits from visit selections
                 if (visit_ids_list.count > 0) {
                     char *visit_error = NULL;
-                    if (!append_audits_for_visits(conn, request.address, &visit_ids_list, &request.audit_ids, &visit_error)) {
+                    if (!append_audits_for_visits(conn, request.address, &target_location, &visit_ids_list, &request.audit_ids, &visit_error)) {
                         char *body = build_error_response(visit_error ? visit_error : "Failed to resolve visit audits");
                         send_http_json(client_fd, 400, "Bad Request", body);
                         free(body);
@@ -11149,7 +11349,7 @@ static void handle_client(int client_fd, void *ctx) {
 
                 if (manual_audit_ids.count > 0) {
                     char *audit_error = NULL;
-                    if (!append_valid_audits_for_address(conn, request.address, &manual_audit_ids, &request.audit_ids, &audit_error)) {
+                    if (!append_valid_audits_for_address(conn, request.address, &target_location, &manual_audit_ids, &request.audit_ids, &audit_error)) {
                         char *body = build_error_response(audit_error ? audit_error : "Invalid audit selection");
                         send_http_json(client_fd, 400, "Bad Request", body);
                         free(body);

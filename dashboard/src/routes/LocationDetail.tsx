@@ -1,13 +1,20 @@
 import type { Component } from 'solid-js';
 import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
-import { fetchLocationDetail, downloadReport, createReportJob, fetchReportJob, updateDeficiencyStatus } from '../api';
+import { fetchLocationDetail, downloadReport, createReportJob, fetchReportJob, updateDeficiencyStatus, type LocationQuery } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
 import { formatDateTime, formatFileSize, slugify } from '../utils';
 import type { LocationDetail as LocationDetailType, LocationDevice, ReportJobStatus, ReportVersion } from '../types';
 
-interface LocationDetailProps {
+interface LocationSelection {
   address: string;
+  locationRowId?: number | null;
+  locationCode?: string | null;
+  siteName?: string | null;
+}
+
+interface LocationDetailProps {
+  location: LocationSelection;
   onBack(): void;
   onSelectAudit(id: string): void;
 }
@@ -34,7 +41,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [formError, setFormError] = createSignal<string | null>(null);
   const [includeAllVisits, setIncludeAllVisits] = createSignal(true);
   const [selectedVisitIds, setSelectedVisitIds] = createSignal<Set<string>>(new Set());
-  const [detail, { refetch }] = createResource<LocationDetailType, string>(() => props.address, fetchLocationDetail);
+  const [detail, { refetch }] = createResource<LocationDetailType, LocationQuery>(
+    () => ({ address: props.location.address, locationId: props.location.locationRowId ?? null }),
+    fetchLocationDetail
+  );
   let ownerInputRef: HTMLInputElement | undefined;
 
   const dismissMessage = () => setMessage(null);
@@ -150,7 +160,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   });
 
   createEffect(() => {
-    props.address;
+    props.location.address;
+    props.location.locationRowId;
     stopPolling();
     setJobId(null);
     setJobStatus(null);
@@ -312,7 +323,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       setStatusMessage(`${label} queued for generation (${selectionLabel})…`);
       setLastDownload(null);
       const response = await createReportJob({
-        address: props.address,
+        address: props.location.address,
+        locationRowId: detail()?.summary.location_row_id ?? props.location.locationRowId ?? null,
         coverBuildingOwner: owner,
         coverStreet: street,
         coverCity: city,
@@ -362,7 +374,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       setIsGenerating(true);
       setStatusMessage(`Deficiency list queued for generation (${selectionLabel})…`);
       const response = await createReportJob({
-        address: props.address,
+        address: props.location.address,
+        locationRowId: detail()?.summary.location_row_id ?? props.location.locationRowId ?? null,
         deficiencyOnly: true,
         visitIds: includeAllVisits() ? undefined : visitSelection
       });
@@ -395,7 +408,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
         if (contentType && contentType.includes('pdf')) return 'pdf';
         return 'zip';
       })();
-      const fallbackName = `audit-report-${slugify(props.address)}.${inferredExt}`;
+      const fallbackName = `audit-report-${slugify(props.location.address)}.${inferredExt}`;
       const filename = serverFilename ?? fallbackName;
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -477,7 +490,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
           <button type="button" class="back-button" onClick={props.onBack}>
             ← Locations
           </button>
-          <h1 id="location-heading">{props.address}</h1>
+          <h1 id="location-heading">{detail()?.profile?.site_name ?? summary()?.address ?? props.location.siteName ?? props.location.address}</h1>
           <Show when={summary()?.building_owner}>
             {(owner) => <p class="section-subtitle">Owned by {owner()}</p>}
           </Show>
@@ -534,7 +547,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
               <div class="profile-grid">
                 <div>
                   <span class="profile-label">Address</span>
-                  <span class="profile-value">{profile()?.address_label ?? summary()?.address ?? props.address}</span>
+                  <span class="profile-value">{profile()?.address_label ?? summary()?.address ?? props.location.address}</span>
                 </div>
                 <div>
                   <span class="profile-label">Site Name</span>

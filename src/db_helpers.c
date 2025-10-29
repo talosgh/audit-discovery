@@ -83,7 +83,14 @@ char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out) {
 char *db_fetch_location_list(PGconn *conn, char **error_out) {
     const char *sql =
         "SELECT "
+        "  COALESCE(l.location_id, '') AS location_code,"
+        "  l.id AS location_row_id,"
         "  a.building_address,"
+        "  COALESCE(l.site_name, a.building_address) AS site_name,"
+        "  COALESCE(l.street, a.building_address) AS street,"
+        "  COALESCE(l.city, a.building_city) AS city,"
+        "  COALESCE(l.state, a.building_state) AS state,"
+        "  COALESCE(l.zip_code, a.building_postal_code) AS zip,"
         "  MAX(a.building_owner) AS building_owner,"
         "  MAX(a.elevator_contractor) AS elevator_contractor,"
         "  MAX(a.city_id) AS city_id,"
@@ -93,13 +100,14 @@ char *db_fetch_location_list(PGconn *conn, char **error_out) {
         "  MIN(a.submitted_on) AS first_audit,"
         "  COALESCE(SUM(d.open_def_count), 0) AS open_deficiencies"
         " FROM audits a"
+        " LEFT JOIN locations l ON a.location_id = l.id"
         " LEFT JOIN ("
         "   SELECT audit_uuid, COUNT(*) FILTER (WHERE resolved_at IS NULL) AS open_def_count"
         "   FROM audit_deficiencies"
         "   GROUP BY audit_uuid"
         " ) d ON d.audit_uuid = a.audit_uuid"
         " WHERE a.building_address IS NOT NULL AND a.building_address <> ''"
-        " GROUP BY a.building_address"
+        " GROUP BY a.building_address, l.id, l.location_id, l.site_name, l.street, l.city, l.state, l.zip_code"
         " ORDER BY MAX(a.submitted_on) DESC NULLS LAST, a.building_address";
 
     PGresult *res = PQexec(conn, sql);
@@ -133,18 +141,25 @@ char *db_fetch_location_list(PGconn *conn, char **error_out) {
     int rows = PQntuples(res);
     bool first = true;
     for (int row = 0; row < rows; ++row) {
-        const char *address = PQgetisnull(res, row, 0) ? NULL : PQgetvalue(res, row, 0);
+        const char *location_code = PQgetisnull(res, row, 0) ? NULL : PQgetvalue(res, row, 0);
+        const char *row_id_str = PQgetisnull(res, row, 1) ? NULL : PQgetvalue(res, row, 1);
+        const char *address = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
         if (!address || address[0] == '\0') {
             continue;
         }
-        const char *owner = PQgetisnull(res, row, 1) ? NULL : PQgetvalue(res, row, 1);
-        const char *contractor = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
-        const char *city_id = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
-        const char *audit_count_str = PQgetisnull(res, row, 4) ? "0" : PQgetvalue(res, row, 4);
-        const char *device_count_str = PQgetisnull(res, row, 5) ? "0" : PQgetvalue(res, row, 5);
-        const char *last_audit = PQgetisnull(res, row, 6) ? NULL : PQgetvalue(res, row, 6);
-        const char *first_audit = PQgetisnull(res, row, 7) ? NULL : PQgetvalue(res, row, 7);
-        const char *open_def_str = PQgetisnull(res, row, 8) ? "0" : PQgetvalue(res, row, 8);
+        const char *site_name = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
+        const char *street = PQgetisnull(res, row, 4) ? NULL : PQgetvalue(res, row, 4);
+        const char *city = PQgetisnull(res, row, 5) ? NULL : PQgetvalue(res, row, 5);
+        const char *state = PQgetisnull(res, row, 6) ? NULL : PQgetvalue(res, row, 6);
+        const char *zip = PQgetisnull(res, row, 7) ? NULL : PQgetvalue(res, row, 7);
+        const char *owner = PQgetisnull(res, row, 8) ? NULL : PQgetvalue(res, row, 8);
+        const char *contractor = PQgetisnull(res, row, 9) ? NULL : PQgetvalue(res, row, 9);
+        const char *city_id = PQgetisnull(res, row, 10) ? NULL : PQgetvalue(res, row, 10);
+        const char *audit_count_str = PQgetisnull(res, row, 11) ? "0" : PQgetvalue(res, row, 11);
+        const char *device_count_str = PQgetisnull(res, row, 12) ? "0" : PQgetvalue(res, row, 12);
+        const char *last_audit = PQgetisnull(res, row, 13) ? NULL : PQgetvalue(res, row, 13);
+        const char *first_audit = PQgetisnull(res, row, 14) ? NULL : PQgetvalue(res, row, 14);
+        const char *open_def_str = PQgetisnull(res, row, 15) ? "0" : PQgetvalue(res, row, 15);
 
         if (!first) {
             if (!buffer_append_char(&buf, ',')) {
@@ -159,8 +174,44 @@ char *db_fetch_location_list(PGconn *conn, char **error_out) {
         first = false;
 
         if (!buffer_append_char(&buf, '{')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"location_code\":")) goto oom;
+        if (location_code && location_code[0]) {
+            if (!buffer_append_json_string(&buf, location_code)) goto oom;
+        } else {
+            if (!buffer_append_cstr(&buf, "null")) goto oom;
+        }
+        if (!buffer_append_char(&buf, ',')) goto oom;
+
+        if (!buffer_append_cstr(&buf, "\"location_row_id\":")) goto oom;
+        if (row_id_str && row_id_str[0]) {
+            if (!buffer_append_cstr(&buf, row_id_str)) goto oom;
+        } else {
+            if (!buffer_append_cstr(&buf, "null")) goto oom;
+        }
+        if (!buffer_append_char(&buf, ',')) goto oom;
+
         if (!buffer_append_cstr(&buf, "\"address\":")) goto oom;
         if (!buffer_append_json_string(&buf, address)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+
+        if (!buffer_append_cstr(&buf, "\"site_name\":")) goto oom;
+        if (!buffer_append_json_string(&buf, site_name)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+
+        if (!buffer_append_cstr(&buf, "\"street\":")) goto oom;
+        if (!buffer_append_json_string(&buf, street)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+
+        if (!buffer_append_cstr(&buf, "\"city\":")) goto oom;
+        if (!buffer_append_json_string(&buf, city)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+
+        if (!buffer_append_cstr(&buf, "\"state\":")) goto oom;
+        if (!buffer_append_json_string(&buf, state)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+
+        if (!buffer_append_cstr(&buf, "\"zip\":")) goto oom;
+        if (!buffer_append_json_string(&buf, zip)) goto oom;
         if (!buffer_append_char(&buf, ',')) goto oom;
 
         if (!buffer_append_cstr(&buf, "\"building_owner\":")) goto oom;

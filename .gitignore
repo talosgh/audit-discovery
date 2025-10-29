@@ -2,6 +2,8 @@
 /audit_webhook
 *.o
 
+__pycache__/
+
 # Build dirs
 /build/
 /dist/
