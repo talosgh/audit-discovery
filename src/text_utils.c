@@ -33,39 +33,72 @@ char *sanitize_ascii(const char *text) {
             }
             continue;
         }
+
+        unsigned int codepoint = 0;
+        size_t advance = 0;
         if ((c & 0xE0) == 0xC0 && i + 1 < len) {
             unsigned char c1 = (unsigned char)text[i + 1];
             if ((c1 & 0xC0) == 0x80) {
-                out[o++] = (char)c;
-                out[o++] = (char)c1;
-                i += 1;
-                continue;
+                codepoint = ((c & 0x1F) << 6) | (c1 & 0x3F);
+                advance = 1;
             }
-        }
-        if ((c & 0xF0) == 0xE0 && i + 2 < len) {
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < len) {
             unsigned char c1 = (unsigned char)text[i + 1];
             unsigned char c2 = (unsigned char)text[i + 2];
             if (((c1 & 0xC0) == 0x80) && ((c2 & 0xC0) == 0x80)) {
-                out[o++] = (char)c;
-                out[o++] = (char)c1;
-                out[o++] = (char)c2;
-                i += 2;
-                continue;
+                codepoint = ((c & 0x0F) << 12) | ((c1 & 0x3F) << 6) | (c2 & 0x3F);
+                advance = 2;
             }
-        }
-        if ((c & 0xF8) == 0xF0 && i + 3 < len) {
+        } else if ((c & 0xF8) == 0xF0 && i + 3 < len) {
             unsigned char c1 = (unsigned char)text[i + 1];
             unsigned char c2 = (unsigned char)text[i + 2];
             unsigned char c3 = (unsigned char)text[i + 3];
             if (((c1 & 0xC0) == 0x80) && ((c2 & 0xC0) == 0x80) && ((c3 & 0xC0) == 0x80)) {
-                out[o++] = (char)c;
-                out[o++] = (char)c1;
-                out[o++] = (char)c2;
-                out[o++] = (char)c3;
-                i += 3;
-                continue;
+                codepoint = ((c & 0x07) << 18) | ((c1 & 0x3F) << 12) | ((c2 & 0x3F) << 6) | (c3 & 0x3F);
+                advance = 3;
             }
         }
+
+        if (advance > 0) {
+            const char *replacement = NULL;
+            char single[4] = {0};
+            switch (codepoint) {
+                case 0x00A0: single[0] = ' '; replacement = single; break;
+                case 0x00B0: replacement = "deg"; break;
+                case 0x2018:
+                case 0x2019:
+                case 0x2032: single[0] = '\''; replacement = single; break;
+                case 0x201C:
+                case 0x201D:
+                case 0x2033: single[0] = '"'; replacement = single; break;
+                case 0x2010:
+                case 0x2011:
+                case 0x2012:
+                case 0x2013: single[0] = '-'; replacement = single; break;
+                case 0x2014:
+                    replacement = "--";
+                    break;
+                case 0x2022: single[0] = '*'; replacement = single; break;
+                case 0x2026: replacement = "..."; break;
+                case 0x2122: replacement = "(TM)"; break;
+                default:
+                    if (codepoint < 0x80 && codepoint >= 0x20) {
+                        single[0] = (char)codepoint;
+                        replacement = single;
+                    }
+                    break;
+            }
+            if (replacement) {
+                size_t rep_len = strlen(replacement);
+                memcpy(out + o, replacement, rep_len);
+                o += rep_len;
+            } else {
+                out[o++] = '?';
+            }
+            i += advance;
+            continue;
+        }
+
         if (c >= 0x80 && c <= 0x9F) {
             const char *rep = CP1252_REPLACEMENTS[c - 0x80];
             if (rep) {
@@ -75,9 +108,8 @@ char *sanitize_ascii(const char *text) {
             }
             continue;
         }
-        if (c >= 0xA0) {
-            out[o++] = '?';
-        }
+
+        out[o++] = '?';
     }
     out[o] = '\0';
     char *trimmed = realloc(out, o + 1);
