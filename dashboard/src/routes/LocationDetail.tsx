@@ -40,22 +40,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
   const summary = createMemo(() => detail()?.summary);
   const devices = createMemo(() => detail()?.devices ?? []);
-  const reports = createMemo<ReportVersion[]>(() => detail()?.reports ?? []);
+  const auditReports = createMemo<ReportVersion[]>(() => detail()?.reports ?? []);
   const deficiencyReports = createMemo<ReportVersion[]>(() => detail()?.deficiency_reports ?? []);
-  const currentAuditId = createMemo(() => reports()[0]?.job_id ?? null);
-  const currentDeficiencyId = createMemo(() => deficiencyReports()[0]?.job_id ?? null);
-  const reportTimeline = createMemo(() => {
-    const auditEntries = reports().map((report) => ({ type: 'audit' as const, report }));
-    const deficiencyEntries = deficiencyReports().map((report) => ({ type: 'deficiency' as const, report }));
-    const combined = [...auditEntries, ...deficiencyEntries];
-    return combined.sort((a, b) => {
-      const aTimestamp = a.report.completed_at ?? a.report.created_at ?? '';
-      const bTimestamp = b.report.completed_at ?? b.report.created_at ?? '';
-      const aDate = aTimestamp ? Date.parse(aTimestamp) : 0;
-      const bDate = bTimestamp ? Date.parse(bTimestamp) : 0;
-      return bDate - aDate;
-    });
-  });
 
   const [showResolvedDeficiencies, setShowResolvedDeficiencies] = createSignal(false);
   const [pendingDeficiencyKey, setPendingDeficiencyKey] = createSignal<string | null>(null);
@@ -515,20 +501,14 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
               </div>
             </Show>
 
-            <Show when={reportTimeline().length > 0}>
-              <div class="summary-section">
-                <h2>Generated reports</h2>
+            <div class="summary-section">
+              <h2>Audit reports</h2>
+              <Show when={auditReports().length > 0} fallback={<p class="deficiency-empty">No audit reports generated yet.</p>}>
                 <ul class="reports-list">
-                  <For each={reportTimeline()}>
-                    {(entry) => {
-                      const report = entry.report;
-                      const isCurrent =
-                        (entry.type === 'audit' && currentAuditId() === report.job_id) ||
-                        (entry.type === 'deficiency' && currentDeficiencyId() === report.job_id);
-                      const versionLabel = report.version != null
-                        ? `${entry.type === 'audit' ? 'Audit' : 'Deficiency'} v${report.version}`
-                        : entry.type === 'audit' ? 'Audit' : 'Deficiency';
-                      const buttonLabel = entry.type === 'audit' ? 'Report' : 'Deficiency list';
+                  <For each={auditReports()}>
+                    {(report: ReportVersion, index) => {
+                      const isCurrent = index() === 0;
+                      const versionLabel = report.version != null ? `Audit v${report.version}` : 'Audit';
                       return (
                         <li class={`report-item${isCurrent ? ' report-item--current' : ''}`}>
                           <div class="report-meta">
@@ -545,7 +525,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                             <button
                               type="button"
                               class="action-button"
-                              onClick={() => void handleDownloadExisting(report.job_id, buttonLabel)}
+                              onClick={() => void handleDownloadExisting(report.job_id, 'Report')}
                             >
                               Download
                             </button>
@@ -555,8 +535,45 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                     }}
                   </For>
                 </ul>
-              </div>
-            </Show>
+              </Show>
+            </div>
+
+            <div class="summary-section">
+              <h2>Deficiency lists</h2>
+              <Show when={deficiencyReports().length > 0} fallback={<p class="deficiency-empty">No deficiency lists generated yet.</p>}>
+                <ul class="reports-list">
+                  <For each={deficiencyReports()}>
+                    {(report: ReportVersion, index) => {
+                      const isCurrent = index() === 0;
+                      const versionLabel = report.version != null ? `Deficiency v${report.version}` : 'Deficiency';
+                      return (
+                        <li class={`report-item${isCurrent ? ' report-item--current' : ''}`}>
+                          <div class="report-meta">
+                            <span class="report-title">
+                              {versionLabel}
+                              <Show when={isCurrent}>
+                                <span class="report-badge">Current</span>
+                              </Show>
+                            </span>
+                            <span class="report-date">{formatDateTime(report.completed_at ?? report.created_at)}</span>
+                          </div>
+                          <div class="report-actions">
+                            <span class="report-size">{report.size_bytes != null ? formatFileSize(report.size_bytes) : '—'}</span>
+                            <button
+                              type="button"
+                              class="action-button"
+                              onClick={() => void handleDownloadExisting(report.job_id, 'Deficiency list')}
+                            >
+                              Download
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    }}
+                  </For>
+                </ul>
+              </Show>
+            </div>
 
             <Show when={message()}>
               {(msg) => (
