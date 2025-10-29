@@ -42,7 +42,6 @@
 #define DEFAULT_PORT 8080
 #define MAX_HEADER_SIZE 65536
 #define READ_BUFFER_SIZE 8192
-#define TEMP_FILE_TEMPLATE "/tmp/audit_zip_XXXXXX"
 #define TEMP_DIR_TEMPLATE  "/tmp/audit_unpack_XXXXXX"
 static pthread_t g_report_thread;
 static pthread_mutex_t g_report_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -388,7 +387,6 @@ typedef struct {
 } NarrativeSet;
 
 static void handle_options_request(int client_fd);
-static void handle_get_request(int client_fd, PGconn *conn, const char *path, const char *query_string);
 static void handle_client(int client_fd, void *ctx);
 static const char *optional_bool_to_text(const OptionalBool *value);
 static const char *optional_int_to_text(const OptionalInt *value, char *buffer, size_t buffer_len);
@@ -403,6 +401,10 @@ static void report_device_init(ReportDevice *device);
 static void report_device_clear(ReportDevice *device);
 static int report_device_list_append_move(ReportDeviceList *list, ReportDevice *device);
 static char *build_location_detail_json(const ReportData *report);
+static int load_report_for_building(PGconn *conn, const char *building_address, ReportData *report, char **error_out);
+static char *report_data_to_json(const ReportData *report);
+static char *build_location_detail_payload(PGconn *conn, const char *address, int *status_out, char **error_out);
+static char *build_report_json_payload(PGconn *conn, const char *address, int *status_out, char **error_out);
 static int generate_uuid_v4(char out[37]);
 static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out);
 static void *report_worker_main(void *arg);
@@ -421,6 +423,22 @@ static bool read_request_body(int client_fd,
                               long *length_out,
                               int *status_out,
                               const char **error_out);
+static char *create_temp_dir(void);
+static int process_extracted_archive(char *temp_dir, PGconn *conn, StringArray *processed_audits, char **error_out);
+static bool handle_zip_upload(int client_fd,
+                              char *body_start,
+                              size_t leftover,
+                              char saved_body_char,
+                              long content_length,
+                              PGconn *conn,
+                              StringArray *processed_audits,
+                              int *status_out,
+                              char **error_out);
+static int export_building_photos(PGconn *conn, const ReportData *report, const char *root_dir, char **error_out);
+static char *sanitize_path_component(const char *input);
+static int copy_file_contents(const char *src_path, const char *dst_path);
+static int create_report_archive(PGconn *conn, const ReportJob *job, const ReportData *report,
+                                 const char *job_dir, const char *pdf_path, char **zip_path_out, char **error_out);
 static bool read_request_body(int client_fd,
                               const char *header_lines,
                               char *body_start,
@@ -1270,6 +1288,118 @@ static int load_deficiencies_for_audit(PGconn *conn,
     }
     PQclear(res);
     return 1;
+}
+
+static char *build_location_detail_payload(PGconn *conn, const char *address, int *status_out, char **error_out) {
+    if (status_out) {
+        *status_out = 500;
+    }
+    if (error_out) {
+        *error_out = NULL;
+    }
+    if (!conn || !address || address[0] == '\0') {
+        if (error_out && !*error_out) {
+            *error_out = strdup("address field is required");
+        }
+        if (status_out) {
+            *status_out = 400;
+        }
+        return NULL;
+    }
+
+    ReportData report;
+    report_data_init(&report);
+    char *load_error = NULL;
+    int ok = load_report_for_building(conn, address, &report, &load_error);
+    if (!ok) {
+        int status = 500;
+        if (load_error && strcmp(load_error, "No audits found for building address") == 0) {
+            status = 404;
+        }
+        if (error_out && !*error_out) {
+            *error_out = load_error ? load_error : strdup("Failed to load location detail");
+            load_error = NULL;
+        }
+        free(load_error);
+        report_data_clear(&report);
+        if (status_out) {
+            *status_out = status;
+        }
+        return NULL;
+    }
+    free(load_error);
+
+    char *json = build_location_detail_json(&report);
+    report_data_clear(&report);
+    if (!json) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to serialize location detail");
+        }
+        if (status_out) {
+            *status_out = 500;
+        }
+        return NULL;
+    }
+    if (status_out) {
+        *status_out = 200;
+    }
+    return json;
+}
+
+static char *build_report_json_payload(PGconn *conn, const char *address, int *status_out, char **error_out) {
+    if (status_out) {
+        *status_out = 500;
+    }
+    if (error_out) {
+        *error_out = NULL;
+    }
+    if (!conn || !address || address[0] == '\0') {
+        if (error_out && !*error_out) {
+            *error_out = strdup("address field is required");
+        }
+        if (status_out) {
+            *status_out = 400;
+        }
+        return NULL;
+    }
+
+    ReportData report;
+    report_data_init(&report);
+    char *load_error = NULL;
+    int ok = load_report_for_building(conn, address, &report, &load_error);
+    if (!ok) {
+        int status = 500;
+        if (load_error && strcmp(load_error, "No audits found for building address") == 0) {
+            status = 404;
+        }
+        if (error_out && !*error_out) {
+            *error_out = load_error ? load_error : strdup("Failed to load report");
+            load_error = NULL;
+        }
+        free(load_error);
+        report_data_clear(&report);
+        if (status_out) {
+            *status_out = status;
+        }
+        return NULL;
+    }
+    free(load_error);
+
+    char *json = report_data_to_json(&report);
+    report_data_clear(&report);
+    if (!json) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to serialize report");
+        }
+        if (status_out) {
+            *status_out = 500;
+        }
+        return NULL;
+    }
+    if (status_out) {
+        *status_out = 200;
+    }
+    return json;
 }
 
 static int load_report_for_building(PGconn *conn, const char *building_address, ReportData *report, char **error_out) {
@@ -2632,43 +2762,6 @@ static int remove_directory_recursive(const char *path) {
     }
     return 0;
 }
-static int unzip_to_temp_dir(const char *zip_path, char **out_dir) {
-    *out_dir = NULL;
-    char *template = strdup(TEMP_DIR_TEMPLATE);
-    if (!template) {
-        return 0;
-    }
-    char *dir_path = mkdtemp(template);
-    if (!dir_path) {
-        log_error("mkdtemp failed: %s", strerror(errno));
-        free(template);
-        return 0;
-    }
-    pid_t pid = fork();
-    if (pid < 0) {
-        log_error("fork failed: %s", strerror(errno));
-        free(template);
-        return 0;
-    }
-    if (pid == 0) {
-        execlp("unzip", "unzip", "-qq", zip_path, "-d", dir_path, (char *)NULL);
-        _exit(127);
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        log_error("waitpid failed: %s", strerror(errno));
-        free(template);
-        return 0;
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        log_error("unzip failed with status %d", status);
-        free(template);
-        return 0;
-    }
-    *out_dir = template;
-    return 1;
-}
-
 static int collect_files_recursive(const char *root, char **csv_path, char **json_path, PhotoCollection *photos) {
     DIR *dir = opendir(root);
     if (!dir) {
@@ -3572,132 +3665,86 @@ static int db_upsert_audit(PGconn *conn, const AuditRecord *record, const PhotoC
     return 1;
 }
 
-static int process_zip_file(const char *zip_path, PGconn *conn, StringArray *processed_audits, char **error_out) {
-    char *temp_dir = NULL;
-    if (!unzip_to_temp_dir(zip_path, &temp_dir)) {
-        if (error_out) *error_out = strdup("Failed to extract zip archive");
+static int process_extracted_archive(char *temp_dir, PGconn *conn, StringArray *processed_audits, char **error_out) {
+    if (!temp_dir || !conn || !processed_audits) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid archive processing parameters");
+        }
+        if (temp_dir) {
+            remove_directory_recursive(temp_dir);
+            free(temp_dir);
+        }
         return 0;
     }
 
+    int success = 0;
     char *csv_path = NULL;
     char *json_path = NULL;
     PhotoCollection photos;
+    char *csv_text = NULL;
+    CsvFile csv_file;
+    bool csv_parsed = false;
+    char *csv_error = NULL;
+    char *json_text = NULL;
+    JsonValue *json_root = NULL;
+    char *json_error = NULL;
+    StringArray photo_order;
+    bool photo_order_init = false;
+    DeficiencyList deficiency_list;
+    bool deficiency_init = false;
+
     if (!collect_files(temp_dir, &csv_path, &json_path, &photos)) {
         if (error_out && !*error_out) *error_out = strdup("Failed to collect extracted files");
-        free(csv_path);
-        free(json_path);
-        remove_directory_recursive(temp_dir);
-        free(temp_dir);
-        return 0;
+        goto cleanup;
     }
     if (!csv_path || !json_path) {
-        if (error_out) *error_out = strdup("CSV or JSON file missing in archive");
-        free(csv_path);
-        free(json_path);
-        photo_collection_clear(&photos);
-        remove_directory_recursive(temp_dir);
-        free(temp_dir);
-        return 0;
+        if (error_out && !*error_out) *error_out = strdup("CSV or JSON file missing in archive");
+        goto cleanup;
     }
 
-    char *csv_text = NULL;
     if (!read_file_to_string(csv_path, &csv_text)) {
-        if (error_out) *error_out = strdup("Failed to read CSV file");
-        free(csv_path);
-        free(json_path);
-        photo_collection_clear(&photos);
-        remove_directory_recursive(temp_dir);
-        free(temp_dir);
-        return 0;
+        if (error_out && !*error_out) *error_out = strdup("Failed to read CSV file");
+        goto cleanup;
     }
 
-    CsvFile csv_file;
-    char *csv_error = NULL;
     if (!csv_parse(csv_text, &csv_file, &csv_error)) {
-        if (error_out) *error_out = csv_error ? csv_error : strdup("Failed to parse CSV content");
-        else free(csv_error);
-        free(csv_text);
-        free(csv_path);
-        free(json_path);
-        photo_collection_clear(&photos);
-        remove_directory_recursive(temp_dir);
-        free(temp_dir);
-        return 0;
+        if (error_out && !*error_out) {
+            *error_out = csv_error ? csv_error : strdup("Failed to parse CSV content");
+            csv_error = NULL;
+        }
+        goto cleanup;
     }
+    csv_parsed = true;
 
-    char *json_text = NULL;
     if (!read_file_to_string(json_path, &json_text)) {
-        if (error_out) *error_out = strdup("Failed to read JSON file");
-        csv_free(&csv_file);
-        free(csv_text);
-        free(csv_path);
-        free(json_path);
-        photo_collection_clear(&photos);
-        remove_directory_recursive(temp_dir);
-        free(temp_dir);
-        return 0;
+        if (error_out && !*error_out) *error_out = strdup("Failed to read JSON file");
+        goto cleanup;
     }
-    char *json_error = NULL;
-    JsonValue *json_root = json_parse(json_text, &json_error);
+
+    json_root = json_parse(json_text, &json_error);
     if (!json_root) {
-        if (error_out) *error_out = json_error ? json_error : strdup("Failed to parse JSON content");
-        else free(json_error);
-        csv_free(&csv_file);
-        free(csv_text);
-        free(csv_path);
-        free(json_path);
-        free(json_text);
-        photo_collection_clear(&photos);
-        remove_directory_recursive(temp_dir);
-        free(temp_dir);
-        return 0;
+        if (error_out && !*error_out) {
+            *error_out = json_error ? json_error : strdup("Failed to parse JSON content");
+            json_error = NULL;
+        }
+        goto cleanup;
     }
 
-    StringArray photo_order;
     if (!parse_photo_names(json_root, &photo_order)) {
-        if (error_out) *error_out = strdup("Failed to parse photo list from JSON");
-        json_free(json_root);
-        csv_free(&csv_file);
-        free(csv_text);
-        free(csv_path);
-        free(json_path);
-        free(json_text);
-        photo_collection_clear(&photos);
-        remove_directory_recursive(temp_dir);
-        free(temp_dir);
-        return 0;
+        if (error_out && !*error_out) *error_out = strdup("Failed to parse photo list from JSON");
+        goto cleanup;
     }
+    photo_order_init = true;
 
-    DeficiencyList deficiency_list;
     if (!parse_deficiencies(json_root, &deficiency_list)) {
-        if (error_out) *error_out = strdup("Failed to parse deficiencies from JSON");
-        string_array_clear(&photo_order);
-        json_free(json_root);
-        csv_free(&csv_file);
-        free(csv_text);
-        free(csv_path);
-        free(json_path);
-        free(json_text);
-        photo_collection_clear(&photos);
-        remove_directory_recursive(temp_dir);
-        free(temp_dir);
-        return 0;
+        if (error_out && !*error_out) *error_out = strdup("Failed to parse deficiencies from JSON");
+        goto cleanup;
     }
+    deficiency_init = true;
 
     if (csv_file.row_count == 0) {
-        if (error_out) *error_out = strdup("CSV file did not contain any audit rows");
-        deficiency_list_clear(&deficiency_list);
-        string_array_clear(&photo_order);
-        json_free(json_root);
-        csv_free(&csv_file);
-        free(csv_text);
-        free(csv_path);
-        free(json_path);
-        free(json_text);
-        photo_collection_clear(&photos);
-        remove_directory_recursive(temp_dir);
-        free(temp_dir);
-        return 0;
+        if (error_out && !*error_out) *error_out = strdup("CSV file did not contain any audit rows");
+        goto cleanup;
     }
 
     for (size_t i = 0; i < csv_file.row_count; ++i) {
@@ -3706,84 +3753,72 @@ static int process_zip_file(const char *zip_path, PGconn *conn, StringArray *pro
         char *record_error = NULL;
         if (!populate_audit_record(&csv_file, row, json_root, &record, &record_error)) {
             if (record_error) {
-                if (error_out) *error_out = record_error; else free(record_error);
-            } else if (error_out) {
+                if (error_out && !*error_out) {
+                    *error_out = record_error;
+                    record_error = NULL;
+                }
+            } else if (error_out && !*error_out) {
                 *error_out = strdup("Failed to populate audit record");
             }
             audit_record_free(&record);
-            deficiency_list_clear(&deficiency_list);
-            string_array_clear(&photo_order);
-            json_free(json_root);
-            csv_free(&csv_file);
-            free(csv_text);
-            free(csv_path);
-            free(json_path);
-            free(json_text);
-            photo_collection_clear(&photos);
-            remove_directory_recursive(temp_dir);
-            free(temp_dir);
-            return 0;
+            goto cleanup;
         }
 
-        bool existed_before = audit_exists(conn, record.audit_uuid);
-        if (existed_before) {
+        if (audit_exists(conn, record.audit_uuid)) {
             log_info("Audit %s already exists; overwriting with new data", record.audit_uuid);
         }
 
         char *upsert_error = NULL;
         if (!db_upsert_audit(conn, &record, &photos, &photo_order, &deficiency_list, &upsert_error)) {
             if (upsert_error) {
-                if (error_out) *error_out = upsert_error; else free(upsert_error);
-            } else if (error_out) {
+                if (error_out && !*error_out) {
+                    *error_out = upsert_error;
+                    upsert_error = NULL;
+                }
+            } else if (error_out && !*error_out) {
                 *error_out = strdup("Database insert failed");
             }
             audit_record_free(&record);
-            deficiency_list_clear(&deficiency_list);
-            string_array_clear(&photo_order);
-            json_free(json_root);
-            csv_free(&csv_file);
-            free(csv_text);
-            free(csv_path);
-            free(json_path);
-            free(json_text);
-            photo_collection_clear(&photos);
-            remove_directory_recursive(temp_dir);
-            free(temp_dir);
-            return 0;
+            goto cleanup;
         }
+        free(upsert_error);
 
         if (!string_array_append_copy(processed_audits, record.audit_uuid)) {
-            if (error_out) *error_out = strdup("Failed recording processed audit id");
+            if (error_out && !*error_out) *error_out = strdup("Failed recording processed audit id");
             audit_record_free(&record);
-            deficiency_list_clear(&deficiency_list);
-            string_array_clear(&photo_order);
-            json_free(json_root);
-            csv_free(&csv_file);
-            free(csv_text);
-            free(csv_path);
-            free(json_path);
-            free(json_text);
-            photo_collection_clear(&photos);
-            remove_directory_recursive(temp_dir);
-            free(temp_dir);
-            return 0;
+            goto cleanup;
         }
+
         audit_record_free(&record);
     }
 
-    deficiency_list_clear(&deficiency_list);
-    string_array_clear(&photo_order);
-    json_free(json_root);
-    csv_free(&csv_file);
+    success = 1;
+
+cleanup:
+    if (deficiency_init) {
+        deficiency_list_clear(&deficiency_list);
+    }
+    if (photo_order_init) {
+        string_array_clear(&photo_order);
+    }
+    if (json_root) {
+        json_free(json_root);
+    }
+    if (csv_parsed) {
+        csv_free(&csv_file);
+    }
     free(csv_text);
     free(json_text);
     free(csv_path);
     free(json_path);
+    free(csv_error);
+    free(json_error);
     photo_collection_clear(&photos);
     remove_directory_recursive(temp_dir);
     free(temp_dir);
-    return 1;
+    return success;
 }
+
 static void handle_options_request(int client_fd) {
     send_http_response(client_fd, 204, "No Content", "application/json", NULL, 0);
 }
@@ -3896,6 +3931,590 @@ static bool read_request_body(int client_fd,
     return true;
 }
 
+static bool handle_zip_upload(int client_fd,
+                              char *body_start,
+                              size_t leftover,
+                              char saved_body_char,
+                              long content_length,
+                              PGconn *conn,
+                              StringArray *processed_audits,
+                              int *status_out,
+                              char **error_out) {
+    if (status_out) {
+        *status_out = 500;
+    }
+    if (error_out) {
+        *error_out = NULL;
+    }
+    if (!conn || !processed_audits) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid upload parameters");
+        }
+        if (status_out) {
+            *status_out = 500;
+        }
+        if (body_start) {
+            *body_start = saved_body_char;
+        }
+        return false;
+    }
+
+    if (content_length <= 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Content-Length must be positive");
+        }
+        if (status_out) {
+            *status_out = 400;
+        }
+        if (body_start) {
+            *body_start = saved_body_char;
+        }
+        return false;
+    }
+
+    if (leftover > (size_t)content_length) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Content-Length mismatch");
+        }
+        if (status_out) {
+            *status_out = 400;
+        }
+        if (body_start) {
+            *body_start = saved_body_char;
+        }
+        return false;
+    }
+
+    if (body_start) {
+        *body_start = saved_body_char;
+    }
+
+    char *temp_dir = create_temp_dir();
+    if (!temp_dir) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to create temporary directory");
+        }
+        if (status_out) {
+            *status_out = 500;
+        }
+        return false;
+    }
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        if (error_out && !*error_out) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Failed to create unzip pipe: %s", strerror(errno));
+            *error_out = strdup(msg);
+        }
+        if (status_out) {
+            *status_out = 500;
+        }
+        remove_directory_recursive(temp_dir);
+        free(temp_dir);
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (error_out && !*error_out) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "fork failed: %s", strerror(errno));
+            *error_out = strdup(msg);
+        }
+        if (status_out) {
+            *status_out = 500;
+        }
+        close(pipefd[0]);
+        close(pipefd[1]);
+        remove_directory_recursive(temp_dir);
+        free(temp_dir);
+        return false;
+    }
+
+    int write_fd = pipefd[1];
+    if (pid == 0) {
+        close(write_fd);
+        if (dup2(pipefd[0], STDIN_FILENO) < 0) {
+            _exit(127);
+        }
+        close(pipefd[0]);
+        execlp("unzip", "unzip", "-qq", "-d", temp_dir, "-", (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipefd[0]);
+
+    size_t total_written = 0;
+    if (leftover > 0 && body_start) {
+        size_t to_write = leftover;
+        if ((long)to_write > content_length) {
+            to_write = (size_t)content_length;
+        }
+        if (!write_all(write_fd, body_start, to_write)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Failed writing request body");
+            }
+            if (status_out) {
+                *status_out = 500;
+            }
+            close(write_fd);
+            kill(pid, SIGTERM);
+            waitpid(pid, NULL, 0);
+            remove_directory_recursive(temp_dir);
+            free(temp_dir);
+            return false;
+        }
+        total_written += to_write;
+        if ((long)leftover > content_length) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Content-Length mismatch");
+            }
+            if (status_out) {
+                *status_out = 400;
+            }
+            close(write_fd);
+            kill(pid, SIGTERM);
+            waitpid(pid, NULL, 0);
+            remove_directory_recursive(temp_dir);
+            free(temp_dir);
+            return false;
+        }
+    }
+
+    char buffer[READ_BUFFER_SIZE];
+    while (total_written < (size_t)content_length) {
+        size_t remaining = (size_t)content_length - total_written;
+        size_t chunk = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        ssize_t nread = recv(client_fd, buffer, chunk, 0);
+        if (nread <= 0) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Unexpected end of stream");
+            }
+            if (status_out) {
+                *status_out = 400;
+            }
+            close(write_fd);
+            kill(pid, SIGTERM);
+            waitpid(pid, NULL, 0);
+            remove_directory_recursive(temp_dir);
+            free(temp_dir);
+            return false;
+        }
+        if (!write_all(write_fd, buffer, (size_t)nread)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Failed writing request body");
+            }
+            if (status_out) {
+                *status_out = 500;
+            }
+            close(write_fd);
+            kill(pid, SIGTERM);
+            waitpid(pid, NULL, 0);
+            remove_directory_recursive(temp_dir);
+            free(temp_dir);
+            return false;
+        }
+        total_written += (size_t)nread;
+    }
+
+    close(write_fd);
+    write_fd = -1;
+
+    int unzip_status = 0;
+    if (waitpid(pid, &unzip_status, 0) < 0) {
+        if (error_out && !*error_out) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Failed waiting for unzip process: %s", strerror(errno));
+            *error_out = strdup(msg);
+        }
+        if (status_out) {
+            *status_out = 500;
+        }
+        remove_directory_recursive(temp_dir);
+        free(temp_dir);
+        return false;
+    }
+    if (!WIFEXITED(unzip_status) || WEXITSTATUS(unzip_status) != 0) {
+        if (error_out && !*error_out) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Archive extraction failed (status %d)", unzip_status);
+            *error_out = strdup(msg);
+        }
+        if (status_out) {
+            *status_out = 400;
+        }
+        remove_directory_recursive(temp_dir);
+        free(temp_dir);
+        return false;
+    }
+
+    bool processed_ok = process_extracted_archive(temp_dir, conn, processed_audits, error_out);
+    if (!processed_ok) {
+        if (status_out && *status_out == 500) {
+            *status_out = 500;
+        }
+        return false;
+    }
+    if (status_out) {
+        *status_out = 200;
+    }
+    return true;
+}
+
+static char *create_temp_dir(void) {
+    char *template = strdup(TEMP_DIR_TEMPLATE);
+    if (!template) {
+        return NULL;
+    }
+    if (!mkdtemp(template)) {
+        log_error("mkdtemp failed: %s", strerror(errno));
+        free(template);
+        return NULL;
+    }
+    return template;
+}
+
+static char *sanitize_path_component(const char *input) {
+    if (!input || !*input) {
+        return strdup("device");
+    }
+    size_t len = strlen(input);
+    char *out = malloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t pos = 0;
+    for (size_t i = 0; i < len; ++i) {
+        unsigned char c = (unsigned char)input[i];
+        if (isalnum(c)) {
+            out[pos++] = (char)c;
+        } else if (c == ' ' || c == '-' || c == '_') {
+            out[pos++] = c == ' ' ? '_' : (char)c;
+        } else {
+            out[pos++] = '_';
+        }
+    }
+    if (pos == 0) {
+        out[pos++] = 'd';
+        out[pos++] = 'e';
+        out[pos++] = 'v';
+    }
+    out[pos] = '\0';
+    return out;
+}
+
+static int copy_file_contents(const char *src_path, const char *dst_path) {
+    FILE *src = fopen(src_path, "rb");
+    if (!src) {
+        return -1;
+    }
+    FILE *dst = fopen(dst_path, "wb");
+    if (!dst) {
+        fclose(src);
+        return -1;
+    }
+    char buffer[8192];
+    size_t n;
+    int error = 0;
+    while ((n = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+        if (fwrite(buffer, 1, n, dst) != n) {
+            error = 1;
+            break;
+        }
+    }
+    if (ferror(src)) {
+        error = 1;
+    }
+    fclose(src);
+    if (fclose(dst) != 0) {
+        error = 1;
+    }
+    if (error) {
+        unlink(dst_path);
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int export_building_photos(PGconn *conn, const ReportData *report, const char *root_dir, char **error_out) {
+    if (!conn || !report || !root_dir) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid export parameters");
+        }
+        return 0;
+    }
+
+    char *site_dir = join_path(root_dir, "SITE PICTURES");
+    if (!site_dir) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory creating site pictures directory");
+        }
+        return 0;
+    }
+    if (ensure_directory_exists(site_dir) != 0) {
+        if (error_out && !*error_out) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Failed to create %s: %s", site_dir, strerror(errno));
+            *error_out = strdup(msg);
+        }
+        free(site_dir);
+        return 0;
+    }
+
+    const char *sql =
+        "SELECT photo_filename, content_type, photo_bytes "
+        "FROM audit_photos "
+        "WHERE audit_uuid = $1::uuid";
+
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        const ReportDevice *device = &report->devices.items[i];
+        if (!device->audit_uuid) {
+            continue;
+        }
+
+        const char *name_source = device->device_id ? device->device_id : (device->submission_id ? device->submission_id : device->audit_uuid);
+        char *safe_name = sanitize_path_component(name_source);
+        if (!safe_name) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory creating device directory");
+            }
+            free(site_dir);
+            return 0;
+        }
+        char *device_dir = join_path(site_dir, safe_name);
+        free(safe_name);
+        if (!device_dir) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory creating device directory path");
+            }
+            free(site_dir);
+            return 0;
+        }
+        if (ensure_directory_exists(device_dir) != 0) {
+            if (error_out && !*error_out) {
+                char msg[160];
+                snprintf(msg, sizeof(msg), "Failed to create %s: %s", device_dir, strerror(errno));
+                *error_out = strdup(msg);
+            }
+            free(device_dir);
+            free(site_dir);
+            return 0;
+        }
+
+        const char *params[1] = { device->audit_uuid };
+        int resultFormat = 1; // binary for photo_bytes
+        PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, resultFormat);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            if (error_out && !*error_out) {
+                const char *msg = PQresultErrorMessage(res);
+                *error_out = strdup(msg ? msg : "Failed to fetch device photos");
+            }
+            PQclear(res);
+            free(device_dir);
+            free(site_dir);
+            return 0;
+        }
+
+        int rows = PQntuples(res);
+        for (int row = 0; row < rows; ++row) {
+            const char *filename = PQgetisnull(res, row, 0) ? NULL : PQgetvalue(res, row, 0);
+            const char *orig_name = (filename && *filename) ? filename : NULL;
+            char generated_name[64];
+            if (!orig_name) {
+                snprintf(generated_name, sizeof(generated_name), "photo-%d.jpg", row + 1);
+                orig_name = generated_name;
+            }
+            char *base_name = sanitize_path_component(orig_name);
+            if (!base_name) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory creating photo filename");
+                }
+                PQclear(res);
+                free(device_dir);
+                free(site_dir);
+                return 0;
+            }
+
+            const char *ext = strrchr(orig_name, '.');
+            char *final_name = NULL;
+            if (ext && *(ext + 1)) {
+                size_t base_len = strlen(base_name);
+                size_t ext_len = strlen(ext);
+                final_name = malloc(base_len + ext_len + 1);
+                if (!final_name) {
+                    if (error_out && !*error_out) {
+                        *error_out = strdup("Out of memory creating photo filename");
+                    }
+                    free(base_name);
+                    PQclear(res);
+                    free(device_dir);
+                    free(site_dir);
+                    return 0;
+                }
+                memcpy(final_name, base_name, base_len);
+                memcpy(final_name + base_len, ext, ext_len + 1);
+            } else {
+                final_name = base_name;
+                base_name = NULL;
+            }
+
+            char *photo_path = join_path(device_dir, final_name);
+            if (!photo_path) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory assembling photo path");
+                }
+                free(final_name);
+                free(base_name);
+                PQclear(res);
+                free(device_dir);
+                free(site_dir);
+                return 0;
+            }
+
+            free(base_name);
+
+            const unsigned char *bytes = (const unsigned char *)PQgetvalue(res, row, 2);
+            size_t length = (size_t)PQgetlength(res, row, 2);
+            FILE *fp = fopen(photo_path, "wb");
+            if (!fp) {
+                if (error_out && !*error_out) {
+                    char msg[160];
+                    snprintf(msg, sizeof(msg), "Failed to write %s: %s", photo_path, strerror(errno));
+                    *error_out = strdup(msg);
+                }
+                free(photo_path);
+                PQclear(res);
+                free(device_dir);
+                free(site_dir);
+                free(final_name);
+                return 0;
+            }
+            if (length > 0 && fwrite(bytes, 1, length, fp) != length) {
+                if (error_out && !*error_out) {
+                    char msg[160];
+                    snprintf(msg, sizeof(msg), "Failed to write %s: %s", photo_path, "short write");
+                    *error_out = strdup(msg);
+                }
+                fclose(fp);
+                unlink(photo_path);
+                free(photo_path);
+                PQclear(res);
+                free(device_dir);
+                free(site_dir);
+                free(final_name);
+                return 0;
+            }
+            fclose(fp);
+            free(photo_path);
+            free(final_name);
+        }
+        PQclear(res);
+        free(device_dir);
+    }
+
+    free(site_dir);
+    return 1;
+}
+
+static int create_report_archive(PGconn *conn, const ReportJob *job, const ReportData *report,
+                                 const char *job_dir, const char *pdf_path, char **zip_path_out, char **error_out) {
+    if (zip_path_out) {
+        *zip_path_out = NULL;
+    }
+    (void)job;
+    if (!conn || !job_dir || !pdf_path) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid archive parameters");
+        }
+        return 0;
+    }
+
+    char *package_dir = create_temp_dir();
+    if (!package_dir) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to create package directory");
+        }
+        return 0;
+    }
+
+    char *pdf_copy_path = join_path(package_dir, "audit_report.pdf");
+    if (!pdf_copy_path || copy_file_contents(pdf_path, pdf_copy_path) != 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to prepare report PDF");
+        }
+        free(pdf_copy_path);
+        remove_directory_recursive(package_dir);
+        free(package_dir);
+        return 0;
+    }
+
+    char *photo_error = NULL;
+    if (!export_building_photos(conn, report, package_dir, &photo_error)) {
+        if (error_out && !*error_out) {
+            *error_out = photo_error ? photo_error : strdup("Failed to export photos");
+        } else {
+            free(photo_error);
+        }
+        free(pdf_copy_path);
+        remove_directory_recursive(package_dir);
+        free(package_dir);
+        return 0;
+    }
+    free(photo_error);
+    free(pdf_copy_path);
+
+    char *zip_path = join_path(job_dir, "audit_report_package.zip");
+    if (!zip_path) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory creating zip path");
+        }
+        remove_directory_recursive(package_dir);
+        free(package_dir);
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to fork zip process");
+        }
+        free(zip_path);
+        remove_directory_recursive(package_dir);
+        free(package_dir);
+        return 0;
+    }
+    if (pid == 0) {
+        if (chdir(package_dir) != 0) {
+            _exit(127);
+        }
+        execlp("zip", "zip", "-r", "-q", zip_path, ".", (char *)NULL);
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to create report archive");
+        }
+        free(zip_path);
+        remove_directory_recursive(package_dir);
+        free(package_dir);
+        return 0;
+    }
+
+    remove_directory_recursive(package_dir);
+    free(package_dir);
+
+    if (zip_path_out) {
+        *zip_path_out = zip_path;
+    } else {
+        free(zip_path);
+    }
+    return 1;
+}
+
 static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out) {
     if (output_path_out) {
         *output_path_out = NULL;
@@ -3914,6 +4533,7 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
     char *job_dir = NULL;
     char *tex_path = NULL;
     char *pdf_path = NULL;
+    char *zip_path = NULL;
     char *report_json = NULL;
     NarrativeSet narratives;
     narrative_set_init(&narratives);
@@ -4048,9 +4668,20 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
     }
     free(compile_error);
 
+    char *archive_error = NULL;
+    if (!create_report_archive(conn, job, &report, job_dir, pdf_path, &zip_path, &archive_error)) {
+        if (error_out && !*error_out) {
+            *error_out = archive_error ? archive_error : strdup("Failed to build report archive");
+        } else {
+            free(archive_error);
+        }
+        goto cleanup;
+    }
+    free(archive_error);
+
     if (output_path_out) {
-        *output_path_out = pdf_path;
-        pdf_path = NULL;
+        *output_path_out = zip_path;
+        zip_path = NULL;
     }
     success = 1;
 
@@ -4059,6 +4690,7 @@ cleanup:
         free(*output_path_out);
         *output_path_out = NULL;
     }
+    free(zip_path);
     free(report_json);
     narrative_set_clear(&narratives);
     report_data_clear(&report);
@@ -4068,254 +4700,6 @@ cleanup:
         free(pdf_path);
     }
     return success;
-}
-
-static void handle_get_request(int client_fd, PGconn *conn, const char *path, const char *query_string) {
-    if (strcmp(path, "/") == 0 || strcmp(path, "/health") == 0) {
-        send_http_json(client_fd, 200, "OK", "{\"status\":\"ok\"}");
-        return;
-    }
-
-    if (strncmp(path, "/reports/", 9) == 0) {
-        const char *rest = path + 9;
-        const char *suffix = strchr(rest, '/');
-        char job_id[37];
-        if (suffix) {
-            size_t len = (size_t)(suffix - rest);
-            if (len >= sizeof(job_id) || len == 0) {
-                char *body = build_error_response("Invalid job id");
-                send_http_json(client_fd, 400, "Bad Request", body);
-                free(body);
-                return;
-            }
-            memcpy(job_id, rest, len);
-            job_id[len] = '\0';
-        } else {
-            size_t len = strlen(rest);
-            if (len >= sizeof(job_id) || len == 0) {
-                char *body = build_error_response("Invalid job id");
-                send_http_json(client_fd, 400, "Bad Request", body);
-                free(body);
-                return;
-            }
-            memcpy(job_id, rest, len + 1);
-        }
-
-        if (!is_valid_uuid(job_id)) {
-            char *body = build_error_response("Invalid job id");
-            send_http_json(client_fd, 400, "Bad Request", body);
-            free(body);
-            return;
-        }
-
-        if (suffix && strcmp(suffix, "/download") == 0) {
-            char *path_str = NULL;
-            char *error = NULL;
-            if (!db_fetch_report_download_path(conn, job_id, &path_str, &error)) {
-                char *body = build_error_response(error ? error : "Report not available");
-                int status = 404;
-                if (error && strcmp(error, "Report not ready") == 0) {
-                    status = 409;
-                } else if (error && strcmp(error, "Report job not found") == 0) {
-                    status = 404;
-                }
-                send_http_json(client_fd, status, status == 404 ? "Not Found" : "Conflict", body);
-                free(body);
-                free(error);
-                return;
-            }
-
-            struct stat st;
-            if (stat(path_str, &st) != 0 || !S_ISREG(st.st_mode)) {
-                free(path_str);
-                char *body = build_error_response("Report artifact missing");
-                send_http_json(client_fd, 500, "Internal Server Error", body);
-                free(body);
-                return;
-            }
-
-            char download_name[64];
-            snprintf(download_name, sizeof(download_name), "audit-report-%s.pdf", job_id);
-            const char *name_to_use = download_name;
-            send_file_download(client_fd, path_str, "application/pdf", name_to_use);
-            free(path_str);
-            return;
-        }
-
-        if (suffix && suffix[0] != '\0') {
-            char *body = build_error_response("Not Found");
-            send_http_json(client_fd, 404, "Not Found", body);
-            free(body);
-            return;
-        }
-
-        char *error = NULL;
-        char *json = db_fetch_report_job_status(conn, job_id, &error);
-        if (!json) {
-            char *body = build_error_response(error ? error : "Failed to fetch report job");
-            int status = (error && strcmp(error, "Report job not found") == 0) ? 404 : 500;
-            send_http_json(client_fd, status, status == 404 ? "Not Found" : "Internal Server Error", body);
-            free(body);
-            free(error);
-            return;
-        }
-        send_http_json(client_fd, 200, "OK", json);
-        free(json);
-        free(error);
-        return;
-    }
-
-    if (strcmp(path, "/locations") == 0) {
-        char *address_value = http_extract_query_param(query_string, "address");
-        if (address_value && address_value[0] != '\0') {
-            ReportData report;
-            report_data_init(&report);
-            char *error = NULL;
-            int ok = load_report_for_building(conn, address_value, &report, &error);
-            free(address_value);
-            if (!ok) {
-                report_data_clear(&report);
-                int status = 500;
-                if (error && strcmp(error, "No audits found for building address") == 0) {
-                    status = 404;
-                }
-                char *body = build_error_response(error ? error : "Failed to load location detail");
-                send_http_json(client_fd, status, status == 404 ? "Not Found" : "Internal Server Error", body);
-                free(body);
-                free(error);
-                return;
-            }
-            free(error);
-
-            char *json = build_location_detail_json(&report);
-            report_data_clear(&report);
-            if (!json) {
-                char *body = build_error_response("Failed to serialize location detail");
-                send_http_json(client_fd, 500, "Internal Server Error", body);
-                free(body);
-                return;
-            }
-            send_http_json(client_fd, 200, "OK", json);
-            free(json);
-            return;
-        }
-        free(address_value);
-
-        char *error = NULL;
-        char *json = db_fetch_location_list(conn, &error);
-        if (!json) {
-            char *body = build_error_response(error ? error : "Failed to fetch locations");
-            send_http_json(client_fd, 500, "Internal Server Error", body);
-            free(body);
-            free(error);
-            return;
-        }
-        send_http_json(client_fd, 200, "OK", json);
-        free(json);
-        return;
-    }
-
-    if (strcmp(path, "/reports") == 0) {
-        char *address_value = http_extract_query_param(query_string, "address");
-
-        if (!address_value || address_value[0] == '\0') {
-            free(address_value);
-            char *body = build_error_response("address query parameter required");
-            send_http_json(client_fd, 400, "Bad Request", body);
-            free(body);
-            return;
-        }
-
-        ReportData report;
-        report_data_init(&report);
-        char *error = NULL;
-        int ok = load_report_for_building(conn, address_value, &report, &error);
-        free(address_value);
-        if (!ok) {
-            report_data_clear(&report);
-            int status = 500;
-            if (error && strcmp(error, "No audits found for building address") == 0) {
-                status = 404;
-            }
-            char *body = build_error_response(error ? error : "Failed to build report");
-            send_http_json(client_fd, status, status == 404 ? "Not Found" : "Internal Server Error", body);
-            free(body);
-            free(error);
-            return;
-        }
-        free(error);
-
-        char *json = report_data_to_json(&report);
-        report_data_clear(&report);
-        if (!json) {
-            char *body = build_error_response("Failed to serialize report");
-            send_http_json(client_fd, 500, "Internal Server Error", body);
-            free(body);
-            return;
-        }
-        send_http_json(client_fd, 200, "OK", json);
-        free(json);
-        return;
-    }
-
-    if (strcmp(path, "/audits") == 0) {
-        char *error = NULL;
-        char *json = db_fetch_audit_list(conn, &error);
-        if (!json) {
-            char *body = build_error_response(error ? error : "Failed to fetch audits");
-            send_http_json(client_fd, 500, "Internal Server Error", body);
-            free(body);
-            free(error);
-            return;
-        }
-        send_http_json(client_fd, 200, "OK", json);
-        free(json);
-        return;
-    }
-
-    if (strncmp(path, "/audits/", 8) == 0) {
-        const char *uuid_start = path + 8;
-        if (*uuid_start == '\0') {
-            char *body = build_error_response("Audit ID required");
-            send_http_json(client_fd, 400, "Bad Request", body);
-            free(body);
-            return;
-        }
-        if (strchr(uuid_start, '/')) {
-            char *body = build_error_response("Unknown resource");
-            send_http_json(client_fd, 404, "Not Found", body);
-            free(body);
-            return;
-        }
-        if (!is_valid_uuid(uuid_start)) {
-            char *body = build_error_response("Invalid audit ID");
-            send_http_json(client_fd, 400, "Bad Request", body);
-            free(body);
-            return;
-        }
-        char *error = NULL;
-        char *json = db_fetch_audit_detail(conn, uuid_start, &error);
-        if (!json) {
-            if (error) {
-                char *body = build_error_response(error);
-                send_http_json(client_fd, 500, "Internal Server Error", body);
-                free(body);
-                free(error);
-            } else {
-                char *body = build_error_response("Audit not found");
-                send_http_json(client_fd, 404, "Not Found", body);
-                free(body);
-            }
-            return;
-        }
-        send_http_json(client_fd, 200, "OK", json);
-        free(json);
-        return;
-    }
-
-    char *body = build_error_response("Not Found");
-    send_http_json(client_fd, 404, "Not Found", body);
-    free(body);
 }
 
 static void signal_report_worker(void) {
@@ -4954,7 +5338,7 @@ static void handle_client(int client_fd, void *ctx) {
 
             if (strcmp(method, "GET") == 0) {
                 if (is_api_path) {
-                    handle_get_request(client_fd, conn, api_path, query_string);
+                    routes_handle_get(client_fd, conn, api_path, query_string);
                 } else {
                     serve_static_file(client_fd, path);
                 }
@@ -5171,69 +5555,30 @@ static void handle_client(int client_fd, void *ctx) {
                 return;
             }
 
-            char temp_path[] = TEMP_FILE_TEMPLATE;
-            int temp_fd = mkstemp(temp_path);
-            if (temp_fd < 0) {
-                char *body = build_error_response("Failed to create temporary file");
-                send_http_json(client_fd, 500, "Internal Server Error", body);
-                free(body);
-                return;
-            }
-
-            if (leftover > 0) {
-                if (!write_all(temp_fd, end_ptr + 4, leftover)) {
-                    close(temp_fd);
-                    unlink(temp_path);
-                    char *body = build_error_response("Failed writing request body");
-                    send_http_json(client_fd, 500, "Internal Server Error", body);
-                    free(body);
-                    return;
-                }
-            }
-
-            ssize_t total_written = (ssize_t)leftover;
-            while (total_written < content_length) {
-                nread = recv(client_fd, recv_buffer, sizeof(recv_buffer), 0);
-                if (nread <= 0) {
-                    close(temp_fd);
-                    unlink(temp_path);
-                    char *body = build_error_response("Unexpected end of stream");
-                    send_http_json(client_fd, 400, "Bad Request", body);
-                    free(body);
-                    return;
-                }
-                if (!write_all(temp_fd, recv_buffer, (size_t)nread)) {
-                    close(temp_fd);
-                    unlink(temp_path);
-                    char *body = build_error_response("Failed writing request body");
-                    send_http_json(client_fd, 500, "Internal Server Error", body);
-                    free(body);
-                    return;
-                }
-                total_written += nread;
-            }
-            close(temp_fd);
-
-            if (total_written != content_length) {
-                unlink(temp_path);
-                char *body = build_error_response("Content-Length mismatch");
-                send_http_json(client_fd, 400, "Bad Request", body);
-                free(body);
-                return;
-            }
-
             StringArray processed;
             string_array_init(&processed);
             char *process_error = NULL;
-            if (!process_zip_file(temp_path, conn, &processed, &process_error)) {
+            int ingest_status = 500;
+            if (!handle_zip_upload(client_fd, body_start, leftover, saved_body_char, content_length,
+                                   conn, &processed, &ingest_status, &process_error)) {
+                const char *status_text;
+                switch (ingest_status) {
+                    case 200: status_text = "OK"; break;
+                    case 400: status_text = "Bad Request"; break;
+                    case 401: status_text = "Unauthorized"; break;
+                    case 411: status_text = "Length Required"; break;
+                    case 413: status_text = "Payload Too Large"; break;
+                    case 500: default: status_text = "Internal Server Error"; break;
+                }
                 char *body = build_error_response(process_error ? process_error : "Processing failed");
-                send_http_json(client_fd, 500, "Internal Server Error", body);
+                const char *payload = body ? body : "{\"status\":\"error\",\"message\":\"Processing failed\"}";
+                send_http_json(client_fd, ingest_status, status_text, payload);
                 free(body);
                 free(process_error);
                 string_array_clear(&processed);
-                unlink(temp_path);
                 return;
             }
+            free(process_error);
             char *body = build_success_response(&processed);
             if (!body) {
                 body = build_error_response("Failed to build response");
@@ -5244,7 +5589,6 @@ static void handle_client(int client_fd, void *ctx) {
                 free(body);
             }
             string_array_clear(&processed);
-            unlink(temp_path);
             return;
         }
     }
@@ -5358,6 +5702,12 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     g_report_output_dir = report_dir_trimmed;
+
+    RouteHelpers route_helpers = {
+        .build_location_detail = build_location_detail_payload,
+        .build_report_json = build_report_json_payload
+    };
+    routes_register_helpers(&route_helpers);
 
     char *xai_key_trimmed = trim_copy(getenv("XAI_API_KEY"));
     if (!xai_key_trimmed || xai_key_trimmed[0] == '\0') {

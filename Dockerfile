@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Makefile README.md env.example ./
+COPY include/ include/
 COPY src/ src/
 COPY sql/ sql/
 RUN make && strip audit_webhook
