@@ -2098,7 +2098,7 @@ static int load_report_for_building(PGconn *conn, const char *building_address, 
         "  a.city_id,"
         "  a.is_first_car"
         " FROM audits a"
-        " WHERE a.building_address = $1"
+        " WHERE trim(lower(a.building_address)) = trim(lower($1))"
         " ORDER BY a.submitted_on NULLS LAST, a.building_id";
 
     const char *params[1] = { building_address };
@@ -2113,14 +2113,6 @@ static int load_report_for_building(PGconn *conn, const char *building_address, 
     }
 
     int rows = PQntuples(res);
-    if (rows == 0) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("No audits found for building address");
-        }
-        PQclear(res);
-        return 0;
-    }
-
     report_data_clear(report);
     report_data_init(report);
     report->summary.audit_count = rows;
