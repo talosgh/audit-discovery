@@ -109,6 +109,7 @@ typedef struct {
 } AllocationList;
 
 typedef struct {
+    long deficiency_id;
     char *equipment;
     char *condition;
     char *remedy;
@@ -407,6 +408,7 @@ static char *build_location_detail_payload(PGconn *conn, const char *address, in
 static char *build_report_json_payload(PGconn *conn, const char *address, int *status_out, char **error_out);
 static char *build_download_url(const char *job_id);
 static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url, bool deficiency_only);
+static char *build_report_version_list(PGconn *conn, const char *address, bool deficiency_only, char **error_out);
 static int generate_uuid_v4(char out[37]);
 static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char **pdf_bytes_out, size_t *pdf_size_out, char **error_out);
 static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownloadArtifact *artifact, char **error_out);
@@ -659,6 +661,7 @@ static void report_deficiency_list_init(ReportDeficiencyList *list) {
 
 static void report_deficiency_free(ReportDeficiency *def) {
     if (!def) return;
+    def->deficiency_id = 0;
     free(def->equipment);
     free(def->condition);
     free(def->remedy);
@@ -680,6 +683,7 @@ static void report_deficiency_list_clear(ReportDeficiencyList *list) {
 }
 
 static int report_deficiency_list_append(ReportDeficiencyList *list,
+                                         long deficiency_id,
                                          const char *equipment,
                                          const char *condition,
                                          const char *remedy,
@@ -702,6 +706,7 @@ static int report_deficiency_list_append(ReportDeficiencyList *list,
     ReportDeficiency *def = &list->items[list->count];
     memset(def, 0, sizeof(*def));
 
+    def->deficiency_id = deficiency_id;
     def->equipment = strdup_safe(equipment);
     def->condition = strdup_safe(condition);
     def->remedy = strdup_safe(remedy);
@@ -1479,6 +1484,9 @@ static char *build_location_detail_json(const ReportData *report) {
             const ReportDeficiency *def = &device->deficiencies.items[j];
             if (j > 0 && !buffer_append_char(&buf, ',')) goto oom;
             if (!buffer_append_char(&buf, '{')) goto oom;
+            if (!buffer_append_cstr(&buf, "\"id\":")) goto oom;
+            if (!buffer_appendf(&buf, "%ld", def->deficiency_id)) goto oom;
+            if (!buffer_append_char(&buf, ',')) goto oom;
             if (!buffer_append_cstr(&buf, "\"equipment\":")) goto oom;
             if (!buffer_append_json_string(&buf, def->equipment)) goto oom;
             if (!buffer_append_char(&buf, ',')) goto oom;
@@ -1490,6 +1498,9 @@ static char *build_location_detail_json(const ReportData *report) {
             if (!buffer_append_char(&buf, ',')) goto oom;
             if (!buffer_append_cstr(&buf, "\"note\":")) goto oom;
             if (!buffer_append_json_string(&buf, def->note)) goto oom;
+            if (!buffer_append_char(&buf, ',')) goto oom;
+            if (!buffer_append_cstr(&buf, "\"condition_code\":")) goto oom;
+            if (!buffer_append_json_string(&buf, def->condition_code_raw)) goto oom;
             if (!buffer_append_char(&buf, ',')) goto oom;
             if (!buffer_append_cstr(&buf, "\"resolved\":")) goto oom;
             {
@@ -1531,6 +1542,7 @@ static int load_deficiencies_for_audit(PGconn *conn,
     }
     const char *sql =
         "SELECT "
+        "  id,"
         "  violation_equipment,"
         "  violation_condition,"
         "  violation_remedy,"
@@ -1558,12 +1570,22 @@ static int load_deficiencies_for_audit(PGconn *conn,
     }
 
     for (int row = 0; row < PQntuples(res); ++row) {
-        const char *raw_equipment = PQgetisnull(res, row, 0) ? NULL : PQgetvalue(res, row, 0);
-        const char *raw_condition = PQgetisnull(res, row, 1) ? NULL : PQgetvalue(res, row, 1);
-        const char *raw_remedy = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
-        const char *raw_note = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
-        const char *raw_condition_code = PQgetisnull(res, row, 4) ? NULL : PQgetvalue(res, row, 4);
-        const char *resolved_at = PQgetisnull(res, row, 5) ? NULL : PQgetvalue(res, row, 5);
+        const char *raw_id = PQgetisnull(res, row, 0) ? NULL : PQgetvalue(res, row, 0);
+        const char *raw_equipment = PQgetisnull(res, row, 1) ? NULL : PQgetvalue(res, row, 1);
+        const char *raw_condition = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
+        const char *raw_remedy = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
+        const char *raw_note = PQgetisnull(res, row, 4) ? NULL : PQgetvalue(res, row, 4);
+        const char *raw_condition_code = PQgetisnull(res, row, 5) ? NULL : PQgetvalue(res, row, 5);
+        const char *resolved_at = PQgetisnull(res, row, 6) ? NULL : PQgetvalue(res, row, 6);
+
+        long deficiency_id = 0;
+        if (raw_id && raw_id[0] != '\0') {
+            errno = 0;
+            long parsed = strtol(raw_id, NULL, 10);
+            if (errno == 0) {
+                deficiency_id = parsed;
+            }
+        }
 
         char *clean_equipment = clean_deficiency_text(raw_equipment);
         char *clean_condition = clean_deficiency_text(raw_condition);
@@ -1579,6 +1601,7 @@ static int load_deficiencies_for_audit(PGconn *conn,
         }
 
         if (!report_deficiency_list_append(&device->deficiencies,
+                                           deficiency_id,
                                            clean_equipment ? clean_equipment : raw_equipment,
                                            clean_condition ? clean_condition : raw_condition,
                                            clean_remedy ? clean_remedy : raw_remedy,
@@ -1639,6 +1662,133 @@ static int load_deficiencies_for_audit(PGconn *conn,
     return 1;
 }
 
+static char *build_report_version_list(PGconn *conn, const char *address, bool deficiency_only, char **error_out) {
+    if (!conn || !address || !*address) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Address required for report listing");
+        }
+        return NULL;
+    }
+
+    const char *sql = deficiency_only
+        ? "SELECT job_id::text, "
+          "       to_char(created_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+          "       to_char(completed_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+          "       artifact_filename, "
+          "       artifact_size, "
+          "       artifact_version "
+          "FROM report_jobs "
+          "WHERE address = $1 AND deficiency_only = true AND status = 'completed' AND artifact_size IS NOT NULL "
+          "ORDER BY completed_at DESC NULLS LAST, created_at DESC"
+        : "SELECT job_id::text, "
+          "       to_char(created_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+          "       to_char(completed_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+          "       artifact_filename, "
+          "       artifact_size, "
+          "       artifact_version "
+          "FROM report_jobs "
+          "WHERE address = $1 AND deficiency_only = false AND status = 'completed' AND artifact_size IS NOT NULL "
+          "ORDER BY completed_at DESC NULLS LAST, created_at DESC";
+
+    const char *params[1] = { address };
+    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to load report versions");
+        }
+        PQclear(res);
+        return NULL;
+    }
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory building report list");
+        }
+        PQclear(res);
+        return NULL;
+    }
+
+    int ok = buffer_append_char(&buf, '[');
+    int rows = PQntuples(res);
+    for (int row = 0; row < rows && ok; ++row) {
+        if (row > 0) {
+            ok = buffer_append_char(&buf, ',');
+        }
+        const char *job_id_val = PQgetisnull(res, row, 0) ? NULL : PQgetvalue(res, row, 0);
+        const char *created_val = PQgetisnull(res, row, 1) ? NULL : PQgetvalue(res, row, 1);
+        const char *completed_val = PQgetisnull(res, row, 2) ? NULL : PQgetvalue(res, row, 2);
+        const char *filename_val = PQgetisnull(res, row, 3) ? NULL : PQgetvalue(res, row, 3);
+        const char *size_val = PQgetisnull(res, row, 4) ? NULL : PQgetvalue(res, row, 4);
+        const char *version_val = PQgetisnull(res, row, 5) ? NULL : PQgetvalue(res, row, 5);
+        char *download_url = job_id_val ? build_download_url(job_id_val) : NULL;
+
+        ok = ok && buffer_append_cstr(&buf, "{\"job_id\":");
+        ok = ok && buffer_append_json_string(&buf, job_id_val ? job_id_val : "");
+
+        ok = ok && buffer_append_cstr(&buf, ",\"version\":");
+        if (version_val && version_val[0] != '\0') {
+            ok = ok && buffer_append_cstr(&buf, version_val);
+        } else {
+            ok = ok && buffer_append_cstr(&buf, "null");
+        }
+
+        ok = ok && buffer_append_cstr(&buf, ",\"created_at\":");
+        if (created_val) {
+            ok = ok && buffer_append_json_string(&buf, created_val);
+        } else {
+            ok = ok && buffer_append_cstr(&buf, "null");
+        }
+
+        ok = ok && buffer_append_cstr(&buf, ",\"completed_at\":");
+        if (completed_val) {
+            ok = ok && buffer_append_json_string(&buf, completed_val);
+        } else {
+            ok = ok && buffer_append_cstr(&buf, "null");
+        }
+
+        ok = ok && buffer_append_cstr(&buf, ",\"filename\":");
+        if (filename_val) {
+            ok = ok && buffer_append_json_string(&buf, filename_val);
+        } else {
+            ok = ok && buffer_append_cstr(&buf, "null");
+        }
+
+        ok = ok && buffer_append_cstr(&buf, ",\"size_bytes\":");
+        if (size_val && size_val[0] != '\0') {
+            ok = ok && buffer_append_cstr(&buf, size_val);
+        } else {
+            ok = ok && buffer_append_cstr(&buf, "null");
+        }
+
+        ok = ok && buffer_append_cstr(&buf, ",\"download_url\":");
+        if (download_url) {
+            ok = ok && buffer_append_json_string(&buf, download_url);
+        } else {
+            ok = ok && buffer_append_cstr(&buf, "null");
+        }
+        ok = ok && buffer_append_char(&buf, '}');
+        free(download_url);
+    }
+
+    ok = ok && buffer_append_char(&buf, ']');
+    PQclear(res);
+
+    if (!ok) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory building report list");
+        }
+        buffer_free(&buf);
+        return NULL;
+    }
+
+    char *result = buf.data;
+    buf.data = NULL;
+    buffer_free(&buf);
+    return result ? result : strdup("[]");
+}
+
 static char *build_location_detail_payload(PGconn *conn, const char *address, int *status_out, char **error_out) {
     if (status_out) {
         *status_out = 500;
@@ -1690,111 +1840,23 @@ static char *build_location_detail_payload(PGconn *conn, const char *address, in
         return NULL;
     }
 
-    char *reports_json = NULL;
-    const char *reports_sql =
-        "SELECT job_id::text, "
-        "       to_char(created_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
-        "       to_char(completed_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
-        "       artifact_filename, "
-        "       artifact_size, "
-        "       artifact_version "
-        "FROM report_jobs "
-        "WHERE address = $1 AND deficiency_only = false AND status = 'completed' AND artifact_size IS NOT NULL "
-        "ORDER BY completed_at DESC NULLS LAST, created_at DESC";
-    const char *report_params[1] = { address };
-    PGresult *reports_res = PQexecParams(conn, reports_sql, 1, NULL, report_params, NULL, NULL, 0);
-    if (PQresultStatus(reports_res) == PGRES_TUPLES_OK) {
-        Buffer reports_buf;
-        if (buffer_init(&reports_buf)) {
-            int build_ok = 1;
-            if (!buffer_append_char(&reports_buf, '[')) {
-                build_ok = 0;
-            } else {
-                int rows = PQntuples(reports_res);
-                for (int row = 0; row < rows && build_ok; ++row) {
-                    if (row > 0) {
-                        if (!buffer_append_cstr(&reports_buf, ",")) {
-                            build_ok = 0;
-                            break;
-                        }
-                    }
-                    const char *job_id_val = PQgetisnull(reports_res, row, 0) ? NULL : PQgetvalue(reports_res, row, 0);
-                    const char *created_val = PQgetisnull(reports_res, row, 1) ? NULL : PQgetvalue(reports_res, row, 1);
-                    const char *completed_val = PQgetisnull(reports_res, row, 2) ? NULL : PQgetvalue(reports_res, row, 2);
-                    const char *filename_val = PQgetisnull(reports_res, row, 3) ? NULL : PQgetvalue(reports_res, row, 3);
-                    const char *size_val = PQgetisnull(reports_res, row, 4) ? NULL : PQgetvalue(reports_res, row, 4);
-                    const char *version_val = PQgetisnull(reports_res, row, 5) ? NULL : PQgetvalue(reports_res, row, 5);
-                    char *download_url = job_id_val ? build_download_url(job_id_val) : NULL;
-
-                    build_ok = build_ok && buffer_append_cstr(&reports_buf, "{\"job_id\":");
-                    build_ok = build_ok && buffer_append_json_string(&reports_buf, job_id_val ? job_id_val : "");
-
-                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"version\":");
-                    if (version_val && version_val[0] != '\0') {
-                        build_ok = build_ok && buffer_append_cstr(&reports_buf, version_val);
-                    } else {
-                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
-                    }
-
-                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"created_at\":");
-                    if (created_val) {
-                        build_ok = build_ok && buffer_append_json_string(&reports_buf, created_val);
-                    } else {
-                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
-                    }
-
-                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"completed_at\":");
-                    if (completed_val) {
-                        build_ok = build_ok && buffer_append_json_string(&reports_buf, completed_val);
-                    } else {
-                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
-                    }
-
-                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"filename\":");
-                    if (filename_val) {
-                        build_ok = build_ok && buffer_append_json_string(&reports_buf, filename_val);
-                    } else {
-                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
-                    }
-
-                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"size_bytes\":");
-                    if (size_val && size_val[0] != '\0') {
-                        build_ok = build_ok && buffer_append_cstr(&reports_buf, size_val);
-                    } else {
-                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
-                    }
-
-                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"download_url\":");
-                    if (download_url) {
-                        build_ok = build_ok && buffer_append_json_string(&reports_buf, download_url);
-                    } else {
-                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
-                    }
-                    build_ok = build_ok && buffer_append_char(&reports_buf, '}');
-                    free(download_url);
-                }
-                if (build_ok) {
-                    build_ok = buffer_append_char(&reports_buf, ']');
-                }
-                if (build_ok) {
-                    reports_json = reports_buf.data;
-                    reports_buf.data = NULL;
-                }
-                buffer_free(&reports_buf);
-            }
-        }
-    }
-    PQclear(reports_res);
-
+    char *reports_json = build_report_version_list(conn, address, false, error_out);
     if (!reports_json) {
-        reports_json = strdup("[]");
-        if (!reports_json) {
-            if (error_out && !*error_out) {
-                *error_out = strdup("Out of memory preparing report list");
-            }
-            free(json);
-            return NULL;
+        free(json);
+        if (status_out) {
+            *status_out = 500;
         }
+        return NULL;
+    }
+
+    char *deficiency_reports_json = build_report_version_list(conn, address, true, error_out);
+    if (!deficiency_reports_json) {
+        free(json);
+        free(reports_json);
+        if (status_out) {
+            *status_out = 500;
+        }
+        return NULL;
     }
 
     size_t json_len = strlen(json);
@@ -1827,6 +1889,8 @@ static char *build_location_detail_payload(PGconn *conn, const char *address, in
     if (!buffer_append_cstr(&combined, json) ||
         !buffer_append_cstr(&combined, ",\"reports\":") ||
         !buffer_append_cstr(&combined, reports_json) ||
+        !buffer_append_cstr(&combined, ",\"deficiency_reports\":") ||
+        !buffer_append_cstr(&combined, deficiency_reports_json) ||
         !buffer_append_char(&combined, '}')) {
         if (error_out && !*error_out) {
             *error_out = strdup("Out of memory assembling payload");
@@ -1834,6 +1898,7 @@ static char *build_location_detail_payload(PGconn *conn, const char *address, in
         buffer_free(&combined);
         free(json);
         free(reports_json);
+        free(deficiency_reports_json);
         if (status_out) {
             *status_out = 500;
         }
@@ -1842,6 +1907,7 @@ static char *build_location_detail_payload(PGconn *conn, const char *address, in
 
     free(json);
     free(reports_json);
+    free(deficiency_reports_json);
     json = combined.data;
     combined.data = NULL;
     buffer_free(&combined);
@@ -5189,15 +5255,6 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
         goto cleanup;
     }
 
-    if (!load_report_for_building(conn, address_copy, &report, &load_error)) {
-        if (error_out && !*error_out) {
-            *error_out = load_error ? load_error : strdup("Failed to load report data");
-        }
-        goto cleanup;
-    }
-    free(load_error);
-    load_error = NULL;
-
     job_dir = create_temp_dir();
     if (!job_dir) {
         if (error_out && !*error_out) {
@@ -5232,10 +5289,63 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
     }
     close(fd);
 
+    if (artifact_filename_val && artifact_filename_val[0] == '\0') {
+        artifact_filename_val = NULL;
+    }
+
+    int version_number = artifact_version_val ? atoi(artifact_version_val) : 0;
+
+    if (deficiency_only) {
+        const char *filename_src = artifact_filename_val && artifact_filename_val[0]
+                                     ? artifact_filename_val
+                                     : (version_number > 0
+                                           ? "deficiency-list.pdf"
+                                           : "deficiency-list.pdf");
+        char generated_name[192];
+        if (artifact_filename_val && artifact_filename_val[0]) {
+            snprintf(generated_name, sizeof(generated_name), "%s", artifact_filename_val);
+        } else if (version_number > 0) {
+            snprintf(generated_name, sizeof(generated_name), "deficiency-list-%s-v%d.pdf", job_id, version_number);
+        } else {
+            snprintf(generated_name, sizeof(generated_name), "deficiency-list-%s.pdf", job_id);
+        }
+
+        artifact->path = pdf_temp_path;
+        pdf_temp_path = NULL;
+        artifact->work_dir = job_dir;
+        job_dir = NULL;
+        artifact->mime = strdup("application/pdf");
+        if (!artifact->mime) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory allocating mime");
+            }
+            goto cleanup;
+        }
+        artifact->filename = strdup((artifact_filename_val && artifact_filename_val[0]) ? filename_src : generated_name);
+        if (!artifact->filename) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory allocating download name");
+            }
+            goto cleanup;
+        }
+
+        success = 1;
+        goto cleanup;
+    }
+
+    if (!load_report_for_building(conn, address_copy, &report, &load_error)) {
+        if (error_out && !*error_out) {
+            *error_out = load_error ? load_error : strdup("Failed to load report data");
+        }
+        goto cleanup;
+    }
+    free(load_error);
+    load_error = NULL;
+
     char *archive_error = NULL;
     ReportJob archive_job;
     report_job_init(&archive_job);
-    archive_job.deficiency_only = deficiency_only;
+    archive_job.deficiency_only = false;
     if (!create_report_archive(conn, &archive_job, &report, job_dir, pdf_temp_path, &zip_path, &archive_error)) {
         if (error_out && !*error_out) {
             *error_out = archive_error ? archive_error : strdup("Failed to package report");
@@ -5249,17 +5359,13 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
     archive_error = NULL;
 
     unlink(pdf_temp_path);
+    pdf_temp_path = NULL;
 
-    if (artifact_filename_val && artifact_filename_val[0] == '\0') {
-        artifact_filename_val = NULL;
-    }
-
-    int version_number = artifact_version_val ? atoi(artifact_version_val) : 0;
     char download_name[160];
     if (version_number > 0) {
-        snprintf(download_name, sizeof(download_name), deficiency_only ? "deficiency-list-%s-v%d.zip" : "audit-report-%s-v%d.zip", job_id, version_number);
+        snprintf(download_name, sizeof(download_name), "audit-report-%s-v%d.zip", job_id, version_number);
     } else {
-        snprintf(download_name, sizeof(download_name), deficiency_only ? "deficiency-list-%s.zip" : "audit-report-%s.zip", job_id);
+        snprintf(download_name, sizeof(download_name), "audit-report-%s.zip", job_id);
     }
 
     artifact->path = zip_path;
@@ -6141,29 +6247,29 @@ static int append_device_deficiencies(Buffer *buf, const ReportDevice *device, b
     }
 
     if (!omit_heading) {
-        if (!buffer_append_cstr(buf, "\\subsubsection*{Documented Deficiencies}\\n\\n")) {
+        if (!buffer_append_cstr(buf, "\\subsubsection*{Documented Deficiencies}\n\n")) {
             return 0;
         }
     }
 
     if (device->deficiencies.count == 0) {
-        const char *none_text = "\\textit{No deficiencies recorded for this device.}\\n\\n";
+        const char *none_text = "\\textit{No deficiencies recorded for this device.}\n\n";
         if (omit_heading) {
-            none_text = "\\textit{No deficiencies recorded for this device.}\\par\\medskip\\n";
+            none_text = "\\textit{No deficiencies recorded for this device.}\\par\\medskip\n";
         }
         return buffer_append_cstr(buf, none_text);
     }
 
     if (include_summary) {
-        if (!buffer_appendf(buf, "\\textit{Open: %d \\hspace{1em} Closed: %d}\\par\\medskip\\n", open_count, closed_count)) {
+        if (!buffer_appendf(buf, "\\textit{Open: %d \\hspace{1em} Closed: %d}\\par\\medskip\n", open_count, closed_count)) {
             return 0;
         }
     }
 
     if (!buffer_append_cstr(buf,
-            "{\\small\\rowcolors{2}{DeviceRow}{white}\\n"
-            "\\begin{tabularx}{\\textwidth}{@{}p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} X@{}}\\toprule\\n"
-            "\\textbf{Equipment} & \\textbf{Condition} & \\textbf{Remedy} & \\textbf{Note} \\\\ \\midrule\\n")) {
+            "{\\small\\rowcolors{2}{DeviceRow}{white}\n"
+            "\\begin{tabularx}{\\textwidth}{@{}p{.18\\textwidth} p{.18\\textwidth} p{.18\\textwidth} X@{}}\\toprule\n"
+            "\\textbf{Equipment} & \\textbf{Condition} & \\textbf{Remedy} & \\textbf{Note} \\\\ \\midrule\n")) {
         return 0;
     }
 
@@ -6236,7 +6342,7 @@ static int append_device_deficiencies(Buffer *buf, const ReportDevice *device, b
         free(note_cell);
     }
 
-    if (!buffer_append_cstr(buf, "\\bottomrule\\n\\end{tabularx}}\\n\\n")) {
+    if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabularx}}\n\n")) {
         return 0;
     }
     return 1;
@@ -6251,15 +6357,8 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
         return 0;
     }
 
-    const char *current_type = NULL;
     for (size_t i = 0; i < report->devices.count; ++i) {
         ReportDevice *device = &report->devices.items[i];
-        const char *device_type = device->device_type ? device->device_type : "Device";
-        char *device_type_clean = sanitize_ascii(device_type);
-        const char *device_type_text = device_type_clean ? device_type_clean : device_type;
-        char *device_type_tex = latex_escape(device_type_text);
-        free(device_type_clean);
-
         const char *id_src = device->device_id ? device->device_id :
                             (device->submission_id ? device->submission_id : device->audit_uuid);
         char *device_id_clean = sanitize_ascii(id_src);
@@ -6267,32 +6366,35 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
         char *device_id_tex = latex_escape(device_id_text);
         free(device_id_clean);
 
-        if (!device_type_tex || !device_id_tex) {
-            free(device_type_tex);
+        if (!device_id_tex) {
             free(device_id_tex);
             return 0;
         }
 
-        if (!current_type || strcmp(current_type, device_type) != 0) {
-            if (!buffer_appendf(buf, "\\paragraph{%ss}\n\n", device_type_tex)) {
-                free(device_type_tex);
-                free(device_id_tex);
-                return 0;
-            }
-            current_type = device_type;
-        }
-
-        if (!buffer_appendf(buf, "\\subsubsection{%s %s}\n\n", device_type_tex, device_id_tex)) {
-            free(device_type_tex);
+        if (!buffer_appendf(buf, "\\subsubsection{Unit %s}\n\n", device_id_tex)) {
             free(device_id_tex);
             return 0;
         }
 
-        free(device_type_tex);
         free(device_id_tex);
 
         if (!buffer_append_cstr(buf, "{\\small\\rowcolors{2}{DeviceRow}{white}\n\\begin{tabularx}{\\textwidth}{@{}lX@{}}\\toprule\n")) {
             return 0;
+        }
+
+        if (device->device_type && device->device_type[0]) {
+            char *type_clean = sanitize_ascii(device->device_type);
+            const char *type_text = type_clean ? type_clean : device->device_type;
+            char *label_tex = latex_escape("Device Type");
+            char *value_tex = latex_escape(type_text);
+            free(type_clean);
+            if (!label_tex || !value_tex || !buffer_appendf(buf, "%s & %s \\\\ \n", label_tex, value_tex)) {
+                free(label_tex);
+                free(value_tex);
+                return 0;
+            }
+            free(label_tex);
+            free(value_tex);
         }
 
         const struct {
@@ -6300,7 +6402,6 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
             const char *value;
         } info_rows[] = {
             {"Bank", device->bank_name},
-            {"City ID", device->city_id},
             {"Controller Manufacturer", device->controller_manufacturer},
             {"Controller Model", device->controller_model},
             {"Machine Manufacturer", device->machine_manufacturer},
@@ -6663,6 +6764,17 @@ static void normalize_heading_text(char *text) {
         len = strlen(text);
     }
 
+    while (text[0] == '*' || text[0] == '-') {
+        memmove(text, text + 1, strlen(text));
+        while (isspace((unsigned char)text[0])) {
+            memmove(text, text + 1, strlen(text));
+        }
+        len = strlen(text);
+        if (len == 0) {
+            return;
+        }
+    }
+
     const char suffix[] = " of This Traction";
     size_t suffix_len = sizeof(suffix) - 1;
     if (len >= suffix_len) {
@@ -6998,12 +7110,15 @@ static int build_report_latex(const ReportData *report,
         "\\usepackage[table]{xcolor}\n"
         "\\usepackage[normalem]{ulem}\n"
         "\\usepackage{float}\n"
+        "\\usepackage{eso-pic}\n"
         "\\geometry{a4paper, left=0.5in, right=0.5in, top=1in, bottom=1in}\n"
         "\\setlength{\\headheight}{26pt}\n"
         "\\pgfplotsset{compat=1.18}\n"
         "\\graphicspath{{./}{./assets/}}\n"
         "\\usepgfplotslibrary{colorbrewer}\n"
-        "\\definecolor{tabblue}{RGB}{31,119,180}\n")) goto cleanup;
+        "\\definecolor{tabblue}{RGB}{31,119,180}\n"
+        "\\definecolor{CitywideAccent}{HTML}{46A6B4}\n"
+        "\\newcommand{\\generatedtimestamp}{\\today~\\currenttime}\n")) goto cleanup;
 
     if (!buffer_append_cstr(&buf, "\\newcommand{\\clientname}{")) goto cleanup;
     if (!buffer_appendf(&buf, "%s", client_name_tex)) goto cleanup;
@@ -7030,8 +7145,22 @@ static int build_report_latex(const ReportData *report,
         "\\setlength{\\parskip}{0.5\\baselineskip}\n"
         "\\setlength{\\parindent}{0pt}\n"
         "\\definecolor{DeviceRow}{HTML}{EEF2F7}\n"
+        "\\renewcommand{\\labelitemi}{\\textcolor{CitywideAccent}{\\large\\textbullet}}\n"
+        "\\renewcommand{\\labelitemii}{\\textcolor{CitywideAccent}{\\textbullet}}\n"
         "\\newcommand{\\ClosedText}[1]{\\textcolor{gray}{\\sout{#1}}}\n"
         "\\newcommand{\\ClosedMarker}{\\textcolor{gray}{(Closed)}}\n"
+        "\\newcommand{\\applydeficiencywatermark}{%\n"
+        "    \\AddToShipoutPictureBG*{%\n"
+        "        \\begin{tikzpicture}[remember picture,overlay]\n"
+        "            \\node[opacity=0.07] at (current page.center){\\includegraphics[width=1.1\\paperwidth,height=1.1\\paperheight,keepaspectratio]{square.png}};\n"
+        "        \\end{tikzpicture}%\n"
+        "    }%\n"
+        "    \\AddToShipoutPictureFG*{%\n"
+        "        \\begin{tikzpicture}[remember picture,overlay]\n"
+        "            \\node[opacity=0.5] at ([yshift=-1.2cm]current page.north){\\color{CitywideAccent}\\Large Generated on \\generatedtimestamp};\n"
+        "        \\end{tikzpicture}%\n"
+        "    }%\n"
+        "}\n"
         "\\newcommand{\\coverpage}{%\n"
         "    \\newpage\n"
         "    \\vspace*{1cm}%\n"
@@ -7053,11 +7182,12 @@ static int build_report_latex(const ReportData *report,
         "}\n"
         "\\fancypagestyle{mainstyle}{%\n"
         "    \\fancyhf{}%\n"
-        "    \\fancyhead[R]{\\includegraphics[width=0.045\\textwidth]{square.png}}%\n"
+        "    \\fancyhead[R]{\\includegraphics[width=0.065\\textwidth]{square.png}}%\n"
         "    \\fancyfoot[L]{%\n"
-        "        \\tiny\\color[HTML]{46A6B3}%\n"
+        "        \\tiny\\color[HTML]{46A6B4}%\n"
         "        \\clientname\\\\\n"
-        "        \\clientaddress\n"
+        "        \\assetlocation\\\\\n"
+        "        Generated \\generatedtimestamp\n"
         "    }%\n"
         "    \\fancyfoot[R]{\\thepage}%\n"
         "    \\renewcommand{\\headrulewidth}{0pt}%\n"
@@ -7075,10 +7205,20 @@ static int build_report_latex(const ReportData *report,
         "    \\tableofcontents\n"
         "    \\newpage\n"
         "}\n"
-        "\\AtEndDocument{}\n"
-        "\\begin{document}\n\n")) goto cleanup;
+        "\\AtEndDocument{}\n")) goto cleanup;
 
     if (job->deficiency_only) {
+        if (!buffer_append_cstr(&buf, "\\AtBeginDocument{\\applydeficiencywatermark}\n")) goto cleanup;
+    }
+
+    if (!buffer_append_cstr(&buf, "\\begin{document}\n\n")) goto cleanup;
+
+    if (job->deficiency_only) {
+        if (!buffer_append_cstr(&buf, "\\section*{Deficiency List}\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf,
+                "\\textbf{Location}: \\assetlocation\\\\\n"
+                "\\textbf{Owner}: \\clientname\\\\\n"
+                "\\textbf{Generated}: \\generatedtimestamp\n\n")) goto cleanup;
         if (!buffer_append_cstr(&buf, "\\section{Deficiency Summary}\n\n")) goto cleanup;
         size_t device_count = report->devices.count;
         int total_open = 0;
@@ -7102,19 +7242,13 @@ static int build_report_latex(const ReportData *report,
             if (!buffer_appendf(&buf,
                     "\\textbf{Devices evaluated}: %zu \\\\ \n"
                     "\\textbf{Open deficiencies}: %d \\\\ \n"
-                    "\\textbf{Closed deficiencies}: %d\\n\\n",
+                    "\\textbf{Closed deficiencies}: %d\n\n",
                     device_count,
                     total_open,
                     total_closed)) goto cleanup;
 
             for (size_t i = 0; i < report->devices.count; ++i) {
                 ReportDevice *device = &report->devices.items[i];
-                const char *device_type = device->device_type ? device->device_type : "Device";
-                char *device_type_clean = sanitize_ascii(device_type);
-                const char *device_type_text = device_type_clean ? device_type_clean : device_type;
-                char *device_type_tex = latex_escape(device_type_text);
-                free(device_type_clean);
-
                 const char *id_src = device->device_id ? device->device_id :
                                     (device->submission_id ? device->submission_id : device->audit_uuid);
                 char *device_id_clean = sanitize_ascii(id_src);
@@ -7122,18 +7256,15 @@ static int build_report_latex(const ReportData *report,
                 char *device_id_tex = latex_escape(device_id_text);
                 free(device_id_clean);
 
-                if (!device_type_tex || !device_id_tex) {
-                    free(device_type_tex);
+                if (!device_id_tex) {
                     free(device_id_tex);
                     goto cleanup;
                 }
 
-                if (!buffer_appendf(&buf, "\\subsection*{%s %s}\n\n", device_type_tex, device_id_tex)) {
-                    free(device_type_tex);
+                if (!buffer_appendf(&buf, "\\subsection*{Unit %s}\n\n", device_id_tex)) {
                     free(device_id_tex);
                     goto cleanup;
                 }
-                free(device_type_tex);
                 free(device_id_tex);
 
                 if (!append_device_deficiencies(&buf, device, true, true)) goto cleanup;

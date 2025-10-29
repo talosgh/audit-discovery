@@ -1,6 +1,6 @@
 import type { Component } from 'solid-js';
 import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal, onCleanup } from 'solid-js';
-import { fetchLocationDetail, downloadReport, createReportJob, fetchReportJob } from '../api';
+import { fetchLocationDetail, downloadReport, createReportJob, fetchReportJob, updateDeficiencyStatus } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
 import { formatDateTime, formatFileSize, slugify } from '../utils';
@@ -35,9 +35,16 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [detail, { refetch }] = createResource<LocationDetailType, string>(() => props.address, fetchLocationDetail);
   let ownerInputRef: HTMLInputElement | undefined;
 
+  const dismissMessage = () => setMessage(null);
+  const dismissLastDownload = () => setLastDownload(null);
+
   const summary = createMemo(() => detail()?.summary);
   const devices = createMemo(() => detail()?.devices ?? []);
   const reports = createMemo<ReportVersion[]>(() => detail()?.reports ?? []);
+  const deficiencyReports = createMemo<ReportVersion[]>(() => detail()?.deficiency_reports ?? []);
+
+  const [showResolvedDeficiencies, setShowResolvedDeficiencies] = createSignal(false);
+  const [pendingDeficiencyKey, setPendingDeficiencyKey] = createSignal<string | null>(null);
 
   let pollTimer: number | null = null;
 
@@ -65,9 +72,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       setIsGenerating(false);
       stopPolling();
       setLastDownload(null);
-      if (!isDeficiency) {
-        void refetch();
-      }
+      void refetch();
       return;
     }
     setMessage(null);
@@ -256,6 +261,36 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     }
   };
 
+  const handleGenerateDeficiencyList = async () => {
+    if (isGenerating()) {
+      return;
+    }
+    stopPolling();
+    setReportMode('deficiency');
+    setMessage(null);
+    setErrorMessage(null);
+    setStatusMessage('Deficiency list queued for generation…');
+    setJobId(null);
+    setJobStatus(null);
+    setLastDownload(null);
+    try {
+      setIsGenerating(true);
+      const response = await createReportJob({
+        address: props.address,
+        deficiencyOnly: true
+      });
+      setFormError(null);
+      setShowReportModal(false);
+      setJobId(response.job_id);
+      startPolling(response.job_id);
+    } catch (error) {
+      setIsGenerating(false);
+      setStatusMessage(null);
+      const message = error instanceof Error ? error.message : 'Failed to queue deficiency list';
+      setErrorMessage(message);
+    }
+  };
+
   const downloadReportFor = async (targetJobId: string, label: string) => {
     setErrorMessage(null);
     setMessage(null);
@@ -300,8 +335,26 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     await downloadReportFor(id, label);
   };
 
-  const handleDownloadExisting = async (id: string) => {
-    await downloadReportFor(id, 'Report');
+  const handleDownloadExisting = async (id: string, label: string) => {
+    await downloadReportFor(id, label);
+  };
+
+  const handleToggleDeficiency = async (auditId: string, deficiencyId: number, resolved: boolean) => {
+    const key = `${auditId}:${deficiencyId}`;
+    setPendingDeficiencyKey(key);
+    setErrorMessage(null);
+    setMessage(null);
+    setStatusMessage(null);
+    try {
+      await updateDeficiencyStatus(auditId, deficiencyId, resolved);
+      setMessage(resolved ? 'Deficiency marked closed.' : 'Deficiency reopened.');
+      await refetch();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to update deficiency status';
+      setErrorMessage(message);
+    } finally {
+      setPendingDeficiencyKey(null);
+    }
   };
 
   const topDeficiencyCodes = createMemo(() => {
@@ -347,7 +400,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
             type="button"
             class="action-button"
             disabled={isGenerating()}
-            onClick={() => openReportModal('deficiency')}
+            onClick={handleGenerateDeficiencyList}
           >
             {isGenerating() && reportMode() === 'deficiency' ? 'Generating…' : 'Generate Deficiency List'}
           </button>
@@ -443,7 +496,43 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                           </div>
                           <div class="report-actions">
                             <span class="report-size">{formatFileSize(report.size_bytes)}</span>
-                            <button type="button" class="action-button" onClick={() => void handleDownloadExisting(report.job_id)}>
+                            <button type="button" class="action-button" onClick={() => void handleDownloadExisting(report.job_id, 'Report')}>
+                              Download
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    }}
+                  </For>
+                </ul>
+              </div>
+            </Show>
+
+            <Show when={deficiencyReports().length > 0}>
+              <div class="summary-section">
+                <h2>Generated deficiency lists</h2>
+                <ul class="reports-list">
+                  <For each={deficiencyReports()}>
+                    {(report: ReportVersion, index) => {
+                      const isCurrent = index() === 0;
+                      return (
+                        <li class={`report-item${isCurrent ? ' report-item--current' : ''}`}>
+                          <div class="report-meta">
+                            <span class="report-title">
+                              Version {report.version ?? '—'}
+                              <Show when={isCurrent}>
+                                <span class="report-badge">Current</span>
+                              </Show>
+                            </span>
+                            <span class="report-date">{formatDateTime(report.completed_at ?? report.created_at)}</span>
+                          </div>
+                          <div class="report-actions">
+                            <span class="report-size">{formatFileSize(report.size_bytes)}</span>
+                            <button
+                              type="button"
+                              class="action-button"
+                              onClick={() => void handleDownloadExisting(report.job_id, 'Deficiency list')}
+                            >
                               Download
                             </button>
                           </div>
@@ -456,7 +545,15 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
             </Show>
 
             <Show when={message()}>
-              {(msg) => <div class="success-banner" role="status">{msg()}</div>}
+              {(msg) => (
+                <div class="success-banner" role="status">
+                  <span>{msg()}</span>
+                  <button type="button" class="banner-close" aria-label="Dismiss notification" onClick={dismissMessage}>
+                    <span aria-hidden="true">&times;</span>
+                    <span class="sr-only">Dismiss notification</span>
+                  </button>
+                </div>
+              )}
             </Show>
             <Show when={lastDownload()}>
               {(info) => (
@@ -464,6 +561,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                   <span>{info().label} downloaded as {info().filename}</span>
                   <button type="button" class="link-button" onClick={() => void downloadReportFor(info().jobId, info().label)}>
                     Download again
+                  </button>
+                  <button type="button" class="banner-close" aria-label="Dismiss download notification" onClick={dismissLastDownload}>
+                    <span aria-hidden="true">&times;</span>
+                    <span class="sr-only">Dismiss download notification</span>
                   </button>
                 </div>
               )}
@@ -534,6 +635,98 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                 </For>
               </tbody>
             </table>
+          </div>
+
+          <div class="detail-card full-span deficiency-section">
+            <div class="deficiency-header">
+              <h2>Deficiencies by device</h2>
+              <button
+                type="button"
+                class="deficiency-toggle"
+                onClick={() => setShowResolvedDeficiencies((value) => !value)}
+              >
+                {showResolvedDeficiencies() ? 'Hide resolved' : 'Show resolved'}
+              </button>
+            </div>
+            <Show when={devices().length > 0} fallback={<p class="deficiency-empty">No devices found.</p>}>
+              <For each={devices()}>
+                {(device: LocationDevice) => {
+                  const filtered = (device.deficiencies ?? []).filter(
+                    (def) => showResolvedDeficiencies() || !def.resolved
+                  );
+                  return (
+                    <section class="deficiency-device-card">
+                      <div class="deficiency-device-heading">
+                        <div class="deficiency-device-title">Unit {device.device_id ?? '—'}</div>
+                        <div class="deficiency-device-meta">
+                          <span>{device.device_type ?? '—'}</span>
+                          <span>{device.bank_name ?? '—'}</span>
+                          <span>
+                            Showing {filtered.length} of {device.total_deficiencies ?? filtered.length}
+                          </span>
+                        </div>
+                      </div>
+                      <Show
+                        when={filtered.length > 0}
+                        fallback={<p class="deficiency-empty">No deficiencies to display.</p>}
+                      >
+                        <ul class="deficiency-list">
+                          <For each={filtered}>
+                            {(def) => {
+                              const key = `${device.audit_uuid}:${def.id}`;
+                              return (
+                                <li class={`deficiency-item${def.resolved ? ' deficiency-item--resolved' : ''}`}>
+                                  <div class="deficiency-main">
+                                    <div class="deficiency-title">{def.condition ?? 'Condition unspecified'}</div>
+                                    <div class="deficiency-meta">
+                                      <Show when={def.condition_code}>
+                                        {(code) => <span class="deficiency-code">{code()}</span>}
+                                      </Show>
+                                      <Show when={def.equipment}>
+                                        {(equipment) => <span>{equipment()}</span>}
+                                      </Show>
+                                      <span>Audit ID {device.audit_uuid.slice(0, 8)}…</span>
+                                      <Show when={def.resolved && def.resolved_at}>
+                                        {(resolvedAt) => <span>Closed {formatDateTime(resolvedAt())}</span>}
+                                      </Show>
+                                    </div>
+                                    <Show when={def.remedy}>
+                                      {(remedy) => (
+                                        <p class="deficiency-note">
+                                          <strong>Remedy:</strong> {remedy()}
+                                        </p>
+                                      )}
+                                    </Show>
+                                    <Show when={def.note}>
+                                      {(note) => <p class="deficiency-note">{note()}</p>}
+                                    </Show>
+                                  </div>
+                                  <div class="deficiency-actions">
+                                    <button
+                                      type="button"
+                                      class="deficiency-action-button"
+                                      aria-label={def.resolved ? 'Reopen deficiency' : 'Mark deficiency closed'}
+                                      disabled={pendingDeficiencyKey() === key}
+                                      onClick={() => void handleToggleDeficiency(device.audit_uuid, def.id, !def.resolved)}
+                                    >
+                                      {pendingDeficiencyKey() === key
+                                        ? 'Updating…'
+                                        : def.resolved
+                                        ? 'Reopen'
+                                        : 'Mark closed'}
+                                    </button>
+                                  </div>
+                                </li>
+                              );
+                            }}
+                          </For>
+                        </ul>
+                      </Show>
+                    </section>
+                  );
+                }}
+              </For>
+            </Show>
           </div>
         </Match>
       </Switch>

@@ -135,10 +135,12 @@ export interface LocationSummary {
 }
 
 export interface LocationDeviceDeficiency {
+  id: number;
   equipment: string | null;
   condition: string | null;
   remedy: string | null;
   note: string | null;
+  condition_code: string | null;
   resolved: boolean;
   resolved_at: string | null;
 }
@@ -191,6 +193,7 @@ export interface LocationDetail {
   };
   devices: LocationDevice[];
   reports: ReportVersion[];
+  deficiency_reports: ReportVersion[];
 }
 
 export interface ReportJobCreateRequest {
