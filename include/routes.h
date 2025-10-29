@@ -5,8 +5,17 @@
 #include <libpq-fe.h>
 
 typedef struct {
+    char *path;
+    char *filename;
+    char *mime;
+    char *work_dir;
+} ReportDownloadArtifact;
+
+typedef struct {
     char *(*build_location_detail)(PGconn *conn, const char *address, int *status_out, char **error_out);
     char *(*build_report_json)(PGconn *conn, const char *address, int *status_out, char **error_out);
+    int (*prepare_report_download)(PGconn *conn, const char *job_id, ReportDownloadArtifact *artifact, char **error_out);
+    void (*cleanup_report_download)(ReportDownloadArtifact *artifact);
 } RouteHelpers;
 
 void routes_register_helpers(const RouteHelpers *helpers);

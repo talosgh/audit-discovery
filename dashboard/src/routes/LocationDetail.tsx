@@ -3,8 +3,8 @@ import { For, Match, Show, Switch, createEffect, createMemo, createResource, cre
 import { fetchLocationDetail, downloadReport, createReportJob, fetchReportJob } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
-import { formatDateTime, slugify } from '../utils';
-import type { LocationDetail as LocationDetailType, LocationDevice, ReportJobStatus } from '../types';
+import { formatDateTime, formatFileSize, slugify } from '../utils';
+import type { LocationDetail as LocationDetailType, LocationDevice, ReportJobStatus, ReportVersion } from '../types';
 
 interface LocationDetailProps {
   address: string;
@@ -18,6 +18,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [isGenerating, setIsGenerating] = createSignal(false);
   const [jobId, setJobId] = createSignal<string | null>(null);
   const [jobStatus, setJobStatus] = createSignal<ReportJobStatus | null>(null);
+  const [statusMessage, setStatusMessage] = createSignal<string | null>(null);
+  const [lastDownload, setLastDownload] = createSignal<{ jobId: string; filename: string } | null>(null);
   const [showReportModal, setShowReportModal] = createSignal(false);
   const [coverOwner, setCoverOwner] = createSignal('');
   const [coverStreet, setCoverStreet] = createSignal('');
@@ -34,6 +36,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
   const summary = createMemo(() => detail()?.summary);
   const devices = createMemo(() => detail()?.devices ?? []);
+  const reports = createMemo<ReportVersion[]>(() => detail()?.reports ?? []);
 
   let pollTimer: number | null = null;
 
@@ -47,21 +50,28 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const updateStatusFromPoll = (status: ReportJobStatus) => {
     setJobStatus(status);
     if (status.status === 'failed') {
+      setStatusMessage(null);
       setErrorMessage(status.error ?? 'Report generation failed');
       setIsGenerating(false);
       stopPolling();
       return;
     }
     if (status.status === 'completed' && status.download_ready) {
+      setStatusMessage(null);
       setMessage('Report ready for download.');
       setIsGenerating(false);
       stopPolling();
+      setLastDownload(null);
+      void refetch();
       return;
     }
+    setMessage(null);
     if (status.status === 'processing') {
-      setMessage('Report generation in progress…');
+      setStatusMessage('Report generation in progress…');
     } else if (status.status === 'queued') {
-      setMessage('Report queued for generation…');
+      setStatusMessage('Report queued for generation…');
+    } else {
+      setStatusMessage(`Status: ${status.status}`);
     }
   };
 
@@ -94,6 +104,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setIsGenerating(false);
     setMessage(null);
     setErrorMessage(null);
+    setStatusMessage(null);
+    setLastDownload(null);
     setShowReportModal(false);
     setFormError(null);
     setCoverOwner('');
@@ -205,6 +217,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
     try {
       setIsGenerating(true);
+      setStatusMessage('Report queued for generation…');
+      setLastDownload(null);
       const response = await createReportJob({
         address: props.address,
         coverBuildingOwner: owner,
@@ -218,24 +232,24 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
         recommendations: recsSeed
       });
       setJobId(response.job_id);
-      setMessage('Report request queued. We will notify when it is ready.');
       setShowReportModal(false);
       setFormError(null);
       startPolling(response.job_id);
     } catch (error) {
       setIsGenerating(false);
+      setStatusMessage(null);
       const message = error instanceof Error ? error.message : 'Failed to queue report';
       setErrorMessage(message);
       setFormError(message);
     }
   };
 
-  const handleDownloadReport = async () => {
-    const id = jobId();
-    if (!id) return;
+  const downloadReportFor = async (targetJobId: string) => {
     setErrorMessage(null);
+    setMessage(null);
+    setStatusMessage(null);
     try {
-      const { blob, filename: serverFilename, contentType } = await downloadReport(id);
+      const { blob, filename: serverFilename, contentType } = await downloadReport(targetJobId);
       const inferredExt = (() => {
         if (serverFilename) {
           const dot = serverFilename.lastIndexOf('.');
@@ -257,11 +271,21 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       link.click();
       document.body.removeChild(link);
       URL.revokeObjectURL(url);
-      setMessage(`Report downloaded as ${filename}`);
+      setLastDownload({ jobId: targetJobId, filename });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to download report';
       setErrorMessage(message);
     }
+  };
+
+  const handleDownloadReport = async () => {
+    const id = jobId();
+    if (!id) return;
+    await downloadReportFor(id);
+  };
+
+  const handleDownloadExisting = async (id: string) => {
+    await downloadReportFor(id);
   };
 
   const topDeficiencyCodes = createMemo(() => {
@@ -373,16 +397,48 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
               </div>
             </Show>
 
+            <Show when={reports().length > 0}>
+              <div class="summary-section">
+                <h2>Generated reports</h2>
+                <ul class="reports-list">
+                  <For each={reports()}>
+                    {(report: ReportVersion) => (
+                      <li class="report-item">
+                        <div class="report-meta">
+                          <span class="report-title">Version {report.version ?? '—'}</span>
+                          <span class="report-date">{formatDateTime(report.completed_at ?? report.created_at)}</span>
+                        </div>
+                        <div class="report-actions">
+                          <span class="report-size">{formatFileSize(report.size_bytes)}</span>
+                          <button type="button" class="action-button" onClick={() => void handleDownloadExisting(report.job_id)}>
+                            Download
+                          </button>
+                        </div>
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </div>
+            </Show>
+
             <Show when={message()}>
               {(msg) => <div class="success-banner" role="status">{msg()}</div>}
+            </Show>
+            <Show when={lastDownload()}>
+              {(info) => (
+                <div class="success-banner" role="status">
+                  <span>Report downloaded as {info().filename}</span>
+                  <button type="button" class="link-button" onClick={() => void handleDownloadExisting(info().jobId)}>
+                    Download again
+                  </button>
+                </div>
+              )}
             </Show>
             <Show when={errorMessage()}>
               {(msg) => <div class="error-banner" role="alert">{msg()}</div>}
             </Show>
-            <Show when={jobStatus() && !jobStatus()?.download_ready && isGenerating()}>
-              {(status) => (
-                <div class="info-banner" role="status">Current status: {status().status}</div>
-              )}
+            <Show when={statusMessage()}>
+              {(msg) => <div class="info-banner" role="status">{msg()}</div>}
             </Show>
           </div>
 

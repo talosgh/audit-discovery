@@ -4,6 +4,7 @@
 #include "log.h"
 
 #include <stdbool.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -242,23 +243,109 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
     return 1;
 }
 
-int db_complete_report_job(PGconn *conn, const char *job_id, const char *status, const char *error_text, const char *output_path, char **error_out) {
+int db_complete_report_job(PGconn *conn,
+                           const char *job_id,
+                           const char *status,
+                           const char *error_text,
+                           const char *artifact_filename,
+                           const char *artifact_mime,
+                           const unsigned char *artifact_bytes,
+                           size_t artifact_size,
+                           char **error_out) {
     if (!conn || !job_id || !status) {
         if (error_out && !*error_out) {
             *error_out = strdup("Invalid report job completion parameters");
         }
         return 0;
     }
+
+    bool completed = strcmp(status, "completed") == 0;
+    const char *resolved_mime = artifact_mime;
+    if (completed) {
+        if (!artifact_bytes || artifact_size == 0 || !artifact_filename || artifact_filename[0] == '\0') {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Artifact data missing for completed report");
+            }
+            return 0;
+        }
+        if (!resolved_mime || resolved_mime[0] == '\0') {
+            resolved_mime = "application/pdf";
+        }
+        if (artifact_size > (size_t)INT_MAX) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Artifact too large to store");
+            }
+            return 0;
+        }
+    } else {
+        artifact_bytes = NULL;
+        artifact_size = 0;
+        artifact_filename = NULL;
+        resolved_mime = NULL;
+    }
+
+    char size_buf[32];
+    const char *size_param = NULL;
+    if (completed) {
+        snprintf(size_buf, sizeof(size_buf), "%zu", artifact_size);
+        size_param = size_buf;
+    }
+
     const char *sql =
-        "UPDATE report_jobs "
+        "WITH target AS ("
+        "        SELECT id, address "
+        "        FROM report_jobs "
+        "        WHERE job_id = $1::uuid"
+        "    ), version_calc AS ("
+        "        SELECT target.id, "
+        "               CASE WHEN $2 = 'completed' THEN "
+        "                    COALESCE(("
+        "                        SELECT MAX(artifact_version) "
+        "                        FROM report_jobs "
+        "                        WHERE address = target.address"
+        "                    ), 0) + 1 "
+        "               ELSE NULL END AS next_version "
+        "        FROM target"
+        "    ) "
+        "UPDATE report_jobs r "
         "SET status = $2, "
         "    error = $3, "
-        "    output_path = $4, "
+        "    output_path = NULL, "
+        "    artifact_filename = CASE WHEN $2 = 'completed' THEN $4 ELSE NULL END, "
+        "    artifact_mime = CASE WHEN $2 = 'completed' THEN $5 ELSE NULL END, "
+        "    artifact_bytes = CASE WHEN $2 = 'completed' THEN $6::bytea ELSE NULL END, "
+        "    artifact_size = CASE WHEN $2 = 'completed' THEN $7::bigint ELSE NULL END, "
+        "    artifact_version = CASE WHEN $2 = 'completed' THEN COALESCE((SELECT next_version FROM version_calc), 1) ELSE artifact_version END, "
         "    completed_at = CASE WHEN $2 IN ('completed','failed') THEN NOW() ELSE completed_at END, "
         "    updated_at = NOW() "
-        "WHERE job_id = $1::uuid";
-    const char *params[4] = { job_id, status, error_text, output_path };
-    PGresult *res = PQexecParams(conn, sql, 4, NULL, params, NULL, NULL, 0);
+        "FROM target "
+        "LEFT JOIN version_calc ON version_calc.id = target.id "
+        "WHERE r.id = target.id";
+
+    const char *paramValues[7] = {0};
+    int paramLengths[7] = {0};
+    int paramFormats[7] = {0};
+    Oid paramTypes[7] = {0};
+
+    paramValues[0] = job_id;
+    paramValues[1] = status;
+    paramValues[2] = error_text;
+    paramValues[3] = artifact_filename;
+    paramValues[4] = resolved_mime;
+    if (completed) {
+        paramValues[5] = (const char *)artifact_bytes;
+        paramLengths[5] = (int)artifact_size;
+        paramFormats[5] = 1;
+    } else {
+        paramValues[5] = NULL;
+        paramLengths[5] = 0;
+        paramFormats[5] = 0;
+    }
+    paramTypes[5] = 17; /* BYTEAOID */
+    paramValues[6] = size_param;
+    paramTypes[6] = 20; /* INT8OID */
+
+    PGresult *res = PQexecParams(conn, sql, 7, paramTypes, paramValues, paramLengths, paramFormats, 0);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(res);
@@ -290,7 +377,10 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
         "       to_char(created_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
         "       to_char(started_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
         "       to_char(completed_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
-        "       error, output_path "
+        "       error, "
+        "       artifact_size, "
+        "       artifact_filename, "
+        "       artifact_version "
         "FROM report_jobs "
         "WHERE job_id = $1::uuid";
     const char *params[1] = { job_id };
@@ -318,8 +408,14 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
     const char *started_val = PQgetisnull(res, 0, 4) ? NULL : PQgetvalue(res, 0, 4);
     const char *completed_val = PQgetisnull(res, 0, 5) ? NULL : PQgetvalue(res, 0, 5);
     const char *error_val = PQgetisnull(res, 0, 6) ? NULL : PQgetvalue(res, 0, 6);
-    const char *output_path = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
-    bool download_ready = status_val && strcmp(status_val, "completed") == 0 && output_path && output_path[0] != '\0';
+    const char *artifact_size_val = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
+    const char *artifact_filename_val = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
+    const char *artifact_version_val = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
+    long long artifact_size_num = 0;
+    if (artifact_size_val) {
+        artifact_size_num = atoll(artifact_size_val);
+    }
+    bool download_ready = status_val && strcmp(status_val, "completed") == 0 && artifact_size_num > 0;
 
     Buffer buf;
     if (!buffer_init(&buf)) {
@@ -373,6 +469,27 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
     if (!buffer_append_cstr(&buf, ",\"download_ready\":")) goto fail;
     if (!buffer_append_cstr(&buf, download_ready ? "true" : "false")) goto fail;
 
+    if (!buffer_append_cstr(&buf, ",\"artifact_size\":")) goto fail;
+    if (artifact_size_val) {
+        if (!buffer_append_cstr(&buf, artifact_size_val)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+
+    if (!buffer_append_cstr(&buf, ",\"artifact_filename\":")) goto fail;
+    if (artifact_filename_val) {
+        if (!buffer_append_json_string(&buf, artifact_filename_val)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+
+    if (!buffer_append_cstr(&buf, ",\"version\":")) goto fail;
+    if (artifact_version_val && artifact_version_val[0] != '\0') {
+        if (!buffer_append_cstr(&buf, artifact_version_val)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+
     if (!buffer_append_cstr(&buf, ",\"download_url\":")) goto fail;
     if (download_ready && job_id_val) {
         Buffer url_buf;
@@ -405,66 +522,15 @@ fail:
     return NULL;
 }
 
-int db_fetch_report_download_path(PGconn *conn, const char *job_id, char **path_out, char **error_out) {
-    if (!conn || !job_id || !path_out) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Job id required");
-        }
-        return 0;
-    }
-    const char *sql =
-        "SELECT status, output_path "
-        "FROM report_jobs "
-        "WHERE job_id = $1::uuid";
-    const char *params[1] = { job_id };
-    PGresult *res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = PQresultErrorMessage(res);
-            *error_out = strdup(msg ? msg : "Failed to fetch download path");
-        }
-        PQclear(res);
-        return 0;
-    }
-    if (PQntuples(res) == 0) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Report job not found");
-        }
-        PQclear(res);
-        return 0;
-    }
-    const char *status = PQgetvalue(res, 0, 0);
-    bool completed = status && strcmp(status, "completed") == 0;
-    if (!completed) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Report not ready");
-        }
-        PQclear(res);
-        return 0;
-    }
-    if (PQgetisnull(res, 0, 1)) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Report artifact missing");
-        }
-        PQclear(res);
-        return 0;
-    }
-    const char *path = PQgetvalue(res, 0, 1);
-    *path_out = strdup(path);
-    PQclear(res);
-    if (!*path_out) {
-        if (error_out && !*error_out) {
-            *error_out = strdup("Out of memory copying path");
-        }
-        return 0;
-    }
-    return 1;
-}
-
-int db_find_existing_report_job(PGconn *conn, const char *address, char **job_id_out, char **status_out, char **output_path_out, char **error_out) {
+int db_find_existing_report_job(PGconn *conn,
+                                const char *address,
+                                char **job_id_out,
+                                char **status_out,
+                                bool *artifact_ready_out,
+                                char **error_out) {
     if (job_id_out) *job_id_out = NULL;
     if (status_out) *status_out = NULL;
-    if (output_path_out) *output_path_out = NULL;
+    if (artifact_ready_out) *artifact_ready_out = false;
     if (!conn || !address) {
         if (error_out && !*error_out) {
             *error_out = strdup("Address required");
@@ -474,7 +540,7 @@ int db_find_existing_report_job(PGconn *conn, const char *address, char **job_id
 
     const char *params[1] = { address };
     const char *active_sql =
-        "SELECT job_id::text, status, output_path "
+        "SELECT job_id::text, status "
         "FROM report_jobs "
         "WHERE address = $1 AND status IN ('queued','processing') "
         "ORDER BY created_at DESC "
@@ -492,19 +558,18 @@ int db_find_existing_report_job(PGconn *conn, const char *address, char **job_id
     if (PQntuples(res) > 0) {
         const char *job_id = PQgetvalue(res, 0, 0);
         const char *status = PQgetvalue(res, 0, 1);
-        const char *output_path = PQgetisnull(res, 0, 2) ? NULL : PQgetvalue(res, 0, 2);
         if (job_id_out) *job_id_out = strdup(job_id);
         if (status_out) *status_out = strdup(status ? status : "queued");
-        if (output_path_out && output_path) *output_path_out = strdup(output_path);
+        if (artifact_ready_out) *artifact_ready_out = false;
         PQclear(res);
         return 1;
     }
     PQclear(res);
 
     const char *completed_sql =
-        "SELECT job_id::text, status, output_path "
+        "SELECT job_id::text, status, artifact_size "
         "FROM report_jobs "
-        "WHERE address = $1 AND status = 'completed' AND output_path IS NOT NULL "
+        "WHERE address = $1 AND status = 'completed' AND artifact_size IS NOT NULL "
         "ORDER BY completed_at DESC NULLS LAST "
         "LIMIT 1";
     res = PQexecParams(conn, completed_sql, 1, NULL, params, NULL, NULL, 0);
@@ -520,10 +585,11 @@ int db_find_existing_report_job(PGconn *conn, const char *address, char **job_id
     if (PQntuples(res) > 0) {
         const char *job_id = PQgetvalue(res, 0, 0);
         const char *status = PQgetvalue(res, 0, 1);
-        const char *output_path = PQgetisnull(res, 0, 2) ? NULL : PQgetvalue(res, 0, 2);
+        const char *artifact_size_val = PQgetisnull(res, 0, 2) ? NULL : PQgetvalue(res, 0, 2);
+        long long artifact_size_num = artifact_size_val ? atoll(artifact_size_val) : 0;
         if (job_id_out) *job_id_out = strdup(job_id);
         if (status_out) *status_out = strdup(status ? status : "completed");
-        if (output_path_out && output_path) *output_path_out = strdup(output_path);
+        if (artifact_ready_out) *artifact_ready_out = artifact_size_num > 0;
         PQclear(res);
         return 1;
     }

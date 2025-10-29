@@ -152,6 +152,70 @@ input[type='search']::placeholder {
   box-shadow: 0 10px 20px rgba(37, 99, 235, 0.35);
 }
 
+.link-button {
+  background: none;
+  border: none;
+  color: #38bdf8;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  margin-left: 0.75rem;
+}
+
+.link-button:hover {
+  text-decoration: none;
+}
+
+.reports-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.report-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.55);
+}
+
+.report-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.report-title {
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.report-date {
+  color: rgba(203, 213, 225, 0.75);
+  font-size: 0.9rem;
+}
+
+.report-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.report-size {
+  color: rgba(148, 163, 184, 0.9);
+  font-size: 0.9rem;
+}
+
+.report-actions .action-button {
+  padding: 0.4rem 0.9rem;
+}
+
 .table-wrapper {
   overflow-x: auto;
 }

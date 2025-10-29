@@ -165,6 +165,16 @@ export interface LocationDevice {
   deficiencies: LocationDeviceDeficiency[];
 }
 
+export interface ReportVersion {
+  job_id: string;
+  version: number | null;
+  created_at: string | null;
+  completed_at: string | null;
+  filename: string | null;
+  size_bytes: number | null;
+  download_url: string | null;
+}
+
 export interface LocationDetail {
   summary: {
     address: string;
@@ -180,6 +190,7 @@ export interface LocationDetail {
     deficiencies_by_code: Record<string, number>;
   };
   devices: LocationDevice[];
+  reports: ReportVersion[];
 }
 
 export interface ReportJobCreateRequest {
@@ -210,4 +221,8 @@ export interface ReportJobStatus {
   completed_at: string | null;
   error: string | null;
   download_ready: boolean;
+  artifact_filename?: string | null;
+  artifact_size?: number | null;
+  version?: number | null;
+  download_url?: string | null;
 }

@@ -32,6 +32,20 @@ export function formatNumber(value: number | null | undefined, options?: Intl.Nu
   return new Intl.NumberFormat(undefined, options).format(value);
 }
 
+export function formatFileSize(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) {
+    return '—';
+  }
+  const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+  let size = value;
+  let unitIndex = 0;
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+  return `${size.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
 export function dataUrl(contentType: string, base64: string): string {
   return `data:${contentType};base64,${base64}`;
 }

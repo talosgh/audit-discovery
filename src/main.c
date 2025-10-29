@@ -408,7 +408,9 @@ static char *build_report_json_payload(PGconn *conn, const char *address, int *s
 static char *build_download_url(const char *job_id);
 static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url);
 static int generate_uuid_v4(char out[37]);
-static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out);
+static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char **pdf_bytes_out, size_t *pdf_size_out, char **error_out);
+static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownloadArtifact *artifact, char **error_out);
+static void cleanup_report_download(ReportDownloadArtifact *artifact);
 static void *report_worker_main(void *arg);
 static void signal_report_worker(void);
 static void narrative_set_init(NarrativeSet *set);
@@ -1684,6 +1686,163 @@ static char *build_location_detail_payload(PGconn *conn, const char *address, in
         }
         return NULL;
     }
+
+    char *reports_json = NULL;
+    const char *reports_sql =
+        "SELECT job_id::text, "
+        "       to_char(created_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+        "       to_char(completed_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
+        "       artifact_filename, "
+        "       artifact_size, "
+        "       artifact_version "
+        "FROM report_jobs "
+        "WHERE address = $1 AND status = 'completed' AND artifact_size IS NOT NULL "
+        "ORDER BY completed_at DESC NULLS LAST, created_at DESC";
+    const char *report_params[1] = { address };
+    PGresult *reports_res = PQexecParams(conn, reports_sql, 1, NULL, report_params, NULL, NULL, 0);
+    if (PQresultStatus(reports_res) == PGRES_TUPLES_OK) {
+        Buffer reports_buf;
+        if (buffer_init(&reports_buf)) {
+            int build_ok = 1;
+            if (!buffer_append_char(&reports_buf, '[')) {
+                build_ok = 0;
+            } else {
+                int rows = PQntuples(reports_res);
+                for (int row = 0; row < rows && build_ok; ++row) {
+                    if (row > 0) {
+                        if (!buffer_append_cstr(&reports_buf, ",")) {
+                            build_ok = 0;
+                            break;
+                        }
+                    }
+                    const char *job_id_val = PQgetisnull(reports_res, row, 0) ? NULL : PQgetvalue(reports_res, row, 0);
+                    const char *created_val = PQgetisnull(reports_res, row, 1) ? NULL : PQgetvalue(reports_res, row, 1);
+                    const char *completed_val = PQgetisnull(reports_res, row, 2) ? NULL : PQgetvalue(reports_res, row, 2);
+                    const char *filename_val = PQgetisnull(reports_res, row, 3) ? NULL : PQgetvalue(reports_res, row, 3);
+                    const char *size_val = PQgetisnull(reports_res, row, 4) ? NULL : PQgetvalue(reports_res, row, 4);
+                    const char *version_val = PQgetisnull(reports_res, row, 5) ? NULL : PQgetvalue(reports_res, row, 5);
+                    char *download_url = job_id_val ? build_download_url(job_id_val) : NULL;
+
+                    build_ok = build_ok && buffer_append_cstr(&reports_buf, "{\"job_id\":");
+                    build_ok = build_ok && buffer_append_json_string(&reports_buf, job_id_val ? job_id_val : "");
+
+                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"version\":");
+                    if (version_val && version_val[0] != '\0') {
+                        build_ok = build_ok && buffer_append_cstr(&reports_buf, version_val);
+                    } else {
+                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
+                    }
+
+                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"created_at\":");
+                    if (created_val) {
+                        build_ok = build_ok && buffer_append_json_string(&reports_buf, created_val);
+                    } else {
+                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
+                    }
+
+                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"completed_at\":");
+                    if (completed_val) {
+                        build_ok = build_ok && buffer_append_json_string(&reports_buf, completed_val);
+                    } else {
+                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
+                    }
+
+                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"filename\":");
+                    if (filename_val) {
+                        build_ok = build_ok && buffer_append_json_string(&reports_buf, filename_val);
+                    } else {
+                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
+                    }
+
+                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"size_bytes\":");
+                    if (size_val && size_val[0] != '\0') {
+                        build_ok = build_ok && buffer_append_cstr(&reports_buf, size_val);
+                    } else {
+                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
+                    }
+
+                    build_ok = build_ok && buffer_append_cstr(&reports_buf, ",\"download_url\":");
+                    if (download_url) {
+                        build_ok = build_ok && buffer_append_json_string(&reports_buf, download_url);
+                    } else {
+                        build_ok = build_ok && buffer_append_cstr(&reports_buf, "null");
+                    }
+                    build_ok = build_ok && buffer_append_char(&reports_buf, '}');
+                    free(download_url);
+                }
+                if (build_ok) {
+                    build_ok = buffer_append_char(&reports_buf, ']');
+                }
+                if (build_ok) {
+                    reports_json = reports_buf.data;
+                    reports_buf.data = NULL;
+                }
+                buffer_free(&reports_buf);
+            }
+        }
+    }
+    PQclear(reports_res);
+
+    if (!reports_json) {
+        reports_json = strdup("[]");
+        if (!reports_json) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory preparing report list");
+            }
+            free(json);
+            return NULL;
+        }
+    }
+
+    size_t json_len = strlen(json);
+    if (json_len == 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid location payload");
+        }
+        free(json);
+        free(reports_json);
+        if (status_out) {
+            *status_out = 500;
+        }
+        return NULL;
+    }
+
+    json[json_len - 1] = '\0';
+    Buffer combined;
+    if (!buffer_init(&combined)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory assembling payload");
+        }
+        free(json);
+        free(reports_json);
+        if (status_out) {
+            *status_out = 500;
+        }
+        return NULL;
+    }
+
+    if (!buffer_append_cstr(&combined, json) ||
+        !buffer_append_cstr(&combined, ",\"reports\":") ||
+        !buffer_append_cstr(&combined, reports_json) ||
+        !buffer_append_char(&combined, '}')) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory assembling payload");
+        }
+        buffer_free(&combined);
+        free(json);
+        free(reports_json);
+        if (status_out) {
+            *status_out = 500;
+        }
+        return NULL;
+    }
+
+    free(json);
+    free(reports_json);
+    json = combined.data;
+    combined.data = NULL;
+    buffer_free(&combined);
+
     if (status_out) {
         *status_out = 200;
     }
@@ -4938,9 +5097,234 @@ static int create_report_archive(PGconn *conn, const ReportJob *job, const Repor
     return 1;
 }
 
-static int process_report_job(PGconn *conn, const ReportJob *job, char **output_path_out, char **error_out) {
-    if (output_path_out) {
-        *output_path_out = NULL;
+static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownloadArtifact *artifact, char **error_out) {
+    if (artifact) {
+        artifact->path = NULL;
+        artifact->filename = NULL;
+        artifact->mime = NULL;
+        artifact->work_dir = NULL;
+    }
+    if (!conn || !job_id || !artifact) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid download parameters");
+        }
+        return 0;
+    }
+
+    int success = 0;
+    PGresult *res = NULL;
+    unsigned char *pdf_data = NULL;
+    size_t pdf_size = 0;
+    char *address_copy = NULL;
+    char *pdf_temp_path = NULL;
+    char *zip_path = NULL;
+    char *job_dir = NULL;
+    ReportData report;
+    report_data_init(&report);
+    char *load_error = NULL;
+
+    const char *params[1] = { job_id };
+    const char *sql =
+        "SELECT address, status, artifact_filename, artifact_mime, artifact_bytes, artifact_size, artifact_version "
+        "FROM report_jobs "
+        "WHERE job_id = $1::uuid";
+
+    res = PQexecParams(conn, sql, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(res);
+            *error_out = strdup(msg ? msg : "Failed to fetch report job");
+        }
+        goto cleanup;
+    }
+    if (PQntuples(res) == 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Report job not found");
+        }
+        goto cleanup;
+    }
+
+    const char *address_val = PQgetisnull(res, 0, 0) ? NULL : PQgetvalue(res, 0, 0);
+    const char *status_val = PQgetisnull(res, 0, 1) ? NULL : PQgetvalue(res, 0, 1);
+    const char *artifact_filename_val = PQgetisnull(res, 0, 2) ? NULL : PQgetvalue(res, 0, 2);
+    const char *artifact_version_val = PQgetisnull(res, 0, 6) ? NULL : PQgetvalue(res, 0, 6);
+
+    if (!status_val || strcmp(status_val, "completed") != 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Report not ready");
+        }
+        goto cleanup;
+    }
+    if (PQgetisnull(res, 0, 4)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Report not ready");
+        }
+        goto cleanup;
+    }
+    pdf_data = PQunescapeBytea((const unsigned char *)PQgetvalue(res, 0, 4), &pdf_size);
+    if (!pdf_data || pdf_size == 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Report artifact missing");
+        }
+        goto cleanup;
+    }
+
+    address_copy = address_val ? strdup(address_val) : NULL;
+    if (!address_copy) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory loading address");
+        }
+        goto cleanup;
+    }
+
+    if (!load_report_for_building(conn, address_copy, &report, &load_error)) {
+        if (error_out && !*error_out) {
+            *error_out = load_error ? load_error : strdup("Failed to load report data");
+        }
+        goto cleanup;
+    }
+    free(load_error);
+    load_error = NULL;
+
+    job_dir = create_temp_dir();
+    if (!job_dir) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to create temporary directory");
+        }
+        goto cleanup;
+    }
+
+    pdf_temp_path = join_path(job_dir, "audit_report.pdf");
+    if (!pdf_temp_path) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory preparing download");
+        }
+        goto cleanup;
+    }
+
+    int fd = open(pdf_temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) {
+        if (error_out && !*error_out) {
+            char msg[160];
+            snprintf(msg, sizeof(msg), "Failed to write PDF: %s", strerror(errno));
+            *error_out = strdup(msg);
+        }
+        goto cleanup;
+    }
+    if (!write_all(fd, pdf_data, pdf_size)) {
+        close(fd);
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to persist PDF");
+        }
+        goto cleanup;
+    }
+    close(fd);
+
+    char *archive_error = NULL;
+    if (!create_report_archive(conn, NULL, &report, job_dir, pdf_temp_path, &zip_path, &archive_error)) {
+        if (error_out && !*error_out) {
+            *error_out = archive_error ? archive_error : strdup("Failed to package report");
+        } else {
+            free(archive_error);
+        }
+        goto cleanup;
+    }
+    free(archive_error);
+    archive_error = NULL;
+
+    unlink(pdf_temp_path);
+
+    if (artifact_filename_val && artifact_filename_val[0] == '\0') {
+        artifact_filename_val = NULL;
+    }
+
+    int version_number = artifact_version_val ? atoi(artifact_version_val) : 0;
+    char download_name[160];
+    if (version_number > 0) {
+        snprintf(download_name, sizeof(download_name), "audit-report-%s-v%d.zip", job_id, version_number);
+    } else {
+        snprintf(download_name, sizeof(download_name), "audit-report-%s.zip", job_id);
+    }
+
+    artifact->path = zip_path;
+    zip_path = NULL;
+    artifact->work_dir = job_dir;
+    job_dir = NULL;
+    artifact->mime = strdup("application/zip");
+    if (!artifact->mime) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory allocating mime");
+        }
+        goto cleanup;
+    }
+    artifact->filename = strdup(download_name);
+    if (!artifact->filename) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory allocating download name");
+        }
+        goto cleanup;
+    }
+
+    success = 1;
+
+cleanup:
+    if (!success) {
+        cleanup_report_download(artifact);
+    }
+    if (zip_path) {
+        unlink(zip_path);
+        free(zip_path);
+    }
+    if (job_dir) {
+        remove_directory_recursive(job_dir);
+        free(job_dir);
+    }
+    if (pdf_temp_path) {
+        unlink(pdf_temp_path);
+        free(pdf_temp_path);
+    }
+    if (pdf_data) {
+        PQfreemem(pdf_data);
+    }
+    report_data_clear(&report);
+    free(address_copy);
+    free(load_error);
+    if (res) {
+        PQclear(res);
+    }
+    return success;
+}
+
+static void cleanup_report_download(ReportDownloadArtifact *artifact) {
+    if (!artifact) {
+        return;
+    }
+    if (artifact->path) {
+        unlink(artifact->path);
+        free(artifact->path);
+        artifact->path = NULL;
+    }
+    if (artifact->work_dir) {
+        remove_directory_recursive(artifact->work_dir);
+        free(artifact->work_dir);
+        artifact->work_dir = NULL;
+    }
+    if (artifact->filename) {
+        free(artifact->filename);
+        artifact->filename = NULL;
+    }
+    if (artifact->mime) {
+        free(artifact->mime);
+        artifact->mime = NULL;
+    }
+}
+
+static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char **pdf_bytes_out, size_t *pdf_size_out, char **error_out) {
+    if (pdf_bytes_out) {
+        *pdf_bytes_out = NULL;
+    }
+    if (pdf_size_out) {
+        *pdf_size_out = 0;
     }
     if (!conn || !job || !job->address || !g_report_output_dir) {
         if (error_out && !*error_out) {
@@ -4956,7 +5340,6 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
     char *job_dir = NULL;
     char *tex_path = NULL;
     char *pdf_path = NULL;
-    char *zip_path = NULL;
     char *report_json = NULL;
     NarrativeSet narratives;
     narrative_set_init(&narratives);
@@ -4966,6 +5349,8 @@ static int process_report_job(PGconn *conn, const ReportJob *job, char **output_
     size_t total_task_slots = 0;
     size_t tasks_created = 0;
     char *narrative_build_error = NULL;
+    unsigned char *pdf_bytes = NULL;
+    size_t pdf_size = 0;
 
     char *load_error = NULL;
     if (!load_report_for_building(conn, job->address, &report, &load_error)) {
@@ -5279,28 +5664,22 @@ narrative_join:
     }
     free(compile_error);
 
-    char *archive_error = NULL;
-    if (!create_report_archive(conn, job, &report, job_dir, pdf_path, &zip_path, &archive_error)) {
+    if (!read_file_to_bytes(pdf_path, &pdf_bytes, &pdf_size)) {
         if (error_out && !*error_out) {
-            *error_out = archive_error ? archive_error : strdup("Failed to build report archive");
-        } else {
-            free(archive_error);
+            *error_out = strdup("Failed to read generated PDF");
         }
         goto cleanup;
     }
-    free(archive_error);
-
-    if (output_path_out) {
-        *output_path_out = zip_path;
-        zip_path = NULL;
+    if (pdf_bytes_out) {
+        *pdf_bytes_out = pdf_bytes;
+        pdf_bytes = NULL;
+    }
+    if (pdf_size_out) {
+        *pdf_size_out = pdf_size;
     }
     success = 1;
 
 cleanup:
-    if (!success && output_path_out && *output_path_out) {
-        free(*output_path_out);
-        *output_path_out = NULL;
-    }
     if (tasks) {
         for (size_t i = 0; i < total_task_slots; ++i) {
             free(tasks[i].prompt);
@@ -5313,14 +5692,19 @@ cleanup:
         free(tasks);
         tasks = NULL;
     }
-    free(zip_path);
     free(report_json);
     narrative_set_clear(&narratives);
     report_data_clear(&report);
+    if (job_dir) {
+        remove_directory_recursive(job_dir);
+    }
     free(job_dir);
     free(tex_path);
     if (pdf_path) {
         free(pdf_path);
+    }
+    if (pdf_bytes) {
+        free(pdf_bytes);
     }
     return success;
 }
@@ -5403,19 +5787,36 @@ static void *report_worker_main(void *arg) {
 
         log_info("Processing report job %s for %s", job.job_id, job.address ? job.address : "(unknown address)");
 
-        char *output_path = NULL;
+        unsigned char *pdf_data = NULL;
+        size_t pdf_size = 0;
         char *process_error = NULL;
-        int success = process_report_job(conn, &job, &output_path, &process_error);
+        int success = process_report_job(conn, &job, &pdf_data, &pdf_size, &process_error);
         char *update_error = NULL;
         if (success) {
-            if (!db_complete_report_job(conn, job.job_id, "completed", NULL, output_path, &update_error)) {
+            if (!db_complete_report_job(conn,
+                                        job.job_id,
+                                        "completed",
+                                        NULL,
+                                        "audit_report.pdf",
+                                        "application/pdf",
+                                        pdf_data,
+                                        pdf_size,
+                                        &update_error)) {
                 log_error("Failed to mark report job %s completed: %s", job.job_id, update_error ? update_error : "unknown error");
             } else {
                 log_info("Report job %s completed", job.job_id);
             }
         } else {
             const char *message = process_error ? process_error : "Report generation failed";
-            if (!db_complete_report_job(conn, job.job_id, "failed", message, NULL, &update_error)) {
+            if (!db_complete_report_job(conn,
+                                        job.job_id,
+                                        "failed",
+                                        message,
+                                        NULL,
+                                        NULL,
+                                        NULL,
+                                        0,
+                                        &update_error)) {
                 log_error("Failed to mark report job %s failed: %s", job.job_id, update_error ? update_error : "unknown error");
             } else {
                 log_error("Report job %s failed: %s", job.job_id, message);
@@ -5423,7 +5824,7 @@ static void *report_worker_main(void *arg) {
         }
         free(update_error);
         free(process_error);
-        free(output_path);
+        free(pdf_data);
         report_job_clear(&job);
     }
 
@@ -6837,9 +7238,9 @@ static void handle_client(int client_fd, void *ctx) {
 
                 char *existing_job_id = NULL;
                 char *existing_status = NULL;
-                char *existing_output_path = NULL;
+                bool existing_artifact_ready = false;
                 char *lookup_error = NULL;
-                int existing = db_find_existing_report_job(conn, request.address, &existing_job_id, &existing_status, &existing_output_path, &lookup_error);
+                int existing = db_find_existing_report_job(conn, request.address, &existing_job_id, &existing_status, &existing_artifact_ready, &lookup_error);
                 if (existing < 0) {
                     char *body = build_error_response(lookup_error ? lookup_error : "Failed to check existing reports");
                     send_http_json(client_fd, 500, "Internal Server Error", body);
@@ -6855,7 +7256,7 @@ static void handle_client(int client_fd, void *ctx) {
                 if (existing == 1 && existing_status) {
                     if (strcmp(existing_status, "queued") == 0 || strcmp(existing_status, "processing") == 0) {
                         reuse_job = true;
-                    } else if (strcmp(existing_status, "completed") == 0 && existing_output_path && access(existing_output_path, R_OK) == 0) {
+                    } else if (strcmp(existing_status, "completed") == 0 && existing_artifact_ready) {
                         reuse_job = true;
                         artifact_ready = true;
                     }
@@ -6876,14 +7277,12 @@ static void handle_client(int client_fd, void *ctx) {
                     free(download_url);
                     free(existing_job_id);
                     free(existing_status);
-                    free(existing_output_path);
                     report_job_clear(&request);
                     return;
                 }
 
                 free(existing_job_id);
                 free(existing_status);
-                free(existing_output_path);
 
                 char job_id[37];
                 if (!generate_uuid_v4(job_id)) {
@@ -7131,7 +7530,9 @@ int main(int argc, char **argv) {
 
     RouteHelpers route_helpers = {
         .build_location_detail = build_location_detail_payload,
-        .build_report_json = build_report_json_payload
+        .build_report_json = build_report_json_payload,
+        .prepare_report_download = prepare_report_download,
+        .cleanup_report_download = cleanup_report_download
     };
     routes_register_helpers(&route_helpers);
     routes_set_prefix(g_api_prefix);

@@ -72,44 +72,44 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
         }
 
         if (suffix && strcmp(suffix, "/download") == 0) {
-            char *path_str = NULL;
-            char *error = NULL;
-            if (!db_fetch_report_download_path(conn, job_id, &path_str, &error)) {
-                char *body = build_error_response(error ? error : "Report not available");
-                int status = 404;
-                if (error && strcmp(error, "Report not ready") == 0) {
-                    status = 409;
-                } else if (error && strcmp(error, "Report job not found") == 0) {
-                    status = 404;
-                }
-                send_http_json(client_fd, status, status == 404 ? "Not Found" : "Conflict", body);
-                free(body);
-                free(error);
-                return;
-            }
-
-            struct stat st;
-            if (stat(path_str, &st) != 0 || !S_ISREG(st.st_mode)) {
-                free(path_str);
-                char *body = build_error_response("Report artifact missing");
+            if (!g_route_helpers.prepare_report_download || !g_route_helpers.cleanup_report_download) {
+                char *body = build_error_response("Report downloads are not configured");
                 send_http_json(client_fd, 500, "Internal Server Error", body);
                 free(body);
                 return;
             }
 
-            const char *mime = mime_type_for(path_str);
-            if (!mime) {
-                mime = "application/octet-stream";
+            ReportDownloadArtifact artifact = {0};
+            char *error = NULL;
+            if (!g_route_helpers.prepare_report_download(conn, job_id, &artifact, &error)) {
+                char *body = build_error_response(error ? error : "Report not available");
+                int status = 500;
+                if (error) {
+                    if (strcmp(error, "Report not ready") == 0) {
+                        status = 409;
+                    } else if (strcmp(error, "Report job not found") == 0) {
+                        status = 404;
+                    }
+                }
+                send_http_json(client_fd, status,
+                               status == 404 ? "Not Found" : (status == 409 ? "Conflict" : "Internal Server Error"),
+                               body);
+                free(body);
+                free(error);
+                g_route_helpers.cleanup_report_download(&artifact);
+                return;
             }
 
+            const char *mime = artifact.mime ? artifact.mime : "application/zip";
+
             char download_name[64];
-            if (mime && strcmp(mime, "application/zip") == 0) {
+            const char *final_name = artifact.filename;
+            if (!final_name || final_name[0] == '\0') {
                 snprintf(download_name, sizeof(download_name), "audit-report-%s.zip", job_id);
-            } else {
-                snprintf(download_name, sizeof(download_name), "audit-report-%s.pdf", job_id);
+                final_name = download_name;
             }
-            send_file_download(client_fd, path_str, mime, download_name);
-            free(path_str);
+            send_file_download(client_fd, artifact.path, mime, final_name);
+            g_route_helpers.cleanup_report_download(&artifact);
             return;
         }
 
