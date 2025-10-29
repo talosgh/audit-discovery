@@ -445,6 +445,8 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
 static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, char **error_out);
 static char *build_visit_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, char **error_out);
 static char *build_report_version_list(PGconn *conn, const char *address, bool deficiency_only, char **error_out);
+static int append_service_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
+static int append_financial_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
 
 static char *build_location_detail_payload(PGconn *conn, const LocationDetailRequest *request, int *status_out, char **error_out) {
     if (status_out) {
@@ -731,7 +733,7 @@ static void *report_worker_main(void *arg);
 static void signal_report_worker(void);
 static void narrative_set_init(NarrativeSet *set);
 static void narrative_set_clear(NarrativeSet *set);
-static int build_report_latex(const ReportData *report, const NarrativeSet *narratives, const ReportJob *job, const char *output_path, char **error_out);
+static int build_report_latex(PGconn *conn, const ReportData *report, const NarrativeSet *narratives, const ReportJob *job, const LocationProfile *profile, const char *output_path, char **error_out);
 static int run_pdflatex(const char *working_dir, const char *tex_filename, char **error_out);
 static void normalize_heading_text(char *text);
 static char *format_closed_cell(const char *text, bool closed, const char *suffix);
@@ -2217,6 +2219,664 @@ static char *build_download_url(const char *job_id) {
     pos += sizeof(download_segment) - 1;
     url[pos] = '\0';
     return url;
+}
+
+#define SERVICE_FILTER \
+    "(($1 IS NOT NULL AND sd_location_id = $1) " \
+    " OR ($2 IS NOT NULL AND $3 IS NOT NULL AND $4 IS NOT NULL " \
+    "     AND sd_normalized_street ILIKE ('%' || $2 || '%') " \
+    "     AND sd_normalized_city ILIKE ('%' || $3 || '%') " \
+    "     AND sd_normalized_state ILIKE ('%' || $4 || '%'))))"
+
+static int append_service_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out) {
+    if (!buf || !conn || !job) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid service summary context");
+        }
+        return 0;
+    }
+
+    const char *location_code = (profile && profile->location_code && profile->location_code[0]) ? profile->location_code : NULL;
+    char *street_trim = NULL;
+    char *city_trim = NULL;
+    char *state_trim = NULL;
+
+    if (profile && profile->street) {
+        street_trim = trim_copy(profile->street);
+        if (profile->street && !street_trim) {
+            goto oom;
+        }
+    }
+    if (profile && profile->city) {
+        city_trim = trim_copy(profile->city);
+        if (profile->city && !city_trim) {
+            goto oom;
+        }
+    }
+    if (profile && profile->state) {
+        state_trim = trim_copy(profile->state);
+        if (profile->state && !state_trim) {
+            goto oom;
+        }
+    }
+
+    if (!location_code && (!street_trim || !city_trim || !state_trim)) {
+        free(street_trim);
+        free(city_trim);
+        free(state_trim);
+        return 1;
+    }
+
+    const char *params[4] = { location_code, street_trim, city_trim, state_trim };
+
+    const char *sql_summary =
+        "SELECT COUNT(*)::bigint AS total_tickets, "
+        "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS total_hours, "
+        "       MAX(sd_work_date) AS last_service "
+        "FROM esa_in_progress "
+        "WHERE " SERVICE_FILTER;
+    const char *sql_top_problems =
+        "SELECT sd_problem_desc, COUNT(*)::bigint "
+        "FROM esa_in_progress "
+        "WHERE " SERVICE_FILTER " "
+        "  AND sd_problem_desc IS NOT NULL "
+        "  AND btrim(sd_problem_desc) <> '' "
+        "GROUP BY sd_problem_desc "
+        "ORDER BY COUNT(*) DESC "
+        "LIMIT 5";
+    const char *sql_trend =
+        "SELECT to_char(sd_work_date, 'YYYY-MM') AS bucket, "
+        "       COUNT(*)::bigint AS tickets, "
+        "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS hours "
+        "FROM esa_in_progress "
+        "WHERE sd_work_date IS NOT NULL AND " SERVICE_FILTER " "
+        "GROUP BY bucket "
+        "ORDER BY bucket DESC "
+        "LIMIT 12";
+    const char *sql_vendor =
+        "SELECT COALESCE(NULLIF(sd_vendor_name, ''), 'Unknown') AS vendor, "
+        "       COUNT(*)::bigint AS tickets "
+        "FROM esa_in_progress "
+        "WHERE " SERVICE_FILTER " "
+        "GROUP BY vendor "
+        "ORDER BY COUNT(*) DESC "
+        "LIMIT 5";
+
+    PGresult *summary_res = PQexecParams(conn, sql_summary, 4, NULL, params, NULL, NULL, 0);
+    if (!summary_res || PQresultStatus(summary_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = summary_res ? PQresultErrorMessage(summary_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load service summary");
+        }
+        if (summary_res) {
+            PQclear(summary_res);
+        }
+        summary_res = NULL;
+        goto cleanup;
+    }
+
+    PGresult *problem_res = PQexecParams(conn, sql_top_problems, 4, NULL, params, NULL, NULL, 0);
+    if (!problem_res || PQresultStatus(problem_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = problem_res ? PQresultErrorMessage(problem_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load service issues");
+        }
+        if (problem_res) {
+            PQclear(problem_res);
+        }
+        problem_res = NULL;
+        goto cleanup_summary;
+    }
+
+    PGresult *trend_res = PQexecParams(conn, sql_trend, 4, NULL, params, NULL, NULL, 0);
+    if (!trend_res || PQresultStatus(trend_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = trend_res ? PQresultErrorMessage(trend_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load service trend");
+        }
+        if (trend_res) {
+            PQclear(trend_res);
+        }
+        trend_res = NULL;
+        goto cleanup_problem;
+    }
+
+    PGresult *vendor_res = PQexecParams(conn, sql_vendor, 4, NULL, params, NULL, NULL, 0);
+    if (!vendor_res || PQresultStatus(vendor_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = vendor_res ? PQresultErrorMessage(vendor_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load service vendor mix");
+        }
+        if (vendor_res) {
+            PQclear(vendor_res);
+        }
+        vendor_res = NULL;
+        goto cleanup_trend;
+    }
+
+    long total_tickets = 0;
+    double total_hours = 0.0;
+    char *last_service = NULL;
+    if (PQntuples(summary_res) > 0) {
+        if (!PQgetisnull(summary_res, 0, 0)) {
+            total_tickets = strtol(PQgetvalue(summary_res, 0, 0), NULL, 10);
+        }
+        if (!PQgetisnull(summary_res, 0, 1)) {
+            total_hours = strtod(PQgetvalue(summary_res, 0, 1), NULL);
+        }
+        if (!PQgetisnull(summary_res, 0, 2)) {
+            last_service = strdup(PQgetvalue(summary_res, 0, 2));
+        }
+    }
+
+    int problem_rows = problem_res ? PQntuples(problem_res) : 0;
+    int trend_rows = trend_res ? PQntuples(trend_res) : 0;
+    int vendor_rows = vendor_res ? PQntuples(vendor_res) : 0;
+    bool has_data = (total_tickets > 0) || (problem_rows > 0) || (trend_rows > 0) || (vendor_rows > 0);
+
+    const char *address_display = (profile && profile->address_label && profile->address_label[0])
+        ? profile->address_label
+        : (job->address ? job->address : "Unknown location");
+    char *address_clean = sanitize_ascii(address_display);
+    const char *address_text = address_clean ? address_clean : address_display;
+    char *address_tex = latex_escape(address_text ? address_text : "Unknown location");
+    free(address_clean);
+    if (!address_tex) {
+        free(last_service);
+        goto cleanup_vendor;
+    }
+
+    if (!buffer_append_cstr(buf, "\\section{Service Activity}\n\n")) {
+        free(address_tex);
+        free(last_service);
+        goto cleanup_vendor;
+    }
+    if (!buffer_appendf(buf, "\\textit{Location: %s}\\par\\medskip\n", address_tex)) {
+        free(address_tex);
+        free(last_service);
+        goto cleanup_vendor;
+    }
+    free(address_tex);
+
+    if (!has_data) {
+        if (!buffer_append_cstr(buf, "\\textit{No service records were found for this location.}\n\n")) {
+            free(last_service);
+            goto cleanup_vendor;
+        }
+        free(last_service);
+        PQclear(vendor_res);
+        PQclear(trend_res);
+        PQclear(problem_res);
+        PQclear(summary_res);
+        free(street_trim);
+        free(city_trim);
+        free(state_trim);
+        return 1;
+    }
+
+    if (!buffer_append_cstr(buf, "\\begin{tabular}{@{}ll@{}}\\toprule\n\\textbf{Metric} & \\textbf{Value} \\\\ \\midrule\n")) {
+        free(last_service);
+        goto cleanup_vendor;
+    }
+
+    char number_buf[64];
+    snprintf(number_buf, sizeof(number_buf), "%ld", total_tickets);
+    if (!buffer_appendf(buf, "Total Tickets & %s \\\\ \n", number_buf)) {
+        free(last_service);
+        goto cleanup_vendor;
+    }
+    snprintf(number_buf, sizeof(number_buf), "%.1f", total_hours);
+    if (!buffer_appendf(buf, "Total Hours & %s \\\\ \n", number_buf)) {
+        free(last_service);
+        goto cleanup_vendor;
+    }
+    const char *last_service_display = (last_service && last_service[0]) ? last_service : "Not recorded";
+    char *service_clean = sanitize_ascii(last_service_display);
+    const char *service_text = service_clean ? service_clean : last_service_display;
+    char *service_tex = latex_escape(service_text ? service_text : "Not recorded");
+    free(service_clean);
+    if (!service_tex) {
+        free(last_service);
+        goto cleanup_vendor;
+    }
+    int ok = buffer_appendf(buf, "Last Service & %s \\\\ \n", service_tex);
+    free(service_tex);
+    free(last_service);
+    if (!ok) {
+        goto cleanup_vendor;
+    }
+
+    if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabular}\n\n")) {
+        goto cleanup_vendor;
+    }
+
+    if (problem_rows > 0) {
+        if (!buffer_append_cstr(buf, "\\subsection*{Top Service Issues}\n\\begin{itemize}\n")) {
+            goto cleanup_vendor;
+        }
+        for (int i = 0; i < problem_rows; ++i) {
+            const char *problem_val = PQgetisnull(problem_res, i, 0) ? "Unspecified" : PQgetvalue(problem_res, i, 0);
+            char *problem_clean = sanitize_ascii(problem_val);
+            const char *problem_text = problem_clean ? problem_clean : problem_val;
+            char *problem_tex = latex_escape(problem_text ? problem_text : "Unspecified");
+            free(problem_clean);
+            if (!problem_tex) {
+                goto cleanup_vendor;
+            }
+            long count = PQgetisnull(problem_res, i, 1) ? 0 : strtol(PQgetvalue(problem_res, i, 1), NULL, 10);
+            if (!buffer_appendf(buf, "\\item %s --- %ld tickets\n", problem_tex, count)) {
+                free(problem_tex);
+                goto cleanup_vendor;
+            }
+            free(problem_tex);
+        }
+        if (!buffer_append_cstr(buf, "\\end{itemize}\n\n")) {
+            goto cleanup_vendor;
+        }
+    }
+
+    if (vendor_rows > 0) {
+        if (!buffer_append_cstr(buf, "\\subsection*{Vendor Mix}\n\\begin{itemize}\n")) {
+            goto cleanup_vendor;
+        }
+        for (int i = 0; i < vendor_rows; ++i) {
+            const char *vendor_val = PQgetisnull(vendor_res, i, 0) ? "Unknown" : PQgetvalue(vendor_res, i, 0);
+            char *vendor_clean = sanitize_ascii(vendor_val);
+            const char *vendor_text = vendor_clean ? vendor_clean : vendor_val;
+            char *vendor_tex = latex_escape(vendor_text ? vendor_text : "Unknown");
+            free(vendor_clean);
+            if (!vendor_tex) {
+                goto cleanup_vendor;
+            }
+            long count = PQgetisnull(vendor_res, i, 1) ? 0 : strtol(PQgetvalue(vendor_res, i, 1), NULL, 10);
+            if (!buffer_appendf(buf, "\\item %s --- %ld tickets\n", vendor_tex, count)) {
+                free(vendor_tex);
+                goto cleanup_vendor;
+            }
+            free(vendor_tex);
+        }
+        if (!buffer_append_cstr(buf, "\\end{itemize}\n\n")) {
+            goto cleanup_vendor;
+        }
+    }
+
+    if (trend_rows > 0) {
+        int display_rows = trend_rows > 6 ? 6 : trend_rows;
+        if (!buffer_append_cstr(buf, "\\subsection*{Recent Monthly Activity}\n")) {
+            goto cleanup_vendor;
+        }
+        if (!buffer_append_cstr(buf, "\\begin{tabular}{@{}lll@{}}\\toprule\nMonth & Tickets & Hours \\\\ \\midrule\n")) {
+            goto cleanup_vendor;
+        }
+        for (int i = display_rows - 1; i >= 0; --i) {
+            const char *month_val = PQgetisnull(trend_res, i, 0) ? "—" : PQgetvalue(trend_res, i, 0);
+            char *month_clean = sanitize_ascii(month_val);
+            const char *month_text = month_clean ? month_clean : month_val;
+            char *month_tex = latex_escape(month_text ? month_text : "—");
+            free(month_clean);
+            if (!month_tex) {
+                goto cleanup_vendor;
+            }
+            long month_tickets = PQgetisnull(trend_res, i, 1) ? 0 : strtol(PQgetvalue(trend_res, i, 1), NULL, 10);
+            double month_hours = PQgetisnull(trend_res, i, 2) ? 0.0 : strtod(PQgetvalue(trend_res, i, 2), NULL);
+            char hours_buf[32];
+            snprintf(hours_buf, sizeof(hours_buf), "%.1f", month_hours);
+            if (!buffer_appendf(buf, "%s & %ld & %s \\\\ \n", month_tex, month_tickets, hours_buf)) {
+                free(month_tex);
+                goto cleanup_vendor;
+            }
+            free(month_tex);
+        }
+        if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabular}\n\n")) {
+            goto cleanup_vendor;
+        }
+    }
+
+    PQclear(vendor_res);
+    PQclear(trend_res);
+    PQclear(problem_res);
+    PQclear(summary_res);
+    free(street_trim);
+    free(city_trim);
+    free(state_trim);
+    return 1;
+
+cleanup_vendor:
+    PQclear(vendor_res);
+cleanup_trend:
+    PQclear(trend_res);
+cleanup_problem:
+    PQclear(problem_res);
+cleanup_summary:
+    PQclear(summary_res);
+cleanup:
+    free(street_trim);
+    free(city_trim);
+    free(state_trim);
+    if (error_out && !*error_out) {
+        *error_out = strdup("Failed to append service summary");
+    }
+    return 0;
+
+oom:
+    if (error_out && !*error_out) {
+        *error_out = strdup("Out of memory preparing service summary");
+    }
+    goto cleanup;
+}
+
+static int append_financial_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out) {
+    if (!buf || !conn || !job) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid financial summary context");
+        }
+        return 0;
+    }
+
+    if (!profile || !profile->row_id.has_value) {
+        return 1;
+    }
+
+    char idbuf[32];
+    snprintf(idbuf, sizeof(idbuf), "%d", profile->row_id.value);
+    const char *params[1] = { idbuf };
+
+    const char *sql_summary =
+        "SELECT COUNT(*)::bigint AS total_records, "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS total_spend, "
+        "       COALESCE(SUM(CASE WHEN status ILIKE 'Completed%%Approved%%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS approved_spend, "
+        "       COALESCE(SUM(CASE WHEN status ILIKE 'Open%%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS open_spend, "
+        "       MAX(statement_creation_date) AS last_statement "
+        "FROM financial_data "
+        "WHERE location_id = $1";
+    const char *sql_trend =
+        "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
+        "FROM financial_data "
+        "WHERE location_id = $1 AND statement_creation_date IS NOT NULL "
+        "GROUP BY bucket "
+        "ORDER BY bucket DESC "
+        "LIMIT 12";
+    const char *sql_category =
+        "SELECT COALESCE(NULLIF(category, ''), 'Uncategorized') AS category, "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
+        "FROM financial_data "
+        "WHERE location_id = $1 "
+        "GROUP BY category "
+        "ORDER BY SUM(COALESCE(new_cost,0)) DESC "
+        "LIMIT 5";
+    const char *sql_status =
+        "SELECT COALESCE(NULLIF(status, ''), 'Unspecified') AS status, "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
+        "FROM financial_data "
+        "WHERE location_id = $1 "
+        "GROUP BY status "
+        "ORDER BY SUM(COALESCE(new_cost,0)) DESC "
+        "LIMIT 5";
+
+    PGresult *summary_res = PQexecParams(conn, sql_summary, 1, NULL, params, NULL, NULL, 0);
+    if (!summary_res || PQresultStatus(summary_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = summary_res ? PQresultErrorMessage(summary_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load financial summary");
+        }
+        if (summary_res) {
+            PQclear(summary_res);
+        }
+        summary_res = NULL;
+        goto fin_cleanup;
+    }
+
+    PGresult *trend_res = PQexecParams(conn, sql_trend, 1, NULL, params, NULL, NULL, 0);
+    if (!trend_res || PQresultStatus(trend_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = trend_res ? PQresultErrorMessage(trend_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load financial trend");
+        }
+        if (trend_res) {
+            PQclear(trend_res);
+        }
+        trend_res = NULL;
+        goto fin_cleanup_summary;
+    }
+
+    PGresult *category_res = PQexecParams(conn, sql_category, 1, NULL, params, NULL, NULL, 0);
+    if (!category_res || PQresultStatus(category_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = category_res ? PQresultErrorMessage(category_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load financial categories");
+        }
+        if (category_res) {
+            PQclear(category_res);
+        }
+        category_res = NULL;
+        goto fin_cleanup_trend;
+    }
+
+    PGresult *status_res = PQexecParams(conn, sql_status, 1, NULL, params, NULL, NULL, 0);
+    if (!status_res || PQresultStatus(status_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = status_res ? PQresultErrorMessage(status_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load financial statuses");
+        }
+        if (status_res) {
+            PQclear(status_res);
+        }
+        status_res = NULL;
+        goto fin_cleanup_category;
+    }
+
+    long total_records = 0;
+    double total_spend = 0.0;
+    double approved_spend = 0.0;
+    double open_spend = 0.0;
+    char *last_statement = NULL;
+    if (PQntuples(summary_res) > 0) {
+        if (!PQgetisnull(summary_res, 0, 0)) {
+            total_records = strtol(PQgetvalue(summary_res, 0, 0), NULL, 10);
+        }
+        if (!PQgetisnull(summary_res, 0, 1)) {
+            total_spend = strtod(PQgetvalue(summary_res, 0, 1), NULL);
+        }
+        if (!PQgetisnull(summary_res, 0, 2)) {
+            approved_spend = strtod(PQgetvalue(summary_res, 0, 2), NULL);
+        }
+        if (!PQgetisnull(summary_res, 0, 3)) {
+            open_spend = strtod(PQgetvalue(summary_res, 0, 3), NULL);
+        }
+        if (!PQgetisnull(summary_res, 0, 4)) {
+            last_statement = strdup(PQgetvalue(summary_res, 0, 4));
+        }
+    }
+
+    int trend_rows = trend_res ? PQntuples(trend_res) : 0;
+    int category_rows = category_res ? PQntuples(category_res) : 0;
+    int status_rows = status_res ? PQntuples(status_res) : 0;
+    bool has_data = (total_records > 0) || (trend_rows > 0) || (category_rows > 0) || (status_rows > 0);
+
+    const char *address_display = (profile && profile->address_label && profile->address_label[0])
+        ? profile->address_label
+        : (job->address ? job->address : "Unknown location");
+    char *address_clean = sanitize_ascii(address_display);
+    const char *address_text = address_clean ? address_clean : address_display;
+    char *address_tex = latex_escape(address_text ? address_text : "Unknown location");
+    free(address_clean);
+    if (!address_tex) {
+        free(last_statement);
+        goto fin_cleanup_status;
+    }
+
+    if (!buffer_append_cstr(buf, "\\section{Financial Summary}\n\n")) {
+        free(address_tex);
+        free(last_statement);
+        goto fin_cleanup_status;
+    }
+    if (!buffer_appendf(buf, "\\textit{Location: %s}\\par\\medskip\n", address_tex)) {
+        free(address_tex);
+        free(last_statement);
+        goto fin_cleanup_status;
+    }
+    free(address_tex);
+
+    if (!has_data) {
+        if (!buffer_append_cstr(buf, "\\textit{No financial records were found for this location.}\n\n")) {
+            free(last_statement);
+            goto fin_cleanup_status;
+        }
+        free(last_statement);
+        PQclear(status_res);
+        PQclear(category_res);
+        PQclear(trend_res);
+        PQclear(summary_res);
+        return 1;
+    }
+
+    if (!buffer_append_cstr(buf, "\\begin{tabular}{@{}ll@{}}\\toprule\n\\textbf{Metric} & \\textbf{Value} \\\\ \\midrule\n")) {
+        free(last_statement);
+        goto fin_cleanup_status;
+    }
+
+    char value_buf[64];
+    snprintf(value_buf, sizeof(value_buf), "%ld", total_records);
+    if (!buffer_appendf(buf, "Total Records & %s \\\\ \n", value_buf)) {
+        free(last_statement);
+        goto fin_cleanup_status;
+    }
+    snprintf(value_buf, sizeof(value_buf), "$%.2f", total_spend);
+    if (!buffer_appendf(buf, "Total Spend & %s \\\\ \n", value_buf)) {
+        free(last_statement);
+        goto fin_cleanup_status;
+    }
+    snprintf(value_buf, sizeof(value_buf), "$%.2f", approved_spend);
+    if (!buffer_appendf(buf, "Approved Spend & %s \\\\ \n", value_buf)) {
+        free(last_statement);
+        goto fin_cleanup_status;
+    }
+    snprintf(value_buf, sizeof(value_buf), "$%.2f", open_spend);
+    if (!buffer_appendf(buf, "Open Spend & %s \\\\ \n", value_buf)) {
+        free(last_statement);
+        goto fin_cleanup_status;
+    }
+    const char *statement_display = (last_statement && last_statement[0]) ? last_statement : "Not recorded";
+    char *statement_clean = sanitize_ascii(statement_display);
+    const char *statement_text = statement_clean ? statement_clean : statement_display;
+    char *statement_tex = latex_escape(statement_text ? statement_text : "Not recorded");
+    free(statement_clean);
+    free(last_statement);
+    if (!statement_tex) {
+        goto fin_cleanup_status;
+    }
+    if (!buffer_appendf(buf, "Last Statement & %s \\\\ \n", statement_tex)) {
+        free(statement_tex);
+        goto fin_cleanup_status;
+    }
+    free(statement_tex);
+
+    if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabular}\n\n")) {
+        goto fin_cleanup_status;
+    }
+
+    if (category_rows > 0) {
+        if (!buffer_append_cstr(buf, "\\subsection*{Spend by Category}\n\\begin{tabular}{@{}lr@{}}\\toprule\nCategory & Spend \\\\ \\midrule\n")) {
+            goto fin_cleanup_status;
+        }
+        for (int i = 0; i < category_rows; ++i) {
+            const char *category_val = PQgetisnull(category_res, i, 0) ? "Uncategorized" : PQgetvalue(category_res, i, 0);
+            char *category_clean = sanitize_ascii(category_val);
+            const char *category_text = category_clean ? category_clean : category_val;
+            char *category_tex = latex_escape(category_text ? category_text : "Uncategorized");
+            free(category_clean);
+            if (!category_tex) {
+                goto fin_cleanup_status;
+            }
+            double spend = PQgetisnull(category_res, i, 1) ? 0.0 : strtod(PQgetvalue(category_res, i, 1), NULL);
+            snprintf(value_buf, sizeof(value_buf), "$%.2f", spend);
+            if (!buffer_appendf(buf, "%s & %s \\\\ \n", category_tex, value_buf)) {
+                free(category_tex);
+                goto fin_cleanup_status;
+            }
+            free(category_tex);
+        }
+        if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabular}\n\n")) {
+            goto fin_cleanup_status;
+        }
+    }
+
+    if (status_rows > 0) {
+        if (!buffer_append_cstr(buf, "\\subsection*{Spend by Status}\n\\begin{tabular}{@{}lr@{}}\\toprule\nStatus & Spend \\\\ \\midrule\n")) {
+            goto fin_cleanup_status;
+        }
+        for (int i = 0; i < status_rows; ++i) {
+            const char *status_val = PQgetisnull(status_res, i, 0) ? "Unspecified" : PQgetvalue(status_res, i, 0);
+            char *status_clean = sanitize_ascii(status_val);
+            const char *status_text = status_clean ? status_clean : status_val;
+            char *status_tex = latex_escape(status_text ? status_text : "Unspecified");
+            free(status_clean);
+            if (!status_tex) {
+                goto fin_cleanup_status;
+            }
+            double spend = PQgetisnull(status_res, i, 1) ? 0.0 : strtod(PQgetvalue(status_res, i, 1), NULL);
+            snprintf(value_buf, sizeof(value_buf), "$%.2f", spend);
+            if (!buffer_appendf(buf, "%s & %s \\\\ \n", status_tex, value_buf)) {
+                free(status_tex);
+                goto fin_cleanup_status;
+            }
+            free(status_tex);
+        }
+        if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabular}\n\n")) {
+            goto fin_cleanup_status;
+        }
+    }
+
+    if (trend_rows > 0) {
+        int display_rows = trend_rows > 6 ? 6 : trend_rows;
+        if (!buffer_append_cstr(buf, "\\subsection*{Recent Monthly Spend}\n")) {
+            goto fin_cleanup_status;
+        }
+        if (!buffer_append_cstr(buf, "\\begin{tabular}{@{}ll@{}}\\toprule\nMonth & Spend \\\\ \\midrule\n")) {
+            goto fin_cleanup_status;
+        }
+        for (int i = display_rows - 1; i >= 0; --i) {
+            const char *month_val = PQgetisnull(trend_res, i, 0) ? "—" : PQgetvalue(trend_res, i, 0);
+            char *month_clean = sanitize_ascii(month_val);
+            const char *month_text = month_clean ? month_clean : month_val;
+            char *month_tex = latex_escape(month_text ? month_text : "—");
+            free(month_clean);
+            if (!month_tex) {
+                goto fin_cleanup_status;
+            }
+            double spend = PQgetisnull(trend_res, i, 1) ? 0.0 : strtod(PQgetvalue(trend_res, i, 1), NULL);
+            snprintf(value_buf, sizeof(value_buf), "$%.2f", spend);
+            if (!buffer_appendf(buf, "%s & %s \\\\ \n", month_tex, value_buf)) {
+                free(month_tex);
+                goto fin_cleanup_status;
+            }
+            free(month_tex);
+        }
+        if (!buffer_append_cstr(buf, "\\bottomrule\n\\end{tabular}\n\n")) {
+            goto fin_cleanup_status;
+        }
+    }
+
+    PQclear(status_res);
+    PQclear(category_res);
+    PQclear(trend_res);
+    PQclear(summary_res);
+    return 1;
+
+fin_cleanup_status:
+    PQclear(status_res);
+fin_cleanup_category:
+    PQclear(category_res);
+fin_cleanup_trend:
+    PQclear(trend_res);
+fin_cleanup_summary:
+    PQclear(summary_res);
+fin_cleanup:
+    if (error_out && !*error_out) {
+        *error_out = strdup("Failed to append financial summary");
+    }
+    return 0;
 }
 
 static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url, bool deficiency_only) {
@@ -4608,13 +5268,6 @@ oom:
     buffer_free(&buf);
     return NULL;
 }
-
-#define SERVICE_FILTER \
-    "(($1 IS NOT NULL AND sd_location_id = $1) " \
-    " OR ($2 IS NOT NULL AND $3 IS NOT NULL AND $4 IS NOT NULL " \
-    "     AND sd_normalized_street ILIKE ('%' || $2 || '%') " \
-    "     AND sd_normalized_city ILIKE ('%' || $3 || '%') " \
-    "     AND sd_normalized_state ILIKE ('%' || $4 || '%')))"
 
 static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, char **error_out) {
     if (!conn) {
@@ -7570,6 +8223,9 @@ static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char 
     int success = 0;
     ReportData report;
     report_data_init(&report);
+    LocationProfile profile;
+    location_profile_init(&profile);
+    bool profile_available = false;
 
     char *job_dir = NULL;
     char *tex_path = NULL;
@@ -7596,6 +8252,28 @@ static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char 
         goto cleanup;
     }
     free(load_error);
+
+    if (job->address && job->address[0]) {
+        LocationDetailRequest profile_request = {
+            .address = job->address,
+            .location_id = NULL,
+            .visit_ids = NULL,
+            .audit_ids = NULL
+        };
+        char location_id_buf[32];
+        if (job->has_location_id) {
+            snprintf(location_id_buf, sizeof(location_id_buf), "%d", job->location_id);
+            profile_request.location_id = location_id_buf;
+        }
+        char *profile_error = NULL;
+        char *profile_lookup_address = NULL;
+        if (resolve_location_profile(conn, &profile_request, &profile, &profile_lookup_address, &profile_error)) {
+            profile_available = true;
+        } else {
+            free(profile_error);
+        }
+        free(profile_lookup_address);
+    }
 
     job_dir = join_path(g_report_output_dir, job->job_id);
     if (!job_dir) {
@@ -7879,7 +8557,8 @@ narrative_join:
     }
 
     char *latex_error = NULL;
-    if (!build_report_latex(&report, &narratives, job, tex_path, &latex_error)) {
+    const LocationProfile *profile_ptr = profile_available ? &profile : NULL;
+    if (!build_report_latex(conn, &report, &narratives, job, profile_ptr, tex_path, &latex_error)) {
         if (error_out && !*error_out) {
             *error_out = latex_error ? latex_error : strdup("Failed to build LaTeX");
         } else {
@@ -7931,6 +8610,7 @@ cleanup:
     free(report_json);
     narrative_set_clear(&narratives);
     report_data_clear(&report);
+    location_profile_clear(&profile);
     if (job_dir) {
         remove_directory_recursive(job_dir);
     }
@@ -8964,12 +9644,14 @@ static int append_narrative_section(Buffer *buf, const char *title, const char *
     return append_narrative_block(buf, content);
 }
 
-static int build_report_latex(const ReportData *report,
+static int build_report_latex(PGconn *conn,
+                              const ReportData *report,
                               const NarrativeSet *narratives,
                               const ReportJob *job,
+                              const LocationProfile *profile,
                               const char *output_path,
                               char **error_out) {
-    if (!report || !narratives || !job || !output_path) {
+    if (!conn || !report || !narratives || !job || !output_path) {
         if (error_out && !*error_out) {
             *error_out = strdup("Invalid report parameters");
         }
@@ -9436,6 +10118,9 @@ static int build_report_latex(const ReportData *report,
     if (!append_deficiency_code_chart(&buf, report)) goto cleanup;
     if (!append_deficiencies_per_device_chart(&buf, report)) goto cleanup;
     if (!append_controller_age_chart(&buf, report)) goto cleanup;
+
+    if (!append_service_summary_section(&buf, conn, job, profile, error_out)) goto cleanup;
+    if (!append_financial_summary_section(&buf, conn, job, profile, error_out)) goto cleanup;
 
     if (!append_device_sections(&buf, report)) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\newpage\n")) goto cleanup;
