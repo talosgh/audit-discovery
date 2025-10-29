@@ -5445,22 +5445,8 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
             return 0;
         }
 
-        const char *notes_src = (device->general_notes && device->general_notes[0]) ? device->general_notes : "No general notes for this device.";
-        char *notes_clean = sanitize_ascii(notes_src);
-        const char *notes_text = notes_clean ? notes_clean : notes_src;
-        char *notes_tex = latex_escape(notes_text);
-        free(notes_clean);
-        if (!notes_tex) {
-            return 0;
-        }
-        if (!buffer_appendf(buf, "\\paragraph{General Notes}\n%s\\\\\n\n", notes_tex)) {
-            free(notes_tex);
-            return 0;
-        }
-        free(notes_tex);
-
         if (device->deficiencies.count > 0) {
-            if (!buffer_append_cstr(buf, "\\paragraph{Documented Deficiencies}\n")) {
+            if (!buffer_append_cstr(buf, "\\paragraph{Documented Deficiencies}\n\n")) {
                 return 0;
             }
             if (!buffer_append_cstr(buf,
@@ -5514,7 +5500,7 @@ static int append_device_sections(Buffer *buf, const ReportData *report) {
                 return 0;
             }
         } else {
-            if (!buffer_append_cstr(buf, "\\paragraph{Documented Deficiencies}\n\\textit{No deficiencies recorded for this device.}\\\n\n")) {
+            if (!buffer_append_cstr(buf, "\\paragraph{Documented Deficiencies}\n\n\\textit{No deficiencies recorded for this device.}\n\n")) {
                 return 0;
             }
         }
@@ -5585,7 +5571,7 @@ static int append_narrative_block(Buffer *buf, const char *content) {
                     heading_start++;
                 }
                 if (*heading_start != '\0') {
-                    char *escaped = latex_escape(heading_start);
+                    char *escaped = latex_escape_with_markdown(heading_start);
                     if (!escaped) {
                         ok = false;
                     } else {
@@ -5626,7 +5612,7 @@ static int append_narrative_block(Buffer *buf, const char *content) {
                 in_list = true;
             }
             if (ok) {
-                char *escaped = latex_escape(p);
+                char *escaped = latex_escape_with_markdown(p);
                 if (!escaped) {
                     ok = false;
                 } else {
@@ -5640,7 +5626,7 @@ static int append_narrative_block(Buffer *buf, const char *content) {
                 in_list = false;
             }
             if (ok) {
-                char *escaped = latex_escape(trimmed);
+                char *escaped = latex_escape_with_markdown(trimmed);
                 if (!escaped) {
                     ok = false;
                 } else {

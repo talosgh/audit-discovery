@@ -2,6 +2,7 @@
 
 #include "buffer.h"
 
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -116,6 +117,29 @@ char *sanitize_ascii(const char *text) {
     return trimmed ? trimmed : out;
 }
 
+static void latex_append_escaped_char(Buffer *buf, unsigned char c) {
+    switch (c) {
+        case '\\': buffer_append_cstr(buf, "\\textbackslash{}"); break;
+        case '{': buffer_append_cstr(buf, "\\{"); break;
+        case '}': buffer_append_cstr(buf, "\\}"); break;
+        case '#': buffer_append_cstr(buf, "\\#"); break;
+        case '$': buffer_append_cstr(buf, "\\$"); break;
+        case '%': buffer_append_cstr(buf, "\\%"); break;
+        case '&': buffer_append_cstr(buf, "\\&"); break;
+        case '_': buffer_append_cstr(buf, "\\_"); break;
+        case '^': buffer_append_cstr(buf, "\\textasciicircum{}"); break;
+        case '~': buffer_append_cstr(buf, "\\textasciitilde{}"); break;
+        case '\n': buffer_append_cstr(buf, "\\\\\n"); break;
+        default:
+            if (c < 0x20) {
+                // Skip control characters
+            } else {
+                buffer_append_char(buf, (char)c);
+            }
+            break;
+    }
+}
+
 char *latex_escape(const char *text) {
     if (!text) {
         return strdup("");
@@ -125,27 +149,42 @@ char *latex_escape(const char *text) {
         return NULL;
     }
     for (const unsigned char *ptr = (const unsigned char *)text; *ptr; ++ptr) {
-        unsigned char c = *ptr;
-        switch (c) {
-            case '\\': buffer_append_cstr(&buf, "\\textbackslash{}"); break;
-            case '{': buffer_append_cstr(&buf, "\\{"); break;
-            case '}': buffer_append_cstr(&buf, "\\}"); break;
-            case '#': buffer_append_cstr(&buf, "\\#"); break;
-            case '$': buffer_append_cstr(&buf, "\\$"); break;
-            case '%': buffer_append_cstr(&buf, "\\%"); break;
-            case '&': buffer_append_cstr(&buf, "\\&"); break;
-            case '_': buffer_append_cstr(&buf, "\\_"); break;
-            case '^': buffer_append_cstr(&buf, "\\textasciicircum{}"); break;
-            case '~': buffer_append_cstr(&buf, "\\textasciitilde{}"); break;
-            case '\n': buffer_append_cstr(&buf, "\\\\\n"); break;
-            default:
-                if (c < 0x20) {
-                    // Skip control characters
-                } else {
-                    buffer_append_char(&buf, (char)c);
-                }
-                break;
+        latex_append_escaped_char(&buf, *ptr);
+    }
+    char *escaped = buf.data;
+    buf.data = NULL;
+    buffer_free(&buf);
+    if (!escaped) {
+        escaped = strdup("");
+    }
+    return escaped;
+}
+
+char *latex_escape_with_markdown(const char *text) {
+    if (!text) {
+        return strdup("");
+    }
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        return NULL;
+    }
+    bool bold_open = false;
+    for (size_t i = 0; text[i]; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '*' && text[i + 1] == '*') {
+            if (bold_open) {
+                buffer_append_cstr(&buf, "}");
+            } else {
+                buffer_append_cstr(&buf, "\\textbf{");
+            }
+            bold_open = !bold_open;
+            ++i;
+            continue;
         }
+        latex_append_escaped_char(&buf, c);
+    }
+    if (bold_open) {
+        buffer_append_cstr(&buf, "}");
     }
     char *escaped = buf.data;
     buf.data = NULL;

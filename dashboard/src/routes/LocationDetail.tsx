@@ -26,6 +26,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [coverZip, setCoverZip] = createSignal('');
   const [coverContactName, setCoverContactName] = createSignal('');
   const [coverContactEmail, setCoverContactEmail] = createSignal('');
+  const [narrativeSeed, setNarrativeSeed] = createSignal('');
+  const [recommendationsSeed, setRecommendationsSeed] = createSignal('');
   const [formError, setFormError] = createSignal<string | null>(null);
   const [detail, { refetch }] = createResource<LocationDetailType, string>(() => props.address, fetchLocationDetail);
   let ownerInputRef: HTMLInputElement | undefined;
@@ -101,6 +103,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setCoverZip('');
     setCoverContactName('');
     setCoverContactEmail('');
+    setNarrativeSeed('');
+    setRecommendationsSeed('');
   });
 
   createEffect(() => {
@@ -169,6 +173,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     const zip = coverZip().trim();
     const contactName = coverContactName().trim();
     const contactEmail = coverContactEmail().trim();
+    const notesSeed = narrativeSeed().trim();
+    const recsSeed = recommendationsSeed().trim();
 
     if (!owner || !street || !city || !state || !zip || !contactName || !contactEmail) {
       setFormError('Please complete all cover page fields.');
@@ -188,6 +194,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setCoverZip(zip);
     setCoverContactName(contactName);
     setCoverContactEmail(contactEmail);
+    setNarrativeSeed(notesSeed);
+    setRecommendationsSeed(recsSeed);
 
     setMessage(null);
     setErrorMessage(null);
@@ -205,7 +213,9 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
         coverState: state,
         coverZip: zip,
         coverContactName: contactName,
-        coverContactEmail: contactEmail
+        coverContactEmail: contactEmail,
+        notes: notesSeed,
+        recommendations: recsSeed
       });
       setJobId(response.job_id);
       setMessage('Report request queued. We will notify when it is ready.');
@@ -525,6 +535,24 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                   />
                 </label>
               </div>
+              <label class="modal-field modal-field--full">
+                <span>Narrative Seed</span>
+                <textarea
+                  value={narrativeSeed()}
+                  onInput={(event) => setNarrativeSeed(event.currentTarget.value)}
+                  rows={4}
+                  placeholder="Key observations to emphasize in the executive summary and findings."
+                />
+              </label>
+              <label class="modal-field modal-field--full">
+                <span>Recommendations Seed</span>
+                <textarea
+                  value={recommendationsSeed()}
+                  onInput={(event) => setRecommendationsSeed(event.currentTarget.value)}
+                  rows={4}
+                  placeholder="Notes about remediation priorities or client directives."
+                />
+              </label>
               <Show when={formError()}>
                 {(msg) => <p class="modal-error" role="alert">{msg()}</p>}
               </Show>

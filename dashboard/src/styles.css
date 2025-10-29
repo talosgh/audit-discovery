@@ -441,6 +441,10 @@ tbody tr:hover {
   gap: 0.35rem;
 }
 
+.modal-field--full {
+  grid-column: 1 / -1;
+}
+
 .modal-field span {
   font-size: 0.75rem;
   font-weight: 600;
@@ -459,13 +463,27 @@ tbody tr:hover {
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.modal-field input:focus {
+.modal-field textarea {
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 9px;
+  color: #e2e8f0;
+  padding: 0.65rem 0.75rem;
+  font-size: 0.95rem;
+  resize: vertical;
+  min-height: 120px;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.modal-field input:focus,
+.modal-field textarea:focus {
   outline: none;
   border-color: rgba(59, 130, 246, 0.8);
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
 }
 
-.modal-field input::placeholder {
+.modal-field input::placeholder,
+.modal-field textarea::placeholder {
   color: rgba(148, 163, 184, 0.45);
 }
 
