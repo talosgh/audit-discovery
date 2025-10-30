@@ -83,6 +83,13 @@ body {
   color: var(--accent);
 }
 
+.brand-savings-compact {
+  margin-left: 0.35rem;
+  font-size: 0.6rem;
+  letter-spacing: normal;
+  color: var(--text-muted);
+}
+
 .header-right {
   display: flex;
   align-items: center;

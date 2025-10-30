@@ -591,10 +591,11 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const classificationTotal = createMemo(() => financialClassifications().reduce((sum, item) => sum + (item.spend ?? 0), 0));
   const typeTotal = createMemo(() => financialTypes().reduce((sum, item) => sum + (item.spend ?? 0), 0));
 
-  const timeline = createMemo(() => analytics()?.timeline);
-  const timelineData = createMemo(() => timeline()?.data ?? []);
-  const timelineHasService = createMemo(() => Boolean(timeline()?.has_service));
-  const timelineHasFinancial = createMemo(() => Boolean(timeline()?.has_financial));
+  const fallbackTimeline = createMemo(() => detail()?.timeline ?? null);
+  const timelineBundle = createMemo(() => analytics()?.timeline ?? fallbackTimeline() ?? null);
+  const timelineData = createMemo(() => timelineBundle()?.data ?? []);
+  const timelineHasService = createMemo(() => Boolean(timelineBundle()?.has_service));
+  const timelineHasFinancial = createMemo(() => Boolean(timelineBundle()?.has_financial));
   const timelineMaxVisits = createMemo(() => {
     const data = timelineData();
     if (!data.length) return 1;

@@ -48,6 +48,23 @@ export function formatCurrency(value: number | string | null | undefined, curren
   }).format(numeric);
 }
 
+export function formatCurrencyCompact(value: number | string | null | undefined, currency = 'USD'): string {
+  if (value === null || value === undefined) {
+    return '—';
+  }
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return '—';
+  }
+  return new Intl.NumberFormat(undefined, {
+    style: 'currency',
+    currency,
+    notation: 'compact',
+    maximumFractionDigits: 1,
+    minimumFractionDigits: 0
+  }).format(numeric);
+}
+
 export function formatFileSize(value: number | null | undefined): string {
   if (value === null || value === undefined || Number.isNaN(value)) {
     return '—';

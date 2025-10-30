@@ -4,7 +4,7 @@ import LocationDetail from './routes/LocationDetail';
 import AuditDetail from './routes/AuditDetail';
 import type { LocationSummary } from './types';
 import { fetchMetricsSummary } from './api';
-import { formatCurrency } from './utils';
+import { formatCurrency, formatCurrencyCompact } from './utils';
 
 interface LocationSelection {
   address: string;
@@ -75,12 +75,18 @@ const App = () => {
   onMount(() => {
     void fetchMetricsSummary()
       .then((metrics) => {
-        const value = Number(metrics.total_savings ?? 0);
-        if (Number.isFinite(value)) {
-          setGlobalSavings(value);
-        } else {
-          setGlobalSavings(null);
+        const raw = metrics.total_savings;
+        let parsed: number | null = null;
+        if (typeof raw === 'number' && Number.isFinite(raw)) {
+          parsed = raw;
+        } else if (typeof raw === 'string') {
+          const cleaned = raw.replace(/,/g, '').trim();
+          const value = Number.parseFloat(cleaned);
+          if (Number.isFinite(value)) {
+            parsed = value;
+          }
         }
+        setGlobalSavings(parsed);
       })
       .catch(() => {
         setGlobalSavings(null);
@@ -141,11 +147,14 @@ const App = () => {
       <header class="app-header">
         <button type="button" class="brand" onClick={navigateToList} aria-label="Citywide Elevator Operations">
           <img src="/citywide.png" alt="Citywide Elevator Operations" />
-          <span class="brand-savings">
+          <span class="brand-savings" title={globalSavings() != null ? `Total negotiated savings to date: ${formatCurrency(globalSavings())}` : undefined}>
             <Show when={globalSavings() != null} fallback={<span>Client savings: <strong>Calculating…</strong></span>}>
               {(value) => (
                 <span>
                   Client savings: <strong>{formatCurrency(value())}</strong>
+                  <Show when={value() !== null && value() !== undefined && Number(value()) >= 1000000}>
+                    <span class="brand-savings-compact">({formatCurrencyCompact(value())})</span>
+                  </Show>
                 </span>
               )}
             </Show>

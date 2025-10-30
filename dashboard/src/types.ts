@@ -363,6 +363,11 @@ export interface LocationDetail {
   reports: ReportVersion[];
   deficiency_reports: ReportVersion[];
   analytics: LocationAnalytics;
+  timeline?: {
+    data: TimelinePoint[];
+    has_service: boolean;
+    has_financial: boolean;
+  };
 }
 
 export type CoverageStatus = 'available' | 'partial' | 'missing';
