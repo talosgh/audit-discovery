@@ -795,7 +795,27 @@ const showFinance = createMemo(() => hasFinanceData());
     const viewportWidth = container.clientWidth;
     const inferredVisible = perColumn > 0 ? Math.max(Math.floor(viewportWidth / perColumn), 1) : 12;
     const windowSize = Math.max(12, inferredVisible);
-    const targetIndex = Math.max(data.length - windowSize, 0);
+    let lastServiceIndex = -1;
+    let lastFinanceIndex = -1;
+    data.forEach((point, index) => {
+      const serviceTotal =
+        (point.pm ?? 0) +
+        (point.cb_emergency ?? 0) +
+        (point.cb_env ?? 0) +
+        (point.cb_other ?? 0) +
+        (point.tst ?? 0) +
+        (point.rp ?? 0) +
+        (point.misc ?? 0);
+      if (serviceTotal > 0) {
+        lastServiceIndex = index;
+      }
+      const financeTotal = (point.bc ?? 0) + (point.opex ?? 0) + (point.capex ?? 0) + (point.other ?? 0);
+      if (financeTotal > 0) {
+        lastFinanceIndex = index;
+      }
+    });
+    const lastActiveIndex = lastServiceIndex >= 0 ? lastServiceIndex : lastFinanceIndex;
+    const targetIndex = lastActiveIndex >= 0 ? Math.max(lastActiveIndex - windowSize + 1, 0) : Math.max(data.length - windowSize, 0);
     const rawTarget = perColumn > 0 ? targetIndex * perColumn : 0;
     const maxScroll = Math.max(contentWidth - viewportWidth, 0);
     const targetScroll = Math.max(Math.min(rawTarget, maxScroll), 0);
