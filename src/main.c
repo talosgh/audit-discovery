@@ -7849,8 +7849,8 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
     bool service_available = service_stats && service_stats->has_records;
     bool financial_available = financial_stats && financial_stats->has_records;
     bool timeline_has_entries = timeline_json_has_entries(timeline_json);
-    bool service_available_timeline = service_available || timeline_has_service || timeline_has_entries;
-    bool financial_available_timeline = financial_available || timeline_has_financial || timeline_has_entries;
+    bool service_available_timeline = service_available || timeline_has_service;
+    bool financial_available_timeline = financial_available || timeline_has_financial;
 
     int total_deficiencies = report->summary.total_deficiencies;
     double avg_per_device = (device_count > 0) ? report->summary.average_deficiencies_per_device : NAN;
@@ -8210,10 +8210,10 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
         }
         if (!buffer_append_char(&buf, ',')) goto oom;
         if (!buffer_append_cstr(&buf, "\"has_service\":")) goto oom;
-        if (!buffer_append_cstr(&buf, (timeline_has_service || timeline_has_entries) ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, timeline_has_service ? "true" : "false")) goto oom;
         if (!buffer_append_char(&buf, ',')) goto oom;
         if (!buffer_append_cstr(&buf, "\"has_financial\":")) goto oom;
-        if (!buffer_append_cstr(&buf, (timeline_has_financial || timeline_has_entries) ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, timeline_has_financial ? "true" : "false")) goto oom;
         if (!buffer_append_char(&buf, '}')) goto oom;
     }
 
