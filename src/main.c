@@ -7488,25 +7488,9 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
     const Oid service_types[5] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
     const char *service_sql =
         "SELECT to_char(sd_work_date, 'YYYY-MM') AS bucket, "
-        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'PM%' THEN 1 ELSE 0 END)::bigint AS pm_visits, "
-        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-EF%' "
-        "                     OR upper(btrim(sd_cw_at)) LIKE 'CB-EMG%' THEN 1 ELSE 0 END)::bigint AS cb_emergency_visits, "
-        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-ENV%' THEN 1 ELSE 0 END)::bigint AS cb_env_visits, "
-        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-%' "
-        "                     AND upper(btrim(sd_cw_at)) NOT LIKE 'CB-EF%' "
-        "                     AND upper(btrim(sd_cw_at)) NOT LIKE 'CB-EMG%' "
-        "                     AND upper(btrim(sd_cw_at)) NOT LIKE 'CB-ENV%' "
-        "                THEN 1 ELSE 0 END)::bigint AS cb_other_visits, "
-        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'TST%' THEN 1 ELSE 0 END)::bigint AS tst_visits, "
-        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'RP%' THEN 1 ELSE 0 END)::bigint AS rp_visits, "
-        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'SV%' "
-        "                     OR upper(btrim(sd_cw_at)) LIKE 'STBY%' "
-        "                     OR upper(btrim(sd_cw_at)) IN ('NDE','') "
-        "                     OR upper(btrim(sd_cw_at)) IS NULL "
-        "                THEN 1 ELSE 0 END)::bigint AS misc_visits "
+        "       sd_cw_at "
         "FROM esa_in_progress "
         "WHERE sd_work_date IS NOT NULL AND " SERVICE_FILTER " "
-        "GROUP BY bucket "
         "ORDER BY bucket";
 
     PGresult *service_res = PQexecParams(conn, service_sql, 5, service_types, service_params, NULL, NULL, 0);
@@ -7553,13 +7537,9 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
                 continue;
             }
             const char *month = PQgetvalue(service_res, i, 0);
-            long pm_visits = PQgetisnull(service_res, i, 1) ? 0 : strtol(PQgetvalue(service_res, i, 1), NULL, 10);
-            long cb_emergency = PQgetisnull(service_res, i, 2) ? 0 : strtol(PQgetvalue(service_res, i, 2), NULL, 10);
-            long cb_env = PQgetisnull(service_res, i, 3) ? 0 : strtol(PQgetvalue(service_res, i, 3), NULL, 10);
-            long cb_other = PQgetisnull(service_res, i, 4) ? 0 : strtol(PQgetvalue(service_res, i, 4), NULL, 10);
-            long tst_visits = PQgetisnull(service_res, i, 5) ? 0 : strtol(PQgetvalue(service_res, i, 5), NULL, 10);
-            long rp_visits = PQgetisnull(service_res, i, 6) ? 0 : strtol(PQgetvalue(service_res, i, 6), NULL, 10);
-            long misc_visits = PQgetisnull(service_res, i, 7) ? 0 : strtol(PQgetvalue(service_res, i, 7), NULL, 10);
+            const char *raw_code = PQgetisnull(service_res, i, 1) ? NULL : PQgetvalue(service_res, i, 1);
+            const ServiceActivityInfo *activity = service_activity_lookup(raw_code);
+            ServiceActivityCategory category = activity ? activity->category : SERVICE_ACTIVITY_UNKNOWN;
             TimelineEntry *entry = NULL;
             if (!timeline_ensure_entry(&entries, &entry_count, &entry_capacity, month, &entry)) {
                 if (error_out && !*error_out) {
@@ -7573,15 +7553,45 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
                 free(state_trim);
                 return NULL;
             }
-            entry->pm_count = pm_visits;
-            entry->cb_emergency_count = cb_emergency;
-            entry->cb_env_count = cb_env;
-            entry->cb_other_count = cb_other;
-            entry->tst_count = tst_visits;
-            entry->rp_count = rp_visits;
-            entry->misc_count = misc_visits;
-            entry->callback_count = cb_emergency + cb_env + cb_other;
-            entry->total_count = pm_visits + cb_emergency + cb_env + cb_other + tst_visits + rp_visits + misc_visits;
+            bool is_callback = false;
+            switch (category) {
+                case SERVICE_ACTIVITY_PREVENTATIVE:
+                    entry->pm_count += 1;
+                    break;
+                case SERVICE_ACTIVITY_TESTING_NO_LOAD:
+                case SERVICE_ACTIVITY_TESTING_FULL_LOAD:
+                    entry->tst_count += 1;
+                    break;
+                case SERVICE_ACTIVITY_CALLBACK_EMERGENCY:
+                case SERVICE_ACTIVITY_CALLBACK_EQUIPMENT:
+                    entry->cb_emergency_count += 1;
+                    is_callback = true;
+                    break;
+                case SERVICE_ACTIVITY_CALLBACK_ENVIRONMENTAL:
+                    entry->cb_env_count += 1;
+                    is_callback = true;
+                    break;
+                case SERVICE_ACTIVITY_CALLBACK_VANDALISM:
+                case SERVICE_ACTIVITY_CALLBACK_UTILITY:
+                case SERVICE_ACTIVITY_CALLBACK_FIRE_PANEL:
+                case SERVICE_ACTIVITY_CALLBACK_OTHER:
+                    entry->cb_other_count += 1;
+                    is_callback = true;
+                    break;
+                case SERVICE_ACTIVITY_REPAIR:
+                    entry->rp_count += 1;
+                    break;
+                case SERVICE_ACTIVITY_SITE_VISIT:
+                case SERVICE_ACTIVITY_STANDBY:
+                case SERVICE_ACTIVITY_UNKNOWN:
+                default:
+                    entry->misc_count += 1;
+                    break;
+            }
+            if (is_callback) {
+                entry->callback_count += 1;
+            }
+            entry->total_count += 1;
         }
     }
     if (service_res) PQclear(service_res);
