@@ -2962,18 +2962,18 @@ static int append_financial_summary_section(Buffer *buf, PGconn *conn, const Rep
     const char *sql_trend =
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend, "
-        "       COALESCE(SUM(CASE WHEN upper(COALESCE(main_catagory,'')) LIKE 'BC%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_bc, "
-        "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'OPEX' "
-        "                             AND upper(COALESCE(main_catagory,'')) NOT LIKE 'BC%' "
+        "       COALESCE(SUM(CASE WHEN upper(btrim(COALESCE(main_catagory,''))) LIKE 'BC%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_bc, "
+        "       COALESCE(SUM(CASE WHEN upper(btrim(COALESCE(classification,''))) = 'OPEX' "
+        "                             AND upper(btrim(COALESCE(main_catagory,''))) NOT LIKE 'BC%' "
         "                        THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_opex, "
-        "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'CAPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_capex "
+        "       COALESCE(SUM(CASE WHEN upper(btrim(COALESCE(classification,''))) = 'CAPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_capex "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
         "GROUP BY bucket "
         "ORDER BY bucket DESC "
         "LIMIT 12";
     const char *sql_category =
-        "SELECT COALESCE(NULLIF(main_catagory, ''), 'Uncategorized') AS category, "
+        "SELECT COALESCE(NULLIF(btrim(main_catagory), ''), 'Uncategorized') AS category, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) "
@@ -6780,7 +6780,12 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
 
     const char *sql_trend =
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
-        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend, "
+        "       COALESCE(SUM(CASE WHEN upper(btrim(COALESCE(main_catagory,''))) LIKE 'BC%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_bc, "
+        "       COALESCE(SUM(CASE WHEN upper(btrim(COALESCE(classification,''))) = 'OPEX' "
+        "                             AND upper(btrim(COALESCE(main_catagory,''))) NOT LIKE 'BC%' "
+        "                        THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_opex, "
+        "       COALESCE(SUM(CASE WHEN upper(btrim(COALESCE(classification,''))) = 'CAPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_capex "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
         "GROUP BY bucket "
