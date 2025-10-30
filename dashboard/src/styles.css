@@ -1257,15 +1257,15 @@ tbody tr:hover {
 .legend-item {
   display: inline-flex;
   align-items: center;
-  gap: 0.45rem;
-  font-size: 0.9rem;
+  gap: 0.4rem;
+  font-size: 0.78rem;
   color: var(--text-subtle);
 }
 
 .legend-swatch {
   display: inline-block;
-  width: 14px;
-  height: 14px;
+  width: 12px;
+  height: 12px;
   border-radius: 3px;
 }
 
