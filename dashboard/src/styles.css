@@ -1334,21 +1334,6 @@ tbody tr:hover {
   min-height: 180px;
 }
 
-.timeline-bars {
-  display: flex;
-  align-items: flex-end;
-  gap: 1.5rem;
-}
-
-.timeline-column {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.45rem;
-  color: var(--text-subtle);
-  position: relative;
-}
-
 .timeline-hint {
   position: absolute;
   top: 0.2rem;
@@ -1371,128 +1356,94 @@ tbody tr:hover {
 }
 
 
-.timeline-bars-stack {
-  display: flex;
-  align-items: flex-end;
-  justify-content: center;
-  gap: 0.7rem;
-  width: 100%;
-  height: 100%;
-}
-
-.timeline-stack {
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  gap: 3px;
-  height: 100%;
-}
-
-
-.timeline-stack--service {
-  width: 22px;
-  position: relative;
-  z-index: 2;
-}
-
-.timeline-stack--finance {
-  width: 16px;
-  position: relative;
-  z-index: 1;
-}
-
-.timeline-stack--finance-only {
-  width: 22px;
-}
-
-.timeline-bar {
-  width: 100%;
-  border-radius: 4px;
-  transition: height 0.3s ease;
-  position: relative;
-  z-index: 2;
-}
-
-.timeline-stack--service .timeline-bar {
-  position: absolute;
-  left: 0;
-  right: 0;
-}
-
 .timeline-bar--pm,
 .trend-segment--pm {
   background: #0ea5e9;
+  fill: #0ea5e9;
 }
 
 .timeline-bar--cb-emergency,
 .trend-segment--cb-emergency {
   background: #ef4444;
+  fill: #ef4444;
 }
 
 .timeline-bar--cb-env,
 .trend-segment--cb-env {
   background: #f59e0b;
+  fill: #f59e0b;
 }
 
 .timeline-bar--cb-other,
 .trend-segment--cb-other {
   background: #fb923c;
+  fill: #fb923c;
 }
 
 .timeline-bar--tst,
 .trend-segment--tst {
   background: #a855f7;
+  fill: #a855f7;
 }
 
 .timeline-bar--rp,
 .trend-segment--rp {
   background: #6b7280;
+  fill: #6b7280;
 }
 
 .timeline-bar--misc,
 .trend-segment--misc {
   background: #94a3b8;
+  fill: #94a3b8;
 }
 
 .timeline-bar--finance-bc,
 .trend-segment--finance-bc {
   background: #94a3b8;
+  fill: #94a3b8;
 }
 
 .timeline-bar--finance-opex,
 .trend-segment--finance-opex {
   background: #f97316;
+  fill: #f97316;
 }
 
 .timeline-bar--finance-capex,
 .trend-segment--finance-capex {
   background: #14b8a6;
+  fill: #14b8a6;
 }
 
 .timeline-bar--finance-other,
 .trend-segment--finance-other {
   background: #22c55e;
-}
-
-.timeline-stack--service .timeline-bar:first-child,
-.timeline-stack--finance .timeline-bar:first-child {
-  border-radius: 4px 4px 0 0;
-}
-
-.timeline-stack--service .timeline-bar:last-child,
-.timeline-stack--finance .timeline-bar:last-child {
-  border-radius: 0 0 4px 4px;
-}
-
-.timeline-month {
-  font-size: 0.78rem;
+  fill: #22c55e;
 }
 
 .timeline-svg {
-  position: absolute;
-  top: 0;
-  left: 0;
-  pointer-events: none;
+  position: relative;
+  display: block;
+}
+
+.timeline-svg--combined {
+  pointer-events: auto;
+}
+
+.timeline-rect {
+  stroke: none;
+  pointer-events: auto;
+  opacity: 0.94;
+}
+
+.timeline-service-column {
+  pointer-events: auto;
+}
+
+.timeline-month-label {
+  font-size: 0.78rem;
+  fill: var(--text-subtle);
 }
 
 .timeline-line {

@@ -765,7 +765,12 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
     const baseHeight = maxVisits * 28;
     const financeHeight = financePresence && maxSpend > 0 ? 220 : 0;
     const chartHeight = Math.min(360, Math.max(160, Math.max(baseHeight, financeHeight)));
-    const serviceBars: Array<{ x: number; segments: Array<{ className: string; y: number; height: number }> }> = [];
+    const serviceBars: Array<{
+      x: number;
+      center: number;
+      width: number;
+      segments: Array<{ className: string; y: number; height: number }>;
+    }> = [];
     const scale = maxVisits > 0 ? chartHeight / maxVisits : 0;
     data.forEach((point, index) => {
       const segmentsDef = [
@@ -802,8 +807,14 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
         columnSegments.push({ className: seg.className, y, height });
         currentY -= height;
       });
+      const columnLeft = index * (columnWidth + columnGap);
+      const columnCenter = columnLeft + columnWidth / 2;
+      const serviceWidth = Math.max(14, Math.min(columnWidth * 0.6, columnWidth));
+      const serviceLeft = columnCenter - serviceWidth / 2;
       serviceBars.push({
-        x: index * (columnWidth + columnGap),
+        x: serviceLeft,
+        center: columnCenter,
+        width: serviceWidth,
         segments: columnSegments
       });
     });
@@ -1340,104 +1351,131 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                               Latest activity <span aria-hidden="true">→</span>
                             </div>
                           </Show>
-                          <div class="timeline-content" style={{ width: `${geometry.width}px` }}>
-                            <Show when={showService() || showFinance()}>
-                              <div class="timeline-bars" style={{ height: `${geometry.height}px` }}>
-                                <For each={data}>
-                                  {(entry, index) => {
-                                    const pmValue = Math.max(entry.pm ?? 0, 0);
-                                    const cbEmergencyValue = Math.max(entry.cb_emergency ?? 0, 0);
-                                    const cbEnvValue = Math.max(entry.cb_env ?? 0, 0);
-                                    const cbOtherValue = Math.max(entry.cb_other ?? 0, 0);
-                                    const tstValue = Math.max(entry.tst ?? 0, 0);
-                                    const rpValue = Math.max(entry.rp ?? 0, 0);
-                                    const miscValue = Math.max(entry.misc ?? 0, 0);
-                                    const totalValue = Math.max(entry.total ?? pmValue + cbEmergencyValue + cbEnvValue + cbOtherValue + tstValue + rpValue + miscValue, 0);
-                                    const serviceSegments = [
-                                      { value: miscValue, className: 'timeline-bar--misc', label: serviceSegmentLabels.misc },
-                                      { value: rpValue, className: 'timeline-bar--rp', label: serviceSegmentLabels.rp },
-                                      { value: tstValue, className: 'timeline-bar--tst', label: serviceSegmentLabels.tst },
-                                      { value: cbEnvValue, className: 'timeline-bar--cb-env', label: serviceSegmentLabels.cbEnv },
-                                      { value: cbOtherValue, className: 'timeline-bar--cb-other', label: serviceSegmentLabels.cbOther },
-                                      { value: cbEmergencyValue, className: 'timeline-bar--cb-emergency', label: serviceSegmentLabels.cbEmergency },
-                                      { value: pmValue, className: 'timeline-bar--pm', label: serviceSegmentLabels.pm }
-                                    ];
-                                    const bcSpend = Math.max(entry.bc ?? 0, 0);
-                                    const opexSpend = Math.max(entry.opex ?? 0, 0);
-                                    const capexSpend = Math.max(entry.capex ?? 0, 0);
-                                    const otherSpend = Math.max(entry.other ?? 0, 0);
-                                    const spendValue = entry.spend ?? 0;
-                                    const geometryBar = geometry.serviceBars[index()] ?? null;
-                                    const serviceSegmentsGeometry = geometryBar?.segments ?? [];
-                                    const chartHeight = geometry.height;
-                                    const columnTitleParts = [];
-                                    columnTitleParts.push(`${serviceSegmentLabels.pm}: ${pmValue}`);
-                                    columnTitleParts.push(`${serviceSegmentLabels.cbEmergency}: ${cbEmergencyValue}`);
-                                    columnTitleParts.push(`${serviceSegmentLabels.cbEnv}: ${cbEnvValue}`);
-                                    columnTitleParts.push(`${serviceSegmentLabels.cbOther}: ${cbOtherValue}`);
-                                    columnTitleParts.push(`${serviceSegmentLabels.tst}: ${tstValue}`);
-                                    columnTitleParts.push(`${serviceSegmentLabels.rp}: ${rpValue}`);
-                                    columnTitleParts.push(`${serviceSegmentLabels.misc}: ${miscValue}`);
-                                    columnTitleParts.push(`Total tracked: ${totalValue}`);
-                                    columnTitleParts.push(`${financialSegmentLabels.bc}: ${formatCurrency(bcSpend)}`);
-                                    columnTitleParts.push(`${financialSegmentLabels.opex}: ${formatCurrency(opexSpend)}`);
-                                    columnTitleParts.push(`${financialSegmentLabels.capex}: ${formatCurrency(capexSpend)}`);
-                                    columnTitleParts.push(`${financialSegmentLabels.other}: ${formatCurrency(otherSpend)}`);
-                                    columnTitleParts.push(`Spend: ${formatCurrency(spendValue)}`);
-                                    const columnTitle = `${formatMonthLabel(entry.month)} — ${columnTitleParts.join(', ')}`;
-                                    return (
-                                      <div class="timeline-column" style={{ width: `${geometry.columnWidth}px` }} title={columnTitle}>
-                                        <div class="timeline-bars-stack">
-                                         <Show when={showService()}>
-                                            <div class="timeline-stack timeline-stack--service" aria-hidden="true">
-                                              <For each={serviceSegmentsGeometry}>
-                                                {(segment) => {
-                                                  if (segment.height <= 0 || chartHeight <= 0) return null;
-                                                  const top = Math.max(segment.y, 0);
-                                                  const height = Math.max(segment.height, 2);
-                                                  return <div class={`timeline-bar ${segment.className}`} style={{ height: `${height}px`, top: `${top}px` }} />;
-                                                }}
+                          <div
+                            class="timeline-content"
+                            style={{ width: `${geometry.width}px`, height: `${geometry.height + 34}px` }}
+                          >
+                            {(() => {
+                              const chartOffset = 8;
+                              const axisOffset = 26;
+                              const svgHeight = geometry.height + chartOffset + axisOffset;
+                              return (
+                                <svg
+                                  class="timeline-svg timeline-svg--combined"
+                                  width={geometry.width}
+                                  height={svgHeight}
+                                  viewBox={`0 0 ${geometry.width} ${svgHeight}`}
+                                  preserveAspectRatio="none"
+                                  aria-label="Timeline of service visits and spend"
+                                >
+                                  <g transform={`translate(0, ${chartOffset})`}>
+                                    <Show when={showService()}>
+                                      <For each={data}>
+                                        {(entry, index) => {
+                                          const column = geometry.serviceBars[index()] ?? null;
+                                          if (!column) return null;
+                                          const pmValue = Math.max(entry.pm ?? 0, 0);
+                                          const cbEmergencyValue = Math.max(entry.cb_emergency ?? 0, 0);
+                                          const cbEnvValue = Math.max(entry.cb_env ?? 0, 0);
+                                          const cbOtherValue = Math.max(entry.cb_other ?? 0, 0);
+                                          const tstValue = Math.max(entry.tst ?? 0, 0);
+                                          const rpValue = Math.max(entry.rp ?? 0, 0);
+                                          const miscValue = Math.max(entry.misc ?? 0, 0);
+                                          const totalValue = Math.max(entry.total ?? pmValue + cbEmergencyValue + cbEnvValue + cbOtherValue + tstValue + rpValue + miscValue, 0);
+                                          const bcSpend = Math.max(entry.bc ?? 0, 0);
+                                          const opexSpend = Math.max(entry.opex ?? 0, 0);
+                                          const capexSpend = Math.max(entry.capex ?? 0, 0);
+                                          const otherSpend = Math.max(entry.other ?? 0, 0);
+                                          const spendValue = entry.spend ?? 0;
+                                          const columnTitleParts = [
+                                            `${serviceSegmentLabels.pm}: ${pmValue}`,
+                                            `${serviceSegmentLabels.cbEmergency}: ${cbEmergencyValue}`,
+                                            `${serviceSegmentLabels.cbEnv}: ${cbEnvValue}`,
+                                            `${serviceSegmentLabels.cbOther}: ${cbOtherValue}`,
+                                            `${serviceSegmentLabels.tst}: ${tstValue}`,
+                                            `${serviceSegmentLabels.rp}: ${rpValue}`,
+                                            `${serviceSegmentLabels.misc}: ${miscValue}`,
+                                            `Total tracked: ${totalValue}`,
+                                            `${financialSegmentLabels.bc}: ${formatCurrency(bcSpend)}`,
+                                            `${financialSegmentLabels.opex}: ${formatCurrency(opexSpend)}`,
+                                            `${financialSegmentLabels.capex}: ${formatCurrency(capexSpend)}`,
+                                            `${financialSegmentLabels.other}: ${formatCurrency(otherSpend)}`,
+                                            `Spend: ${formatCurrency(spendValue)}`
+                                          ];
+                                          const columnTitle = `${formatMonthLabel(entry.month)} — ${columnTitleParts.join(', ')}`;
+                                          return (
+                                            <g class="timeline-service-column">
+                                              <title>{columnTitle}</title>
+                                              <For each={column.segments}>
+                                                {(segment) => (
+                                                  <rect
+                                                    class={`timeline-rect ${segment.className}`}
+                                                    x={column.x}
+                                                    y={Math.max(segment.y, 0)}
+                                                    width={Math.max(column.width, 2)}
+                                                    height={Math.max(segment.height, 2)}
+                                                  />
+                                                )}
                                               </For>
-                                            </div>
-                                          </Show>
-                                          {/* Financial bars intentionally omitted; spend is shown via overlay lines. */}
-                                        </div>
-                                        <span class="timeline-month">{formatMonthLabel(entry.month)}</span>
-                                      </div>
-                                    );
-                                  }}
-                                </For>
-                              </div>
-                            </Show>
-                            <Show when={showFinance()}>
-                              <svg
-                                class="timeline-svg"
-                                width={geometry.width}
-                                height={geometry.height}
-                                viewBox={`0 0 ${geometry.width} ${geometry.height}`}
-                                preserveAspectRatio="none"
-                                aria-hidden="true"
-                              >
-                                <path class="timeline-line timeline-line--total" d={geometry.path.length > 0 ? geometry.path : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
-                                <Show when={geometry.financeActive.bc}>
-                                  <path class="timeline-line timeline-line--bc" d={geometry.financePaths.bc.length > 0 ? geometry.financePaths.bc : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
-                                </Show>
-                                <Show when={geometry.financeActive.opex}>
-                                  <path class="timeline-line timeline-line--opex" d={geometry.financePaths.opex.length > 0 ? geometry.financePaths.opex : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
-                                </Show>
-                                <Show when={geometry.financeActive.capex}>
-                                  <path class="timeline-line timeline-line--capex" d={geometry.financePaths.capex.length > 0 ? geometry.financePaths.capex : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
-                                </Show>
-                                <Show when={geometry.financeActive.other}>
-                                  <path class="timeline-line timeline-line--other" d={geometry.financePaths.other.length > 0 ? geometry.financePaths.other : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
-                                </Show>
-                                <For each={geometry.points}>
-                                  {(point) => (
-                                    <circle class="timeline-dot" cx={point.x} cy={point.y} r={4} />
-                                  )}
-                                </For>
-                              </svg>
-                            </Show>
+                                            </g>
+                                          );
+                                        }}
+                                      </For>
+                                    </Show>
+                                    <Show when={showFinance()}>
+                                      <>
+                                        <path
+                                          class="timeline-line timeline-line--total"
+                                          d={geometry.path.length > 0 ? geometry.path : `M0,${geometry.height} L${geometry.width},${geometry.height}`}
+                                        />
+                                        <Show when={geometry.financeActive.bc}>
+                                          <path
+                                            class="timeline-line timeline-line--bc"
+                                            d={geometry.financePaths.bc.length > 0 ? geometry.financePaths.bc : `M0,${geometry.height} L${geometry.width},${geometry.height}`}
+                                          />
+                                        </Show>
+                                        <Show when={geometry.financeActive.opex}>
+                                          <path
+                                            class="timeline-line timeline-line--opex"
+                                            d={geometry.financePaths.opex.length > 0 ? geometry.financePaths.opex : `M0,${geometry.height} L${geometry.width},${geometry.height}`}
+                                          />
+                                        </Show>
+                                        <Show when={geometry.financeActive.capex}>
+                                          <path
+                                            class="timeline-line timeline-line--capex"
+                                            d={geometry.financePaths.capex.length > 0 ? geometry.financePaths.capex : `M0,${geometry.height} L${geometry.width},${geometry.height}`}
+                                          />
+                                        </Show>
+                                        <Show when={geometry.financeActive.other}>
+                                          <path
+                                            class="timeline-line timeline-line--other"
+                                            d={geometry.financePaths.other.length > 0 ? geometry.financePaths.other : `M0,${geometry.height} L${geometry.width},${geometry.height}`}
+                                          />
+                                        </Show>
+                                        <For each={geometry.points}>
+                                          {(point) => (
+                                            <circle class="timeline-dot" cx={point.x} cy={point.y} r={4} />
+                                          )}
+                                        </For>
+                                      </>
+                                    </Show>
+                                  </g>
+                                  <For each={data}>
+                                    {(entry, index) => {
+                                      const column = geometry.serviceBars[index()] ?? null;
+                                      const center =
+                                        column?.center ??
+                                        index() * (geometry.columnWidth + geometry.columnGap) + geometry.columnWidth / 2;
+                                      return (
+                                        <text class="timeline-month-label" x={center} y={svgHeight - 6} text-anchor="middle">
+                                          {formatMonthLabel(entry.month)}
+                                        </text>
+                                      );
+                                    }}
+                                  </For>
+                                </svg>
+                              );
+                            })()}
                           </div>
                         </div>
                       </>
