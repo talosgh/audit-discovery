@@ -6370,6 +6370,22 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
     const char *sql_trend =
         "SELECT to_char(sd_work_date, 'YYYY-MM') AS bucket, "
         "       COUNT(*)::bigint AS tickets, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'PM%' THEN 1 ELSE 0 END)::bigint AS pm_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-EF%' "
+        "                     OR upper(btrim(sd_cw_at)) LIKE 'CB-EMG%' THEN 1 ELSE 0 END)::bigint AS cb_emergency_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-ENV%' THEN 1 ELSE 0 END)::bigint AS cb_env_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-%' "
+        "                     AND upper(btrim(sd_cw_at)) NOT LIKE 'CB-EF%' "
+        "                     AND upper(btrim(sd_cw_at)) NOT LIKE 'CB-EMG%' "
+        "                     AND upper(btrim(sd_cw_at)) NOT LIKE 'CB-ENV%' "
+        "                THEN 1 ELSE 0 END)::bigint AS cb_other_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'TST%' THEN 1 ELSE 0 END)::bigint AS tst_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'RP%' THEN 1 ELSE 0 END)::bigint AS rp_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'SV%' "
+        "                     OR upper(btrim(sd_cw_at)) LIKE 'STBY%' "
+        "                     OR upper(btrim(sd_cw_at)) IN ('NDE','') "
+        "                     OR upper(btrim(sd_cw_at)) IS NULL "
+        "                THEN 1 ELSE 0 END)::bigint AS misc_count, "
         "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS hours "
         "FROM esa_in_progress "
         "WHERE sd_work_date IS NOT NULL AND " SERVICE_FILTER " "
@@ -6499,16 +6515,16 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         if (!PQgetisnull(trend_res, 0, 1)) {
             latest_tickets = strtol(PQgetvalue(trend_res, 0, 1), NULL, 10);
         }
-        if (!PQgetisnull(trend_res, 0, 7)) {
-            latest_hours = strtod(PQgetvalue(trend_res, 0, 7), NULL);
+        if (!PQgetisnull(trend_res, 0, 9)) {
+            latest_hours = strtod(PQgetvalue(trend_res, 0, 9), NULL);
         }
     }
     if (trend_rows > 1) {
         if (!PQgetisnull(trend_res, 1, 1)) {
             previous_tickets = strtol(PQgetvalue(trend_res, 1, 1), NULL, 10);
         }
-        if (!PQgetisnull(trend_res, 1, 7)) {
-            previous_hours = strtod(PQgetvalue(trend_res, 1, 7), NULL);
+        if (!PQgetisnull(trend_res, 1, 9)) {
+            previous_hours = strtod(PQgetvalue(trend_res, 1, 9), NULL);
         }
     }
     for (int i = trend_rows - 1; i >= 0; --i) {
@@ -6523,8 +6539,10 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         long pm = PQgetisnull(trend_res, i, 2) ? 0 : strtol(PQgetvalue(trend_res, i, 2), NULL, 10);
         long cb_emergency = PQgetisnull(trend_res, i, 3) ? 0 : strtol(PQgetvalue(trend_res, i, 3), NULL, 10);
         long cb_env = PQgetisnull(trend_res, i, 4) ? 0 : strtol(PQgetvalue(trend_res, i, 4), NULL, 10);
-        long tst = PQgetisnull(trend_res, i, 5) ? 0 : strtol(PQgetvalue(trend_res, i, 5), NULL, 10);
-        long rp = PQgetisnull(trend_res, i, 6) ? 0 : strtol(PQgetvalue(trend_res, i, 6), NULL, 10);
+        long cb_other = PQgetisnull(trend_res, i, 5) ? 0 : strtol(PQgetvalue(trend_res, i, 5), NULL, 10);
+        long tst = PQgetisnull(trend_res, i, 6) ? 0 : strtol(PQgetvalue(trend_res, i, 6), NULL, 10);
+        long rp = PQgetisnull(trend_res, i, 7) ? 0 : strtol(PQgetvalue(trend_res, i, 7), NULL, 10);
+        long misc = PQgetisnull(trend_res, i, 8) ? 0 : strtol(PQgetvalue(trend_res, i, 8), NULL, 10);
         if (!buffer_append_cstr(&buf, "\"pm\":")) goto oom;
         if (!buffer_appendf(&buf, "%ld", pm)) goto oom;
         if (!buffer_append_char(&buf, ',')) goto oom;
@@ -6534,14 +6552,20 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         if (!buffer_append_cstr(&buf, "\"cb_env\":")) goto oom;
         if (!buffer_appendf(&buf, "%ld", cb_env)) goto oom;
         if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"cb_other\":")) goto oom;
+        if (!buffer_appendf(&buf, "%ld", cb_other)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
         if (!buffer_append_cstr(&buf, "\"tst\":")) goto oom;
         if (!buffer_appendf(&buf, "%ld", tst)) goto oom;
         if (!buffer_append_char(&buf, ',')) goto oom;
         if (!buffer_append_cstr(&buf, "\"rp\":")) goto oom;
         if (!buffer_appendf(&buf, "%ld", rp)) goto oom;
         if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"misc\":")) goto oom;
+        if (!buffer_appendf(&buf, "%ld", misc)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
         if (!buffer_append_cstr(&buf, "\"hours\":")) goto oom;
-        double hours = PQgetisnull(trend_res, i, 7) ? 0.0 : strtod(PQgetvalue(trend_res, i, 7), NULL);
+        double hours = PQgetisnull(trend_res, i, 9) ? 0.0 : strtod(PQgetvalue(trend_res, i, 9), NULL);
         if (!buffer_appendf(&buf, "%.2f", hours)) goto oom;
         if (!buffer_append_char(&buf, '}')) goto oom;
         if (i > 0 && !buffer_append_char(&buf, ',')) goto oom;
