@@ -104,16 +104,24 @@ static void normalize_activity_code(const char *code, char *buffer, size_t buffe
     while (start < len && isspace((unsigned char)code[start])) {
         ++start;
     }
-    size_t end = len;
-    while (end > start && isspace((unsigned char)code[end - 1])) {
-        --end;
-    }
-    for (size_t i = start; i < end && dst + 1 < buffer_len; ++i) {
+    for (size_t i = start; i < len && dst + 1 < buffer_len; ++i) {
         unsigned char ch = (unsigned char)code[i];
+        if (ch == 0) {
+            break;
+        }
         if (isspace(ch)) {
             continue;
         }
-        buffer[dst++] = (char)toupper(ch);
+        if (isalnum(ch)) {
+            buffer[dst++] = (char)toupper(ch);
+            continue;
+        }
+        if (ch == '-' || ch == '_') {
+            buffer[dst++] = '-';
+            continue;
+        }
+        /* Stop at punctuation or non-ASCII markers */
+        break;
     }
     buffer[dst] = '\0';
 }

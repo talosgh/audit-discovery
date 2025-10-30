@@ -2961,7 +2961,12 @@ static int append_financial_summary_section(Buffer *buf, PGconn *conn, const Rep
         "WHERE location_id = COALESCE($1::int, $2::int)";
     const char *sql_trend =
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
-        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend, "
+        "       COALESCE(SUM(CASE WHEN upper(COALESCE(main_catagory,'')) LIKE 'BC%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_bc, "
+        "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'OPEX' "
+        "                             AND upper(COALESCE(main_catagory,'')) NOT LIKE 'BC%' "
+        "                        THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_opex, "
+        "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'CAPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_capex "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
         "GROUP BY bucket "
@@ -7030,7 +7035,9 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         double spend_opex = PQgetisnull(trend_res, i, 3) ? 0.0 : strtod(PQgetvalue(trend_res, i, 3), NULL);
         double spend_capex = PQgetisnull(trend_res, i, 4) ? 0.0 : strtod(PQgetvalue(trend_res, i, 4), NULL);
         double spend_other = spend - spend_bc - spend_opex - spend_capex;
-        if (fabs(spend_other) < 0.005) {
+        if (fabs(spend_other) < 0.01) {
+            spend_other = 0.0;
+        } else if (spend_other < 0.0) {
             spend_other = 0.0;
         }
         if (!buffer_appendf(&buf, "%.2f", spend)) goto fin_oom;
@@ -7444,7 +7451,9 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend_total, "
         "       COALESCE(SUM(CASE WHEN upper(COALESCE(main_catagory,'')) LIKE 'BC%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_bc, "
-        "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'OPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_opex, "
+        "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'OPEX' "
+        "                             AND upper(COALESCE(main_catagory,'')) NOT LIKE 'BC%' "
+        "                        THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_opex, "
         "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'CAPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_capex "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) "
@@ -7521,7 +7530,9 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
             double spend_opex = PQgetisnull(finance_res, i, 3) ? 0.0 : strtod(PQgetvalue(finance_res, i, 3), NULL);
             double spend_capex = PQgetisnull(finance_res, i, 4) ? 0.0 : strtod(PQgetvalue(finance_res, i, 4), NULL);
             double spend_other = spend_total - spend_bc - spend_opex - spend_capex;
-            if (fabs(spend_other) < 0.005) {
+            if (fabs(spend_other) < 0.01) {
+                spend_other = 0.0;
+            } else if (spend_other < 0.0) {
                 spend_other = 0.0;
             }
             entry->spend_amount = spend_total;

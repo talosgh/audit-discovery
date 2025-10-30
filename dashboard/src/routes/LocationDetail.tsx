@@ -1883,11 +1883,11 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                   <div class="insight-card full-width" title="Most recent activity codes driving service volume.">
                     <h3>Top activity codes</h3>
                     <Show when={serviceActivityBreakdown().length > 0} fallback={<p class="muted">No activity codes captured.</p>}>
-                      <ul class="analytics-list activity-code-list">
+                     <ul class="analytics-list activity-code-list">
                         <For each={serviceActivityBreakdown().slice(0, 6)}>
                           {(item) => (
-                            <li title={`${item.code ?? 'N/A'} · ${item.tickets} tickets · ${item.hours.toFixed(1)} hours`}>
-                              <span class="list-primary">{item.code ?? 'N/A'} — {item.label ?? 'Unclassified'}</span>
+                            <li title={`Code: ${item.code ?? 'N/A'} · ${item.tickets} tickets · ${item.hours.toFixed(1)} hours`}>
+                              <span class="list-primary">{item.label ?? 'Unclassified'}</span>
                               <span class="list-secondary">{item.tickets} tickets · {item.hours.toFixed(1)} hours</span>
                             </li>
                           )}
