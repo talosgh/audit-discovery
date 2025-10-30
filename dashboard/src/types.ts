@@ -424,7 +424,11 @@ export interface LocationAnalytics {
   deficiencies: DeficiencyAnalytics;
   service: ServiceAnalyticsSection;
   financial: FinancialAnalyticsSection;
-  timeline: TimelinePoint[];
+  timeline?: {
+    data: TimelinePoint[];
+    has_service: boolean;
+    has_financial: boolean;
+  };
 }
 
 export interface MetricsSummary {

@@ -583,7 +583,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const savingsDeltaGap = createMemo(() => Math.abs((proposedTotal() - approvedTotal()) - negotiatedSavings()));
   const serviceCorrelation = createMemo(() => financialAnalyticsSection()?.service_correlation ?? null);
 
-  const timelineData = createMemo(() => analytics()?.timeline ?? []);
+  const timeline = createMemo(() => analytics()?.timeline);
+  const timelineData = createMemo(() => timeline()?.data ?? []);
+  const timelineHasService = createMemo(() => Boolean(timeline()?.has_service));
+  const timelineHasFinancial = createMemo(() => Boolean(timeline()?.has_financial));
   const timelineMaxVisits = createMemo(() => {
     const data = timelineData();
     if (!data.length) return 1;
@@ -880,78 +883,83 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
               </div>
             </section>
 
-            <section class="timeline-card" aria-labelledby="timeline-title">
-              <header class="timeline-header">
-                <h2 id="timeline-title">Service &amp; Spend Timeline</h2>
-                <p>Monthly preventative maintenance (PM) and callback activity compared with invoiced spend.</p>
-              </header>
-              <Show when={timelineData().length > 0} fallback={<p class="muted">No combined service or financial history recorded yet.</p>}>
-                {(() => {
-                  const data = timelineData();
-                  const maxVisits = timelineMaxVisits();
-                  const geometry = timelineGeometry();
-                  const maxSpend = timelineMaxSpend();
-                  return (
-                    <>
-                      <div class="timeline-legend">
-                        <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> PM visits</span>
-                        <span class="legend-item"><span class="legend-swatch legend-swatch--cb" /> Callback visits</span>
-                        <span class="legend-item"><span class="legend-line" /> Spend</span>
-                      </div>
-                      <div class="timeline-chart" role="img" aria-label="Timeline of service visits and spend">
-                        <div class="timeline-content" style={{ width: `${geometry.width}px` }}>
-                          <div class="timeline-bars" style={{ height: `${geometry.height}px` }}>
-                            <For each={data}>
-                              {(entry) => {
-                                const pmValue = Math.max(entry.pm_visits ?? 0, 0);
-                                const cbValue = Math.max(entry.callback_visits ?? 0, 0);
-                                const pmHeight = maxVisits > 0 ? Math.max(0, Math.round((pmValue / maxVisits) * 100)) : 0;
-                                const cbHeight = maxVisits > 0 ? Math.max(0, Math.round((cbValue / maxVisits) * 100)) : 0;
-                                const columnTitle = `${formatMonthLabel(entry.month)} — PM: ${pmValue}, Callbacks: ${cbValue}, Spend: ${formatCurrency(entry.spend ?? 0)}`;
-                                return (
-                                  <div class="timeline-column" style={{ width: `${geometry.columnWidth}px` }} title={columnTitle}>
-                                    <div class="timeline-bars-stack">
-                                      <div
-                                        class="timeline-bar timeline-bar--pm"
-                                        style={{ height: `${pmHeight}%` }}
-                                        aria-hidden="true"
-                                      />
-                                      <div
-                                        class="timeline-bar timeline-bar--cb"
-                                        style={{ height: `${cbHeight}%` }}
-                                        aria-hidden="true"
-                                      />
-                                    </div>
-                                    <span class="timeline-month">{formatMonthLabel(entry.month)}</span>
-                                  </div>
-                                );
-                              }}
-                            </For>
-                          </div>
-                          <Show when={geometry.path.length > 0 && maxSpend > 0}>
-                            <svg
-                              class="timeline-svg"
-                              width={geometry.width}
-                              height={geometry.height}
-                              viewBox={`0 0 ${geometry.width} ${geometry.height}`}
-                              preserveAspectRatio="none"
-                              aria-hidden="true"
-                            >
-                              <path class="timeline-line" d={geometry.path} />
-                              <For each={geometry.points}>
-                                {(point) => (
-                                  <circle class="timeline-dot" cx={point.x} cy={point.y} r={4} />
-                                )}
-                              </For>
-                            </svg>
+            <Show when={timelineHasService() || timelineHasFinancial()}>
+              <section class="timeline-card" aria-labelledby="timeline-title">
+                <header class="timeline-header">
+                  <h2 id="timeline-title">Service &amp; Spend Timeline</h2>
+                  <p>Monthly preventative maintenance (PM) and callback activity compared with invoiced spend.</p>
+                </header>
+                <Show when={timelineData().length > 0} fallback={<p class="muted">No combined service or financial history recorded yet.</p>}>
+                  {(() => {
+                    const data = timelineData();
+                    const maxVisits = timelineMaxVisits();
+                    const geometry = timelineGeometry();
+                    const maxSpend = timelineMaxSpend();
+                    return (
+                      <>
+                        <div class="timeline-legend">
+                          <Show when={timelineHasService()}>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> PM visits</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb" /> Callback visits</span>
+                          </Show>
+                          <Show when={timelineHasFinancial()}>
+                            <span class="legend-item"><span class="legend-line" /> Spend</span>
                           </Show>
                         </div>
-                      </div>
-                    </>
-                  );
-                })()}
-              </Show>
-            </section>
+                        <div class="timeline-chart" role="img" aria-label="Timeline of service visits and spend">
+                          <div class="timeline-content" style={{ width: `${geometry.width}px` }}>
+                            <Show when={timelineHasService()}>
+                              <div class="timeline-bars" style={{ height: `${geometry.height}px` }}>
+                                <For each={data}>
+                                  {(entry) => {
+                                    const pmValue = Math.max(entry.pm_visits ?? 0, 0);
+                                    const cbValue = Math.max(entry.callback_visits ?? 0, 0);
+                                    const pmHeight = maxVisits > 0 ? Math.max(0, Math.round((pmValue / maxVisits) * 100)) : 0;
+                                    const cbHeight = maxVisits > 0 ? Math.max(0, Math.round((cbValue / maxVisits) * 100)) : 0;
+                                    const spendValue = entry.spend ?? 0;
+                                    const columnTitleParts = [];
+                                    columnTitleParts.push(`PM: ${pmValue}`);
+                                    columnTitleParts.push(`Callbacks: ${cbValue}`);
+                                    columnTitleParts.push(`Spend: ${formatCurrency(spendValue)}`);
+                                    const columnTitle = `${formatMonthLabel(entry.month)} — ${columnTitleParts.join(', ')}`;
+                                    return (
+                                      <div class="timeline-column" style={{ width: `${geometry.columnWidth}px` }} title={columnTitle}>
+                                        <div class="timeline-bars-stack">
+                                          <div class="timeline-bar timeline-bar--pm" style={{ height: `${pmHeight}%` }} aria-hidden="true" />
+                                          <div class="timeline-bar timeline-bar--cb" style={{ height: `${cbHeight}%` }} aria-hidden="true" />
+                                        </div>
+                                        <span class="timeline-month">{formatMonthLabel(entry.month)}</span>
+                                      </div>
+                                    );
+                                  }}
+                                </For>
+                              </div>
+                            </Show>
+                            <Show when={timelineHasFinancial()}>
+                              <svg
+                                class="timeline-svg"
+                                width={geometry.width}
+                                height={geometry.height}
+                                viewBox={`0 0 ${geometry.width} ${geometry.height}`}
+                                preserveAspectRatio="none"
+                                aria-hidden="true"
+                              >
+                                <path class="timeline-line" d={geometry.path.length > 0 ? geometry.path : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
+                                <For each={geometry.points}>
+                                  {(point) => (
+                                    <circle class="timeline-dot" cx={point.x} cy={point.y} r={4} />
+                                  )}
+                                </For>
+                              </svg>
+                            </Show>
+                          </div>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </Show>
+              </section>
+            </Show>
 
             <section class="summary-grid" aria-label="Location summary cards">
               <article

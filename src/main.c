@@ -528,8 +528,8 @@ static char *build_report_version_list(PGconn *conn, const char *address, bool d
 static const char *determine_trend_direction(double latest, double previous, double tolerance_percent, double *percent_change_out);
 static double forecast_next_value(double latest, double previous);
 static bool string_is_integer(const char *text);
-static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, TimelineStats *stats, char **error_out);
-static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats);
+static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out);
+static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats, bool timeline_has_service, bool timeline_has_financial);
 static TimelineEntry *timeline_find_entry(TimelineEntry *entries, size_t count, const char *month);
 static int timeline_ensure_entry(TimelineEntry **entries, size_t *count, size_t *capacity, const char *month, TimelineEntry **out_entry);
 static void timeline_free_entries(TimelineEntry *entries, size_t count);
@@ -645,8 +645,10 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     TimelineStats timeline_stats;
     memset(&timeline_stats, 0, sizeof(timeline_stats));
     char *timeline_json = NULL;
-    if (service_json && financial_json) {
-        timeline_json = build_service_financial_timeline_json(conn, &profile, lookup_address, &timeline_stats, error_out);
+    bool timeline_service = false;
+    bool timeline_financial = false;
+    if (service_json || financial_json) {
+        timeline_json = build_service_financial_timeline_json(conn, &profile, lookup_address, &timeline_stats, &timeline_service, &timeline_financial, error_out);
         if (!timeline_json && error_out && *error_out) {
             free(summary_json);
             free(profile_json);
@@ -681,9 +683,9 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
         }
     }
     char *analytics_json = NULL;
-    if (service_json && financial_json) {
+    if (service_json || financial_json) {
         const char *timeline_payload = timeline_json && timeline_json[0] ? timeline_json : "[]";
-        analytics_json = build_location_analytics_json(&report, &profile, open_deficiency_count, &service_stats, &financial_stats, timeline_payload, &timeline_stats);
+        analytics_json = build_location_analytics_json(&report, &profile, open_deficiency_count, &service_stats, &financial_stats, timeline_payload, &timeline_stats, timeline_service, timeline_financial);
     }
     report_data_clear(&report);
 
@@ -7015,8 +7017,10 @@ static int compare_timeline_entries(const void *a, const void *b) {
     return strcmp(ma, mb);
 }
 
-static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, TimelineStats *stats, char **error_out) {
+static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out) {
     (void)lookup_address;
+    if (service_available) *service_available = false;
+    if (financial_available) *financial_available = false;
     if (stats) {
         stats->correlation_valid = false;
         stats->correlation = 0.0;
@@ -7050,17 +7054,6 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
         "ORDER BY bucket";
 
     PGresult *service_res = PQexecParams(conn, service_sql, 4, service_types, service_params, NULL, NULL, 0);
-    if (!service_res || PQresultStatus(service_res) != PGRES_TUPLES_OK) {
-        if (error_out && !*error_out) {
-            const char *msg = service_res ? PQresultErrorMessage(service_res) : PQerrorMessage(conn);
-            *error_out = strdup(msg ? msg : "Failed to load service timeline");
-        }
-        if (service_res) PQclear(service_res);
-        free(street_trim);
-        free(city_trim);
-        free(state_trim);
-        return NULL;
-    }
 
     char location_id_buf[32];
     char row_id_buf[32];
@@ -7084,51 +7077,44 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
         "ORDER BY bucket";
     if (finance_params[0] || finance_params[1]) {
         finance_res = PQexecParams(conn, finance_sql, 2, NULL, finance_params, NULL, NULL, 0);
-        if (!finance_res || PQresultStatus(finance_res) != PGRES_TUPLES_OK) {
-            if (error_out && !*error_out) {
-                const char *msg = finance_res ? PQresultErrorMessage(finance_res) : PQerrorMessage(conn);
-                *error_out = strdup(msg ? msg : "Failed to load financial timeline");
-            }
-            if (finance_res) PQclear(finance_res);
-            PQclear(service_res);
-            free(street_trim);
-            free(city_trim);
-            free(state_trim);
-            return NULL;
-        }
     }
 
     TimelineEntry *entries = NULL;
     size_t entry_count = 0;
     size_t entry_capacity = 0;
 
-    int service_rows = PQntuples(service_res);
-    for (int i = 0; i < service_rows; ++i) {
-        if (PQgetisnull(service_res, i, 0)) {
-            continue;
-        }
-        const char *month = PQgetvalue(service_res, i, 0);
-        long pm_visits = PQgetisnull(service_res, i, 1) ? 0 : strtol(PQgetvalue(service_res, i, 1), NULL, 10);
-        long cb_visits = PQgetisnull(service_res, i, 2) ? 0 : strtol(PQgetvalue(service_res, i, 2), NULL, 10);
-        TimelineEntry *entry = NULL;
-        if (!timeline_ensure_entry(&entries, &entry_count, &entry_capacity, month, &entry)) {
-            if (error_out && !*error_out) {
-                *error_out = strdup("Out of memory building timeline");
+    if (service_res && PQresultStatus(service_res) == PGRES_TUPLES_OK) {
+        int service_rows = PQntuples(service_res);
+        if (service_rows > 0 && service_available) *service_available = true;
+        for (int i = 0; i < service_rows; ++i) {
+            if (PQgetisnull(service_res, i, 0)) {
+                continue;
             }
-            timeline_free_entries(entries, entry_count);
-            PQclear(service_res);
-            if (finance_res) PQclear(finance_res);
-            free(street_trim);
-            free(city_trim);
-            free(state_trim);
-            return NULL;
+            const char *month = PQgetvalue(service_res, i, 0);
+            long pm_visits = PQgetisnull(service_res, i, 1) ? 0 : strtol(PQgetvalue(service_res, i, 1), NULL, 10);
+            long cb_visits = PQgetisnull(service_res, i, 2) ? 0 : strtol(PQgetvalue(service_res, i, 2), NULL, 10);
+            TimelineEntry *entry = NULL;
+            if (!timeline_ensure_entry(&entries, &entry_count, &entry_capacity, month, &entry)) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory building timeline");
+                }
+                timeline_free_entries(entries, entry_count);
+                PQclear(service_res);
+                if (finance_res) PQclear(finance_res);
+                free(street_trim);
+                free(city_trim);
+                free(state_trim);
+                return NULL;
+            }
+            entry->pm_count = pm_visits;
+            entry->callback_count = cb_visits;
         }
-        entry->pm_count = pm_visits;
-        entry->callback_count = cb_visits;
     }
+    if (service_res) PQclear(service_res);
 
-    if (finance_res) {
+    if (finance_res && PQresultStatus(finance_res) == PGRES_TUPLES_OK) {
         int finance_rows = PQntuples(finance_res);
+        if (finance_rows > 0 && financial_available) *financial_available = true;
         for (int i = 0; i < finance_rows; ++i) {
             if (PQgetisnull(finance_res, i, 0)) {
                 continue;
@@ -7140,7 +7126,6 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
                     *error_out = strdup("Out of memory building timeline");
                 }
                 timeline_free_entries(entries, entry_count);
-                PQclear(service_res);
                 PQclear(finance_res);
                 free(street_trim);
                 free(city_trim);
@@ -7150,8 +7135,6 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
             entry->spend_amount = PQgetisnull(finance_res, i, 1) ? 0.0 : strtod(PQgetvalue(finance_res, i, 1), NULL);
         }
     }
-
-    PQclear(service_res);
     if (finance_res) {
         PQclear(finance_res);
     }
@@ -7160,45 +7143,49 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
     free(state_trim);
 
     if (entry_count == 0) {
+        if (service_available) *service_available = false;
+        if (financial_available) *financial_available = false;
         timeline_free_entries(entries, entry_count);
-        char *empty = strdup("[]");
-        if (!empty && error_out && !*error_out) {
-            *error_out = strdup("Out of memory building timeline");
-        }
-        return empty;
+        return strdup("[]");
     }
 
     qsort(entries, entry_count, sizeof(TimelineEntry), compare_timeline_entries);
 
-    double sum_x = 0.0;
-    double sum_y = 0.0;
-    double sum_x2 = 0.0;
-    double sum_y2 = 0.0;
-    double sum_xy = 0.0;
-    int samples = 0;
-    for (size_t i = 0; i < entry_count; ++i) {
-        double x = (double)entries[i].callback_count;
-        double y = entries[i].spend_amount;
-        if (x == 0.0 && y == 0.0) {
-            continue;
-        }
-        sum_x += x;
-        sum_y += y;
-        sum_x2 += x * x;
-        sum_y2 += y * y;
-        sum_xy += x * y;
-        samples += 1;
-    }
     if (stats) {
-        stats->sample_count = samples;
-        if (samples >= 2) {
-            double numerator = (double)samples * sum_xy - sum_x * sum_y;
-            double denom_part_x = (double)samples * sum_x2 - sum_x * sum_x;
-            double denom_part_y = (double)samples * sum_y2 - sum_y * sum_y;
-            double denom = sqrt(fabs(denom_part_x * denom_part_y));
-            if (denom > 0.0) {
-                stats->correlation = numerator / denom;
-                stats->correlation_valid = true;
+        if (!financial_available || !service_available) {
+            stats->sample_count = 0;
+            stats->correlation = 0.0;
+            stats->correlation_valid = false;
+        } else {
+            double sum_x = 0.0;
+            double sum_y = 0.0;
+            double sum_x2 = 0.0;
+            double sum_y2 = 0.0;
+            double sum_xy = 0.0;
+            int samples = 0;
+            for (size_t i = 0; i < entry_count; ++i) {
+                double x = (double)entries[i].callback_count;
+                double y = entries[i].spend_amount;
+                if (x == 0.0 && y == 0.0) {
+                    continue;
+                }
+                sum_x += x;
+                sum_y += y;
+                sum_x2 += x * x;
+                sum_y2 += y * y;
+                sum_xy += x * y;
+                samples += 1;
+            }
+            stats->sample_count = samples;
+            if (samples >= 2) {
+                double numerator = (double)samples * sum_xy - sum_x * sum_y;
+                double denom_part_x = (double)samples * sum_x2 - sum_x * sum_x;
+                double denom_part_y = (double)samples * sum_y2 - sum_y * sum_y;
+                double denom = sqrt(fabs(denom_part_x * denom_part_y));
+                if (denom > 0.0) {
+                    stats->correlation = numerator / denom;
+                    stats->correlation_valid = true;
+                }
             }
         }
     }
@@ -7251,7 +7238,7 @@ static double safe_divide(double numerator, double denominator) {
     return numerator / denominator;
 }
 
-static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats) {
+static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats, bool timeline_has_service, bool timeline_has_financial) {
     if (!report) {
         return NULL;
     }
@@ -7271,6 +7258,8 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
     bool deficiencies_available = report->summary.audit_count > 0;
     bool service_available = service_stats && service_stats->has_records;
     bool financial_available = financial_stats && financial_stats->has_records;
+    bool service_available_timeline = service_available || timeline_has_service;
+    bool financial_available_timeline = financial_available || timeline_has_financial;
 
     int total_deficiencies = report->summary.total_deficiencies;
     double avg_per_device = (device_count > 0) ? report->summary.average_deficiencies_per_device : NAN;
@@ -7366,10 +7355,10 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
     if (!buffer_append_json_string(&buf, coverage_status(deficiencies_available))) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
     if (!buffer_append_cstr(&buf, "\"service\":")) goto oom;
-    if (!buffer_append_json_string(&buf, coverage_status(service_available))) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(service_available_timeline))) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
     if (!buffer_append_cstr(&buf, "\"financial\":")) goto oom;
-    if (!buffer_append_json_string(&buf, coverage_status(financial_available))) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(financial_available_timeline))) goto oom;
     if (!buffer_append_char(&buf, '}')) goto oom;
     if (!buffer_append_char(&buf, '}')) goto oom;
 
@@ -7418,7 +7407,7 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
 
     if (!buffer_append_cstr(&buf, ",\"service\":{")) goto oom;
     if (!buffer_append_cstr(&buf, "\"status\":")) goto oom;
-    if (!buffer_append_json_string(&buf, coverage_status(service_available))) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(service_available_timeline))) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
     if (!buffer_append_cstr(&buf, "\"metrics\":{")) goto oom;
     if (!buffer_append_cstr(&buf, "\"tickets\":")) goto oom;
@@ -7499,7 +7488,7 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
 
     if (!buffer_append_cstr(&buf, ",\"financial\":{")) goto oom;
     if (!buffer_append_cstr(&buf, "\"status\":")) goto oom;
-    if (!buffer_append_json_string(&buf, coverage_status(financial_available))) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(financial_available_timeline))) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
     if (!buffer_append_cstr(&buf, "\"metrics\":{")) goto oom;
     if (!buffer_append_cstr(&buf, "\"total_spend\":")) goto oom;
@@ -7613,11 +7602,21 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
 
     if (!buffer_append_char(&buf, '}')) goto oom;
 
-    if (!buffer_append_cstr(&buf, ",\"timeline\":")) goto oom;
-    if (timeline_json && timeline_json[0]) {
-        if (!buffer_append_cstr(&buf, timeline_json)) goto oom;
-    } else {
-        if (!buffer_append_cstr(&buf, "[]")) goto oom;
+    if (timeline_has_service || timeline_has_financial) {
+        if (!buffer_append_cstr(&buf, ",\"timeline\":{")) goto oom;
+        if (!buffer_append_cstr(&buf, "\"data\":")) goto oom;
+        if (timeline_json && timeline_json[0]) {
+            if (!buffer_append_cstr(&buf, timeline_json)) goto oom;
+        } else {
+            if (!buffer_append_cstr(&buf, "[]")) goto oom;
+        }
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"has_service\":")) goto oom;
+        if (!buffer_append_cstr(&buf, timeline_has_service ? "true" : "false")) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"has_financial\":")) goto oom;
+        if (!buffer_append_cstr(&buf, timeline_has_financial ? "true" : "false")) goto oom;
+        if (!buffer_append_char(&buf, '}')) goto oom;
     }
 
     return buf.data;
