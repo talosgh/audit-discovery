@@ -1413,6 +1413,12 @@ tbody tr:hover {
   z-index: 2;
 }
 
+.timeline-stack--service .timeline-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
+
 .timeline-bar--pm,
 .trend-segment--pm {
   background: #0ea5e9;

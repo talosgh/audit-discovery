@@ -765,6 +765,48 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
     const baseHeight = maxVisits * 28;
     const financeHeight = financePresence && maxSpend > 0 ? 220 : 0;
     const chartHeight = Math.min(360, Math.max(160, Math.max(baseHeight, financeHeight)));
+    const serviceBars: Array<{ x: number; segments: Array<{ className: string; y: number; height: number }> }> = [];
+    const scale = maxVisits > 0 ? chartHeight / maxVisits : 0;
+    data.forEach((point, index) => {
+      const segmentsDef = [
+        { value: Math.max(point.misc ?? 0, 0), className: 'timeline-bar--misc' },
+        { value: Math.max(point.rp ?? 0, 0), className: 'timeline-bar--rp' },
+        { value: Math.max(point.tst ?? 0, 0), className: 'timeline-bar--tst' },
+        { value: Math.max(point.cb_env ?? 0, 0), className: 'timeline-bar--cb-env' },
+        { value: Math.max(point.cb_other ?? 0, 0), className: 'timeline-bar--cb-other' },
+        { value: Math.max(point.cb_emergency ?? 0, 0), className: 'timeline-bar--cb-emergency' },
+        { value: Math.max(point.pm ?? 0, 0), className: 'timeline-bar--pm' }
+      ];
+      let rawTotal = 0;
+      const rawSegments = segmentsDef.map((seg) => {
+        const height = seg.value > 0 && scale > 0 ? seg.value * scale : 0;
+        rawTotal += height;
+        return { className: seg.className, value: seg.value, height };
+      });
+      const factor = rawTotal > chartHeight && rawTotal > 0 ? chartHeight / rawTotal : 1;
+      let currentY = chartHeight;
+      const columnSegments: Array<{ className: string; y: number; height: number }> = [];
+      rawSegments.forEach((seg) => {
+        if (seg.value <= 0 || seg.height <= 0 || scale <= 0) {
+          return;
+        }
+        let height = seg.height * factor;
+        const minHeight = Math.min(Math.max(chartHeight * 0.02, 2), chartHeight);
+        if (height < minHeight) {
+          height = minHeight;
+        }
+        if (height > currentY) {
+          height = currentY;
+        }
+        const y = currentY - height;
+        columnSegments.push({ className: seg.className, y, height });
+        currentY -= height;
+      });
+      serviceBars.push({
+        x: index * (columnWidth + columnGap),
+        segments: columnSegments
+      });
+    });
     const segments: string[] = [];
     const financeSegments = {
       total: [] as string[],
@@ -814,6 +856,7 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
       height: chartHeight,
       columnWidth,
       columnGap,
+      serviceBars,
       path: segments.join(' '),
       financePaths: {
         total: financeSegments.total.join(' '),
@@ -1253,7 +1296,6 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                 <Show when={timelineData().length > 0} fallback={<p class="muted">No combined service or financial history recorded yet.</p>}>
                   {(() => {
                     const data = timelineData();
-                    const maxVisits = timelineMaxVisits();
                     const geometry = timelineGeometry();
                     const maxSpend = timelineMaxSpend();
                     return (
@@ -1302,7 +1344,7 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                             <Show when={showService() || showFinance()}>
                               <div class="timeline-bars" style={{ height: `${geometry.height}px` }}>
                                 <For each={data}>
-                                  {(entry) => {
+                                  {(entry, index) => {
                                     const pmValue = Math.max(entry.pm ?? 0, 0);
                                     const cbEmergencyValue = Math.max(entry.cb_emergency ?? 0, 0);
                                     const cbEnvValue = Math.max(entry.cb_env ?? 0, 0);
@@ -1324,13 +1366,10 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                                     const opexSpend = Math.max(entry.opex ?? 0, 0);
                                     const capexSpend = Math.max(entry.capex ?? 0, 0);
                                     const otherSpend = Math.max(entry.other ?? 0, 0);
-                                    const financeSegments = [
-                                      { value: bcSpend, className: 'timeline-bar--finance-bc', label: financialSegmentLabels.bc },
-                                      { value: opexSpend, className: 'timeline-bar--finance-opex', label: financialSegmentLabels.opex },
-                                      { value: capexSpend, className: 'timeline-bar--finance-capex', label: financialSegmentLabels.capex },
-                                      { value: otherSpend, className: 'timeline-bar--finance-other', label: financialSegmentLabels.other }
-                                    ];
                                     const spendValue = entry.spend ?? 0;
+                                    const geometryBar = geometry.serviceBars[index()] ?? null;
+                                    const serviceSegmentsGeometry = geometryBar?.segments ?? [];
+                                    const chartHeight = geometry.height;
                                     const columnTitleParts = [];
                                     columnTitleParts.push(`${serviceSegmentLabels.pm}: ${pmValue}`);
                                     columnTitleParts.push(`${serviceSegmentLabels.cbEmergency}: ${cbEmergencyValue}`);
@@ -1349,14 +1388,14 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                                     return (
                                       <div class="timeline-column" style={{ width: `${geometry.columnWidth}px` }} title={columnTitle}>
                                         <div class="timeline-bars-stack">
-                                          <Show when={showService()}>
+                                         <Show when={showService()}>
                                             <div class="timeline-stack timeline-stack--service" aria-hidden="true">
-                                              <For each={serviceSegments}>
+                                              <For each={serviceSegmentsGeometry}>
                                                 {(segment) => {
-                                                  if (segment.value <= 0) return null;
-                                                  const rawHeight = maxVisits > 0 ? (segment.value / maxVisits) * 100 : 0;
-                                                  const segmentHeight = rawHeight > 0 ? Math.max(4, Math.min(100, rawHeight)) : 0;
-                                                  return <div class={`timeline-bar ${segment.className}`} style={{ height: `${segmentHeight}%` }} />;
+                                                  if (segment.height <= 0 || chartHeight <= 0) return null;
+                                                  const top = Math.max(segment.y, 0);
+                                                  const height = Math.max(segment.height, 2);
+                                                  return <div class={`timeline-bar ${segment.className}`} style={{ height: `${height}px`, top: `${top}px` }} />;
                                                 }}
                                               </For>
                                             </div>
