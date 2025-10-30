@@ -19,7 +19,8 @@ SRC := src/main.c \
        src/text_utils.c \
        src/narrative.c \
        src/address_validation.c \
-       src/routes.c
+       src/routes.c \
+       src/service_activity.c
 OBJ := $(SRC:.c=.o)
 TARGET := audit_webhook
 

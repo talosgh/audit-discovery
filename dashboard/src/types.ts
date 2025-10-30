@@ -136,6 +136,9 @@ export interface LocationSummary {
   vendor_name: string | null;
   device_count: number;
   open_deficiencies: number;
+  has_audits?: boolean;
+  has_service_records?: boolean;
+  has_financial_records?: boolean;
 }
 
 export interface LocationListParams {
@@ -220,6 +223,23 @@ export interface ServiceTrendPoint {
   hours?: number;
 }
 
+export interface ServiceActivityBreakdown {
+  code: string | null;
+  label: string | null;
+  category: string | null;
+  tickets: number;
+  hours: number;
+  description?: string | null;
+}
+
+export interface ServiceActivitySummaryItem {
+  category: string | null;
+  tickets: number;
+  hours: number;
+  share: number;
+  short_label: string | null;
+}
+
 export interface ServiceVendorMix {
   vendor: string | null;
   tickets: number;
@@ -232,11 +252,18 @@ export interface ServiceSummary {
   top_problems: ServiceProblem[];
   monthly_trend: ServiceTrendPoint[];
   vendor_mix: ServiceVendorMix[];
+  activity_breakdown: ServiceActivityBreakdown[];
+  activity_summary: ServiceActivitySummaryItem[];
 }
 
 export interface FinancialTrendPoint {
   month: string | null;
   spend: number;
+}
+
+export interface FinancialSavingsPoint {
+  month: string | null;
+  savings: number;
 }
 
 export interface FinancialBreakdownItem {
@@ -254,6 +281,10 @@ export interface FinancialSummary {
   monthly_trend: FinancialTrendPoint[];
   category_breakdown: FinancialBreakdownItem[];
   status_breakdown: FinancialBreakdownItem[];
+  total_savings: number;
+  savings_rate: number;
+  monthly_savings: FinancialSavingsPoint[];
+  cumulative_savings: FinancialSavingsPoint[];
 }
 
 export interface VisitSummary {
@@ -312,6 +343,71 @@ export interface LocationDetail {
   visits: VisitSummary[];
   reports: ReportVersion[];
   deficiency_reports: ReportVersion[];
+  analytics: LocationAnalytics;
+}
+
+export type CoverageStatus = 'available' | 'partial' | 'missing';
+
+export type TrendDirection = 'up' | 'down' | 'flat' | 'insufficient';
+
+export interface TrendMetrics {
+  direction: TrendDirection;
+  percent_change: number | null;
+  forecast: number | null;
+}
+
+export interface DeficiencyAnalytics {
+  status: CoverageStatus;
+  metrics: {
+    total: number;
+    open: number;
+    closure_rate: number | null;
+    open_per_device: number | null;
+    avg_per_device: number | null;
+  };
+  trend: TrendMetrics;
+}
+
+export interface ServiceAnalyticsSection {
+  status: CoverageStatus;
+  metrics: {
+    tickets: number | null;
+    hours: number | null;
+    per_device: number | null;
+  };
+  trend: TrendMetrics;
+  activities: ServiceActivitySummaryItem[];
+}
+
+export interface FinancialAnalyticsSection {
+  status: CoverageStatus;
+  metrics: {
+    total_spend: number | null;
+    approved_spend: number | null;
+    open_spend: number | null;
+    per_device: number | null;
+    savings_total: number | null;
+    savings_rate: number | null;
+    savings_per_device: number | null;
+  };
+  trend: TrendMetrics;
+  savings_trend: TrendMetrics;
+}
+
+export interface LocationAnalyticsOverview {
+  device_count: number;
+  data_coverage: {
+    deficiencies: CoverageStatus;
+    service: CoverageStatus;
+    financial: CoverageStatus;
+  };
+}
+
+export interface LocationAnalytics {
+  overview: LocationAnalyticsOverview;
+  deficiencies: DeficiencyAnalytics;
+  service: ServiceAnalyticsSection;
+  financial: FinancialAnalyticsSection;
 }
 
 export interface ReportJobCreateRequest {

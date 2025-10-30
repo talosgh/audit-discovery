@@ -43,6 +43,7 @@
 #include "text_utils.h"
 #include "narrative.h"
 #include "util.h"
+#include "service_activity.h"
 
 #define DEFAULT_PORT 8080
 #define MAX_HEADER_SIZE 65536
@@ -233,6 +234,39 @@ typedef struct {
     ReportDeviceList devices;
     DeviceCodesList deficiency_codes_by_device;
 } ReportData;
+
+typedef struct {
+    bool has_records;
+    long total_tickets;
+    double total_hours;
+    int vendor_count;
+    int trend_points;
+    double latest_tickets;
+    double previous_tickets;
+    double latest_hours;
+    double previous_hours;
+    long category_tickets[SERVICE_ACTIVITY_UNKNOWN + 1];
+    double category_hours[SERVICE_ACTIVITY_UNKNOWN + 1];
+    long total_activity_tickets;
+    double total_activity_hours;
+} ServiceAnalytics;
+
+typedef struct {
+    bool has_records;
+    long total_records;
+    double total_spend;
+    double approved_spend;
+    double open_spend;
+    int trend_points;
+    double latest_spend;
+    double previous_spend;
+    double total_savings;
+    double proposed_spend;
+    double latest_savings;
+    double previous_savings;
+    int savings_points;
+    double savings_rate;
+} FinancialAnalytics;
 
 static const char *REPORT_SUMMARY_DOCSTRING =
     "Contains high-level metrics about the elevator audit.\n"
@@ -466,7 +500,7 @@ static void report_data_clear(ReportData *data);
 static void report_device_init(ReportDevice *device);
 static void report_device_clear(ReportDevice *device);
 static int report_device_list_append_move(ReportDeviceList *list, ReportDevice *device);
-static char *build_location_detail_json(const ReportData *report, const LocationProfile *profile);
+static char *build_location_detail_json(const ReportData *report, const LocationProfile *profile, size_t *open_deficiencies_out);
 static int load_report_for_building(PGconn *conn, const char *building_address, const OptionalInt *location_row_id, const StringArray *audit_filter, ReportData *report, char **error_out);
 static char *report_data_to_json(const ReportData *report);
 static char *pg_array_from_string_array(const StringArray *array);
@@ -474,10 +508,13 @@ static void location_profile_init(LocationProfile *profile);
 static void location_profile_clear(LocationProfile *profile);
 static int resolve_location_profile(PGconn *conn, const LocationDetailRequest *request, LocationProfile *profile, char **lookup_address_out, char **error_out);
 static char *build_location_profile_json(const LocationProfile *profile);
-static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, char **error_out);
-static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, char **error_out);
+static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, ServiceAnalytics *analytics_out, char **error_out);
+static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, FinancialAnalytics *analytics_out, char **error_out);
 static char *build_visit_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, char **error_out);
 static char *build_report_version_list(PGconn *conn, const char *address, bool deficiency_only, char **error_out);
+static const char *determine_trend_direction(double latest, double previous, double tolerance_percent, double *percent_change_out);
+static double forecast_next_value(double latest, double previous);
+static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats);
 static int append_service_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
 static int append_financial_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
 static void address_cache_init(AddressCache *cache);
@@ -534,31 +571,40 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     char *load_error = NULL;
     int ok = load_report_for_building(conn, lookup_address, &profile.row_id, NULL, &report, &load_error);
     if (!ok) {
-        int status = 500;
-        if (load_error && strcmp(load_error, "No audits found for building address") == 0) {
-            status = 404;
-        }
-        if (error_out && !*error_out) {
-            *error_out = load_error ? load_error : strdup("Failed to load location detail");
-            load_error = NULL;
+        bool allow_empty = (load_error && strcmp(load_error, "No audits found for building address") == 0);
+        if (!allow_empty) {
+            int status = 500;
+            if (load_error && strcmp(load_error, "No audits found for building address") == 0) {
+                status = 404;
+            }
+            if (error_out && !*error_out) {
+                *error_out = load_error ? load_error : strdup("Failed to load location detail");
+                load_error = NULL;
+            }
+            free(load_error);
+            report_data_clear(&report);
+            location_profile_clear(&profile);
+            free(lookup_address);
+            if (status_out) {
+                *status_out = status;
+            }
+            return NULL;
         }
         free(load_error);
+        load_error = NULL;
         report_data_clear(&report);
-        location_profile_clear(&profile);
-        free(lookup_address);
-        if (status_out) {
-            *status_out = status;
-        }
-        return NULL;
+        report_data_init(&report);
+    } else {
+        free(load_error);
     }
-    free(load_error);
 
-    char *summary_json = build_location_detail_json(&report, &profile);
-    report_data_clear(&report);
+    size_t open_deficiency_count = 0;
+    char *summary_json = build_location_detail_json(&report, &profile, &open_deficiency_count);
     if (!summary_json) {
         if (error_out && !*error_out) {
             *error_out = strdup("Failed to serialize location detail");
         }
+        report_data_clear(&report);
         location_profile_clear(&profile);
         free(lookup_address);
         if (status_out) {
@@ -568,13 +614,22 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     }
 
     char *profile_json = build_location_profile_json(&profile);
-    char *service_json = build_service_summary_json(conn, &profile, lookup_address, error_out);
-    char *financial_json = build_financial_summary_json(conn, &profile, error_out);
+    ServiceAnalytics service_stats;
+    memset(&service_stats, 0, sizeof(service_stats));
+    char *service_json = build_service_summary_json(conn, &profile, lookup_address, &service_stats, error_out);
+    FinancialAnalytics financial_stats;
+    memset(&financial_stats, 0, sizeof(financial_stats));
+    char *financial_json = build_financial_summary_json(conn, &profile, &financial_stats, error_out);
     char *visits_json = build_visit_summary_json(conn, &profile, lookup_address, error_out);
     char *reports_json = build_report_version_list(conn, lookup_address, false, error_out);
     char *deficiency_reports_json = build_report_version_list(conn, lookup_address, true, error_out);
+    char *analytics_json = NULL;
+    if (service_json && financial_json) {
+        analytics_json = build_location_analytics_json(&report, &profile, open_deficiency_count, &service_stats, &financial_stats);
+    }
+    report_data_clear(&report);
 
-    if (!profile_json || !service_json || !financial_json || !visits_json || !reports_json || !deficiency_reports_json) {
+    if (!profile_json || !service_json || !financial_json || !visits_json || !reports_json || !deficiency_reports_json || !analytics_json) {
         free(summary_json);
         free(profile_json);
         free(service_json);
@@ -582,6 +637,7 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
         free(visits_json);
         free(reports_json);
         free(deficiency_reports_json);
+        free(analytics_json);
         location_profile_clear(&profile);
         free(lookup_address);
         if (status_out) {
@@ -645,6 +701,8 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
         buffer_append_cstr(&combined, reports_json) &&
         buffer_append_cstr(&combined, ",\"deficiency_reports\":") &&
         buffer_append_cstr(&combined, deficiency_reports_json) &&
+        buffer_append_cstr(&combined, ",\"analytics\":") &&
+        buffer_append_cstr(&combined, analytics_json) &&
         buffer_append_char(&combined, '}');
 
     free(summary_json);
@@ -654,6 +712,7 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     free(visits_json);
     free(reports_json);
     free(deficiency_reports_json);
+    free(analytics_json);
     location_profile_clear(&profile);
     free(lookup_address);
 
@@ -1744,9 +1803,12 @@ static char *build_device_narrative_fallback(const ReportDevice *device) {
     return result;
 }
 
-static char *build_location_detail_json(const ReportData *report, const LocationProfile *profile) {
+static char *build_location_detail_json(const ReportData *report, const LocationProfile *profile, size_t *open_deficiencies_out) {
     if (!report) {
         return NULL;
+    }
+    if (open_deficiencies_out) {
+        *open_deficiencies_out = 0;
     }
 
     Buffer buf;
@@ -1891,6 +1953,10 @@ static char *build_location_detail_json(const ReportData *report, const Location
     if (!buffer_append_cstr(&buf, "\"open_deficiencies\":")) goto oom;
     if (!buffer_appendf(&buf, "%zu", total_open)) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (open_deficiencies_out) {
+        *open_deficiencies_out = total_open;
+    }
 
     if (!buffer_append_cstr(&buf, "\"location_row_id\":")) goto oom;
     if (profile && profile->row_id.has_value) {
@@ -2724,8 +2790,10 @@ static int append_financial_summary_section(Buffer *buf, PGconn *conn, const Rep
     const char *sql_summary =
         "SELECT COUNT(*)::bigint AS total_records, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS total_spend, "
+        "       COALESCE(SUM(COALESCE(proposed_cost,0)),0)::numeric AS proposed_spend, "
         "       COALESCE(SUM(CASE WHEN status ILIKE 'Completed%%Approved%%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS approved_spend, "
         "       COALESCE(SUM(CASE WHEN status ILIKE 'Open%%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS open_spend, "
+        "       COALESCE(SUM(COALESCE(delta,0)),0)::numeric AS total_savings, "
         "       MAX(statement_creation_date) AS last_statement "
         "FROM financial_data "
         "WHERE location_id = $1";
@@ -5992,9 +6060,16 @@ oom:
     return NULL;
 }
 
-static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, char **error_out) {
+static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, ServiceAnalytics *analytics_out, char **error_out) {
     if (!conn) {
+        if (analytics_out) {
+            memset(analytics_out, 0, sizeof(*analytics_out));
+        }
         return NULL;
+    }
+
+    if (analytics_out) {
+        memset(analytics_out, 0, sizeof(*analytics_out));
     }
 
     const char *location_code = (profile && profile->location_code && profile->location_code[0]) ? profile->location_code : NULL;
@@ -6039,6 +6114,11 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         }
     }
     PQclear(res);
+    if (analytics_out) {
+        analytics_out->has_records = (total_tickets > 0) || (last_service && last_service[0]);
+        analytics_out->total_tickets = total_tickets;
+        analytics_out->total_hours = total_hours;
+    }
 
     const char *sql_top_problems =
         "SELECT sd_problem_desc, COUNT(*)::bigint "
@@ -6111,11 +6191,37 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         return NULL;
     }
 
+    const char *sql_activity =
+        "SELECT COALESCE(NULLIF(sd_cw_at, ''), 'NDE') AS activity_code, "
+        "       COUNT(*)::bigint AS tickets, "
+        "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS hours "
+        "FROM esa_in_progress "
+        "WHERE " SERVICE_FILTER " "
+        "GROUP BY activity_code "
+        "ORDER BY tickets DESC";
+    PGresult *activity_res = PQexecParams(conn, sql_activity, 4, param_types, params, NULL, NULL, 0);
+    if (PQresultStatus(activity_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(activity_res);
+            *error_out = strdup(msg ? msg : "Failed to load service activity codes");
+        }
+        PQclear(activity_res);
+        PQclear(vendor_res);
+        PQclear(trend_res);
+        PQclear(problem_res);
+        free(street_trim);
+        free(city_trim);
+        free(state_trim);
+        free(last_service);
+        return NULL;
+    }
+
     Buffer buf;
     if (!buffer_init(&buf)) {
         if (error_out && !*error_out) {
             *error_out = strdup("Out of memory assembling service summary");
         }
+        PQclear(activity_res);
         PQclear(vendor_res);
         PQclear(trend_res);
         PQclear(problem_res);
@@ -6161,6 +6267,26 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
 
     if (!buffer_append_cstr(&buf, "\"monthly_trend\":[")) goto oom;
     int trend_rows = PQntuples(trend_res);
+    long latest_tickets = 0;
+    long previous_tickets = 0;
+    double latest_hours = 0.0;
+    double previous_hours = 0.0;
+    if (trend_rows > 0) {
+        if (!PQgetisnull(trend_res, 0, 1)) {
+            latest_tickets = strtol(PQgetvalue(trend_res, 0, 1), NULL, 10);
+        }
+        if (!PQgetisnull(trend_res, 0, 2)) {
+            latest_hours = strtod(PQgetvalue(trend_res, 0, 2), NULL);
+        }
+    }
+    if (trend_rows > 1) {
+        if (!PQgetisnull(trend_res, 1, 1)) {
+            previous_tickets = strtol(PQgetvalue(trend_res, 1, 1), NULL, 10);
+        }
+        if (!PQgetisnull(trend_res, 1, 2)) {
+            previous_hours = strtod(PQgetvalue(trend_res, 1, 2), NULL);
+        }
+    }
     for (int i = trend_rows - 1; i >= 0; --i) {
         if (!buffer_append_char(&buf, '{')) goto oom;
         if (!buffer_append_cstr(&buf, "\"month\":")) goto oom;
@@ -6181,6 +6307,17 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
 
     if (!buffer_append_cstr(&buf, "\"vendor_mix\":[")) goto oom;
     int vendor_rows = PQntuples(vendor_res);
+    if (analytics_out) {
+        analytics_out->vendor_count = vendor_rows;
+        analytics_out->trend_points = trend_rows;
+        analytics_out->latest_tickets = latest_tickets;
+        analytics_out->previous_tickets = previous_tickets;
+        analytics_out->latest_hours = latest_hours;
+        analytics_out->previous_hours = previous_hours;
+        if (vendor_rows > 0 || trend_rows > 0) {
+            analytics_out->has_records = true;
+        }
+    }
     for (int i = 0; i < vendor_rows; ++i) {
         if (!buffer_append_char(&buf, '{')) goto oom;
         if (!buffer_append_cstr(&buf, "\"vendor\":")) goto oom;
@@ -6193,9 +6330,94 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         if (i + 1 < vendor_rows && !buffer_append_char(&buf, ',')) goto oom;
     }
     if (!buffer_append_char(&buf, ']')) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"activity_breakdown\":[")) goto oom;
+    int activity_rows = PQntuples(activity_res);
+    double total_activity_hours = 0.0;
+    long total_activity_tickets = 0;
+    double category_hours[SERVICE_ACTIVITY_UNKNOWN + 1] = {0};
+    long category_tickets[SERVICE_ACTIVITY_UNKNOWN + 1] = {0};
+    for (int i = 0; i < activity_rows; ++i) {
+        const char *code = PQgetisnull(activity_res, i, 0) ? NULL : PQgetvalue(activity_res, i, 0);
+        const ServiceActivityInfo *info = service_activity_lookup(code);
+        ServiceActivityCategory category = info ? info->category : SERVICE_ACTIVITY_UNKNOWN;
+        long tickets = PQgetisnull(activity_res, i, 1) ? 0 : strtol(PQgetvalue(activity_res, i, 1), NULL, 10);
+        double hours = PQgetisnull(activity_res, i, 2) ? 0.0 : strtod(PQgetvalue(activity_res, i, 2), NULL);
+        total_activity_tickets += tickets;
+        total_activity_hours += hours;
+        if (category < 0 || category > SERVICE_ACTIVITY_UNKNOWN) {
+            category = SERVICE_ACTIVITY_UNKNOWN;
+        }
+        category_tickets[category] += tickets;
+        category_hours[category] += hours;
+
+        if (!buffer_append_char(&buf, '{')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"code\":")) goto oom;
+        if (!buffer_append_json_string(&buf, code)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"label\":")) goto oom;
+        if (!buffer_append_json_string(&buf, info ? info->label : "Unclassified")) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"category\":")) goto oom;
+        if (!buffer_append_json_string(&buf, service_activity_category_name(category))) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"tickets\":")) goto oom;
+        if (!buffer_appendf(&buf, "%ld", tickets)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"hours\":")) goto oom;
+        if (!buffer_appendf(&buf, "%.2f", hours)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"description\":")) goto oom;
+        if (!buffer_append_json_string(&buf, info ? info->description : "Unclassified or missing activity code")) goto oom;
+        if (!buffer_append_char(&buf, '}')) goto oom;
+        if (i + 1 < activity_rows && !buffer_append_char(&buf, ',')) goto oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"activity_summary\":[")) goto oom;
+    bool first_summary = true;
+    for (int cat = 0; cat <= SERVICE_ACTIVITY_UNKNOWN; ++cat) {
+        if (category_tickets[cat] == 0 && category_hours[cat] == 0.0) {
+            continue;
+        }
+        if (!first_summary) {
+            if (!buffer_append_char(&buf, ',')) goto oom;
+        }
+        first_summary = false;
+        if (!buffer_append_char(&buf, '{')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"category\":")) goto oom;
+        if (!buffer_append_json_string(&buf, service_activity_category_name((ServiceActivityCategory)cat))) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"tickets\":")) goto oom;
+        if (!buffer_appendf(&buf, "%ld", category_tickets[cat])) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"hours\":")) goto oom;
+        if (!buffer_appendf(&buf, "%.2f", category_hours[cat])) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"share\":")) goto oom;
+        double share = (total_activity_tickets > 0) ? ((double)category_tickets[cat] / (double)total_activity_tickets) : 0.0;
+        if (!buffer_appendf(&buf, "%.4f", share)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"short_label\":")) goto oom;
+        if (!buffer_append_json_string(&buf, service_activity_category_short((ServiceActivityCategory)cat))) goto oom;
+        if (!buffer_append_char(&buf, '}')) goto oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto oom;
 
     if (!buffer_append_char(&buf, '}')) goto oom;
 
+    if (analytics_out) {
+        analytics_out->total_activity_tickets = total_activity_tickets;
+        analytics_out->total_activity_hours = total_activity_hours;
+        for (int cat = 0; cat <= SERVICE_ACTIVITY_UNKNOWN; ++cat) {
+            analytics_out->category_tickets[cat] = category_tickets[cat];
+            analytics_out->category_hours[cat] = category_hours[cat];
+        }
+    }
+
+    PQclear(activity_res);
     PQclear(vendor_res);
     PQclear(trend_res);
     PQclear(problem_res);
@@ -6210,6 +6432,7 @@ oom:
         *error_out = strdup("Out of memory assembling service summary");
     }
     buffer_free(&buf);
+    PQclear(activity_res);
     PQclear(vendor_res);
     PQclear(trend_res);
     PQclear(problem_res);
@@ -6220,15 +6443,25 @@ oom:
     return NULL;
 }
 
-static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, char **error_out) {
+static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, FinancialAnalytics *analytics_out, char **error_out) {
     if (!conn) {
+        if (analytics_out) {
+            memset(analytics_out, 0, sizeof(*analytics_out));
+        }
         return NULL;
+    }
+
+    if (analytics_out) {
+        memset(analytics_out, 0, sizeof(*analytics_out));
     }
 
     if (!profile || !profile->row_id.has_value) {
         char *fallback = strdup("{\"total_records\":0,\"total_spend\":0.00,\"approved_spend\":0.00,\"open_spend\":0.00,\"last_statement\":null,\"monthly_trend\":[],\"category_breakdown\":[],\"status_breakdown\":[]}");
         if (!fallback && error_out && !*error_out) {
             *error_out = strdup("Out of memory assembling financial summary");
+        }
+        if (analytics_out) {
+            memset(analytics_out, 0, sizeof(*analytics_out));
         }
         return fallback;
     }
@@ -6240,8 +6473,10 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
     const char *sql_summary =
         "SELECT COUNT(*)::bigint AS total_records, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS total_spend, "
+        "       COALESCE(SUM(COALESCE(proposed_cost,0)),0)::numeric AS proposed_spend, "
         "       COALESCE(SUM(CASE WHEN status ILIKE 'Completed%%Approved%%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS approved_spend, "
         "       COALESCE(SUM(CASE WHEN status ILIKE 'Open%%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS open_spend, "
+        "       COALESCE(SUM(COALESCE(delta,0)),0)::numeric AS total_savings, "
         "       MAX(statement_creation_date) AS last_statement "
         "FROM financial_data "
         "WHERE location_id = $1";
@@ -6257,8 +6492,10 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
 
     long total_records = 0;
     double total_spend = 0.0;
+    double proposed_spend = 0.0;
     double approved_spend = 0.0;
     double open_spend = 0.0;
+    double total_savings = 0.0;
     char *last_statement = NULL;
     if (PQntuples(res) > 0) {
         if (!PQgetisnull(res, 0, 0)) {
@@ -6268,16 +6505,33 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
             total_spend = strtod(PQgetvalue(res, 0, 1), NULL);
         }
         if (!PQgetisnull(res, 0, 2)) {
-            approved_spend = strtod(PQgetvalue(res, 0, 2), NULL);
+            proposed_spend = strtod(PQgetvalue(res, 0, 2), NULL);
         }
         if (!PQgetisnull(res, 0, 3)) {
-            open_spend = strtod(PQgetvalue(res, 0, 3), NULL);
+            approved_spend = strtod(PQgetvalue(res, 0, 3), NULL);
         }
         if (!PQgetisnull(res, 0, 4)) {
-            last_statement = strdup(PQgetvalue(res, 0, 4));
+            open_spend = strtod(PQgetvalue(res, 0, 4), NULL);
+        }
+        if (!PQgetisnull(res, 0, 5)) {
+            total_savings = strtod(PQgetvalue(res, 0, 5), NULL);
+        }
+        if (!PQgetisnull(res, 0, 6)) {
+            last_statement = strdup(PQgetvalue(res, 0, 6));
         }
     }
     PQclear(res);
+    double savings_rate = (proposed_spend > 0.0) ? (total_savings / proposed_spend) : 0.0;
+    if (analytics_out) {
+        analytics_out->has_records = (total_records > 0) || (total_spend > 0.0);
+        analytics_out->total_records = total_records;
+        analytics_out->total_spend = total_spend;
+        analytics_out->approved_spend = approved_spend;
+        analytics_out->open_spend = open_spend;
+        analytics_out->total_savings = total_savings;
+        analytics_out->proposed_spend = proposed_spend;
+        analytics_out->savings_rate = savings_rate;
+    }
 
     const char *sql_trend =
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
@@ -6338,11 +6592,34 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         return NULL;
     }
 
+    const char *sql_savings =
+        "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
+        "       COALESCE(SUM(COALESCE(delta,0)),0)::numeric AS savings "
+        "FROM financial_data "
+        "WHERE location_id = $1 AND statement_creation_date IS NOT NULL "
+        "GROUP BY bucket "
+        "ORDER BY bucket DESC "
+        "LIMIT 12";
+    PGresult *savings_res = PQexecParams(conn, sql_savings, 1, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(savings_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(savings_res);
+            *error_out = strdup(msg ? msg : "Failed to load financial savings trend");
+        }
+        PQclear(savings_res);
+        PQclear(status_res);
+        PQclear(category_res);
+        PQclear(trend_res);
+        free(last_statement);
+        return NULL;
+    }
+
     Buffer buf;
     if (!buffer_init(&buf)) {
         if (error_out && !*error_out) {
             *error_out = strdup("Out of memory assembling financial summary");
         }
+        PQclear(savings_res);
         PQclear(status_res);
         PQclear(category_res);
         PQclear(trend_res);
@@ -6367,6 +6644,14 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
     if (!buffer_appendf(&buf, "%.2f", open_spend)) goto fin_oom;
     if (!buffer_append_char(&buf, ',')) goto fin_oom;
 
+    if (!buffer_append_cstr(&buf, "\"total_savings\":")) goto fin_oom;
+    if (!buffer_appendf(&buf, "%.2f", total_savings)) goto fin_oom;
+    if (!buffer_append_char(&buf, ',')) goto fin_oom;
+
+    if (!buffer_append_cstr(&buf, "\"savings_rate\":")) goto fin_oom;
+    if (!buffer_appendf(&buf, "%.4f", savings_rate)) goto fin_oom;
+    if (!buffer_append_char(&buf, ',')) goto fin_oom;
+
     if (!buffer_append_cstr(&buf, "\"last_statement\":")) goto fin_oom;
     if (!last_statement || last_statement[0] == '\0') {
         if (!buffer_append_cstr(&buf, "null")) goto fin_oom;
@@ -6377,6 +6662,14 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
 
     if (!buffer_append_cstr(&buf, "\"monthly_trend\":[")) goto fin_oom;
     int trend_rows = PQntuples(trend_res);
+    double latest_spend = 0.0;
+    double previous_spend = 0.0;
+    if (trend_rows > 0 && !PQgetisnull(trend_res, 0, 1)) {
+        latest_spend = strtod(PQgetvalue(trend_res, 0, 1), NULL);
+    }
+    if (trend_rows > 1 && !PQgetisnull(trend_res, 1, 1)) {
+        previous_spend = strtod(PQgetvalue(trend_res, 1, 1), NULL);
+    }
     for (int i = trend_rows - 1; i >= 0; --i) {
         if (!buffer_append_char(&buf, '{')) goto fin_oom;
         if (!buffer_append_cstr(&buf, "\"month\":")) goto fin_oom;
@@ -6385,6 +6678,48 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         if (!buffer_append_cstr(&buf, "\"spend\":")) goto fin_oom;
         double spend = PQgetisnull(trend_res, i, 1) ? 0.0 : strtod(PQgetvalue(trend_res, i, 1), NULL);
         if (!buffer_appendf(&buf, "%.2f", spend)) goto fin_oom;
+        if (!buffer_append_char(&buf, '}')) goto fin_oom;
+        if (i > 0 && !buffer_append_char(&buf, ',')) goto fin_oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto fin_oom;
+    if (!buffer_append_char(&buf, ',')) goto fin_oom;
+
+    if (!buffer_append_cstr(&buf, "\"monthly_savings\":[")) goto fin_oom;
+    int savings_rows = PQntuples(savings_res);
+    double savings_values[64];
+    double cumulative_values[64];
+    const char *savings_months[64];
+    int savings_limit = savings_rows > 64 ? 64 : savings_rows;
+    for (int i = 0; i < savings_limit; ++i) {
+        savings_months[i] = PQgetisnull(savings_res, i, 0) ? NULL : PQgetvalue(savings_res, i, 0);
+        savings_values[i] = PQgetisnull(savings_res, i, 1) ? 0.0 : strtod(PQgetvalue(savings_res, i, 1), NULL);
+    }
+    double cumulative_total = 0.0;
+    for (int i = savings_limit - 1; i >= 0; --i) {
+        const char *month = savings_months[i];
+        double savings = savings_values[i];
+        cumulative_total += savings;
+        cumulative_values[i] = cumulative_total;
+        if (!buffer_append_char(&buf, '{')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"month\":")) goto fin_oom;
+        if (!buffer_append_json_string(&buf, month)) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"savings\":")) goto fin_oom;
+        if (!buffer_appendf(&buf, "%.2f", savings)) goto fin_oom;
+        if (!buffer_append_char(&buf, '}')) goto fin_oom;
+        if (i > 0 && !buffer_append_char(&buf, ',')) goto fin_oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto fin_oom;
+    if (!buffer_append_char(&buf, ',')) goto fin_oom;
+
+    if (!buffer_append_cstr(&buf, "\"cumulative_savings\":[")) goto fin_oom;
+    for (int i = savings_limit - 1; i >= 0; --i) {
+        if (!buffer_append_char(&buf, '{')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"month\":")) goto fin_oom;
+        if (!buffer_append_json_string(&buf, savings_months[i])) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"savings\":")) goto fin_oom;
+        if (!buffer_appendf(&buf, "%.2f", cumulative_values[i])) goto fin_oom;
         if (!buffer_append_char(&buf, '}')) goto fin_oom;
         if (i > 0 && !buffer_append_char(&buf, ',')) goto fin_oom;
     }
@@ -6424,6 +6759,19 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
 
     if (!buffer_append_char(&buf, '}')) goto fin_oom;
 
+    if (analytics_out) {
+        analytics_out->trend_points = trend_rows;
+        analytics_out->latest_spend = latest_spend;
+        analytics_out->previous_spend = previous_spend;
+        if (trend_rows > 0 || cat_rows > 0 || status_rows > 0 || savings_limit > 0) {
+            analytics_out->has_records = true;
+        }
+        analytics_out->savings_points = savings_limit;
+        analytics_out->latest_savings = (savings_rows > 0 && !PQgetisnull(savings_res, 0, 1)) ? strtod(PQgetvalue(savings_res, 0, 1), NULL) : 0.0;
+        analytics_out->previous_savings = (savings_rows > 1 && !PQgetisnull(savings_res, 1, 1)) ? strtod(PQgetvalue(savings_res, 1, 1), NULL) : 0.0;
+    }
+
+    PQclear(savings_res);
     PQclear(status_res);
     PQclear(category_res);
     PQclear(trend_res);
@@ -6435,10 +6783,400 @@ fin_oom:
         *error_out = strdup("Out of memory assembling financial summary");
     }
     buffer_free(&buf);
+    PQclear(savings_res);
     PQclear(status_res);
     PQclear(category_res);
     PQclear(trend_res);
     free(last_statement);
+    return NULL;
+}
+
+static const char *determine_trend_direction(double latest, double previous, double tolerance_percent, double *percent_change_out) {
+    if (percent_change_out) {
+        *percent_change_out = 0.0;
+    }
+    if (previous <= 0.0) {
+        if (latest <= 0.0) {
+            return "flat";
+        }
+        return "insufficient";
+    }
+
+    double diff = latest - previous;
+    double percent = (diff / previous) * 100.0;
+    if (percent_change_out) {
+        *percent_change_out = percent;
+    }
+    double abs_percent = fabs(percent);
+    if (abs_percent <= tolerance_percent) {
+        return "flat";
+    }
+    return diff > 0.0 ? "up" : "down";
+}
+
+static double forecast_next_value(double latest, double previous) {
+    if (previous <= 0.0) {
+        return latest;
+    }
+    return latest + (latest - previous);
+}
+
+static const char *coverage_status(bool available) {
+    return available ? "available" : "missing";
+}
+
+static double safe_divide(double numerator, double denominator) {
+    if (denominator == 0.0) {
+        return NAN;
+    }
+    return numerator / denominator;
+}
+
+static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats) {
+    if (!report) {
+        return NULL;
+    }
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        return NULL;
+    }
+
+    int device_count = 0;
+    if (profile && profile->device_count.has_value) {
+        device_count = profile->device_count.value;
+    } else if (report->summary.total_devices > 0) {
+        device_count = report->summary.total_devices;
+    }
+
+    bool deficiencies_available = report->summary.audit_count > 0;
+    bool service_available = service_stats && service_stats->has_records;
+    bool financial_available = financial_stats && financial_stats->has_records;
+
+    int total_deficiencies = report->summary.total_deficiencies;
+    double avg_per_device = (device_count > 0) ? report->summary.average_deficiencies_per_device : NAN;
+    double closure_rate = (total_deficiencies > 0) ? safe_divide((double)(total_deficiencies - (double)open_deficiencies), (double)total_deficiencies) : NAN;
+    double open_per_device = (device_count > 0) ? safe_divide((double)open_deficiencies, (double)device_count) : NAN;
+
+    long service_tickets = service_available ? service_stats->total_tickets : 0;
+    double service_hours = service_available ? service_stats->total_hours : 0.0;
+    double service_per_device = (service_available && device_count > 0) ? safe_divide((double)service_stats->total_tickets, (double)device_count) : NAN;
+    double service_activity_total = service_stats ? (double)service_stats->total_activity_tickets : 0.0;
+    const char *service_trend = "insufficient";
+    double service_percent_change = 0.0;
+    bool service_percent_valid = false;
+    double service_forecast = 0.0;
+    bool service_forecast_valid = false;
+    if (service_stats && service_stats->trend_points > 0) {
+        service_forecast = (double)service_stats->latest_tickets;
+        service_forecast_valid = true;
+    }
+    if (service_stats && service_stats->trend_points >= 2) {
+        service_trend = determine_trend_direction((double)service_stats->latest_tickets, (double)service_stats->previous_tickets, 5.0, &service_percent_change);
+        if (strcmp(service_trend, "insufficient") != 0) {
+            service_percent_valid = true;
+        }
+        service_forecast = forecast_next_value((double)service_stats->latest_tickets, (double)service_stats->previous_tickets);
+        service_forecast_valid = true;
+    }
+    if (!service_available) {
+        service_percent_valid = false;
+        service_forecast_valid = false;
+        service_trend = "insufficient";
+    }
+
+    double financial_total_spend = financial_available ? financial_stats->total_spend : 0.0;
+    double financial_approved = financial_available ? financial_stats->approved_spend : 0.0;
+    double financial_open = financial_available ? financial_stats->open_spend : 0.0;
+    double financial_per_device = (financial_available && device_count > 0) ? safe_divide(financial_stats->total_spend, (double)device_count) : NAN;
+    const char *financial_trend = "insufficient";
+    double financial_percent_change = 0.0;
+    bool financial_percent_valid = false;
+    double financial_forecast = 0.0;
+    bool financial_forecast_valid = false;
+    double savings_total_amount = financial_available ? financial_stats->total_savings : 0.0;
+    double savings_rate_decimal = financial_available ? financial_stats->savings_rate : NAN;
+    double savings_per_device = (financial_available && device_count > 0) ? safe_divide(financial_stats->total_savings, (double)device_count) : NAN;
+    const char *savings_trend = "insufficient";
+    double savings_percent_change = 0.0;
+    bool savings_percent_valid = false;
+    double savings_forecast = 0.0;
+    bool savings_forecast_valid = false;
+    if (financial_stats && financial_stats->savings_points > 0) {
+        savings_forecast = financial_stats->latest_savings;
+        savings_forecast_valid = true;
+    }
+    if (financial_stats && financial_stats->trend_points > 0) {
+        financial_forecast = financial_stats->latest_spend;
+        financial_forecast_valid = true;
+    }
+    if (financial_stats && financial_stats->trend_points >= 2) {
+        financial_trend = determine_trend_direction(financial_stats->latest_spend, financial_stats->previous_spend, 5.0, &financial_percent_change);
+        if (strcmp(financial_trend, "insufficient") != 0) {
+            financial_percent_valid = true;
+        }
+        financial_forecast = forecast_next_value(financial_stats->latest_spend, financial_stats->previous_spend);
+        financial_forecast_valid = true;
+    }
+    if (financial_stats && financial_stats->savings_points >= 2) {
+        savings_trend = determine_trend_direction(financial_stats->latest_savings, financial_stats->previous_savings, 5.0, &savings_percent_change);
+        if (strcmp(savings_trend, "insufficient") != 0) {
+            savings_percent_valid = true;
+        }
+        savings_forecast = forecast_next_value(financial_stats->latest_savings, financial_stats->previous_savings);
+        savings_forecast_valid = true;
+    }
+    if (!financial_available) {
+        financial_percent_valid = false;
+        financial_forecast_valid = false;
+        financial_trend = "insufficient";
+        savings_percent_valid = false;
+        savings_forecast_valid = false;
+        savings_trend = "insufficient";
+    }
+
+    if (!buffer_append_char(&buf, '{')) goto oom;
+
+    if (!buffer_append_cstr(&buf, "\"overview\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"device_count\":")) goto oom;
+    if (!buffer_appendf(&buf, "%d", device_count)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"data_coverage\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"deficiencies\":")) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(deficiencies_available))) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"service\":")) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(service_available))) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"financial\":")) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(financial_available))) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+
+    if (!buffer_append_cstr(&buf, ",\"deficiencies\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"status\":")) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(deficiencies_available))) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"metrics\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"total\":")) goto oom;
+    if (!buffer_appendf(&buf, "%d", total_deficiencies)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"open\":")) goto oom;
+    if (!buffer_appendf(&buf, "%zu", open_deficiencies)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"closure_rate\":")) goto oom;
+    if (isnan(closure_rate)) {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    } else {
+        if (!buffer_appendf(&buf, "%.4f", closure_rate)) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"open_per_device\":")) goto oom;
+    if (isnan(open_per_device)) {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    } else {
+        if (!buffer_appendf(&buf, "%.2f", open_per_device)) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"avg_per_device\":")) goto oom;
+    if (isnan(avg_per_device)) {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    } else {
+        if (!buffer_appendf(&buf, "%.2f", avg_per_device)) goto oom;
+    }
+    if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"trend\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"direction\":")) goto oom;
+    if (!buffer_append_json_string(&buf, "insufficient")) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"percent_change\":null")) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"forecast\":null")) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+
+    if (!buffer_append_cstr(&buf, ",\"service\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"status\":")) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(service_available))) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"metrics\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"tickets\":")) goto oom;
+    if (service_available) {
+        if (!buffer_appendf(&buf, "%ld", service_tickets)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"hours\":")) goto oom;
+    if (service_available) {
+        if (!buffer_appendf(&buf, "%.2f", service_hours)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"per_device\":")) goto oom;
+    if (isnan(service_per_device)) {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    } else {
+        if (!buffer_appendf(&buf, "%.2f", service_per_device)) goto oom;
+    }
+    if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"trend\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"direction\":")) goto oom;
+    if (!buffer_append_json_string(&buf, service_trend)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"percent_change\":")) goto oom;
+    if (service_percent_valid) {
+        if (!buffer_appendf(&buf, "%.2f", service_percent_change)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"forecast\":")) goto oom;
+    if (service_forecast_valid) {
+        if (!buffer_appendf(&buf, "%.2f", service_forecast)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"activities\":[")) goto oom;
+    bool first_activity = true;
+    if (service_stats) {
+        for (int cat = 0; cat <= SERVICE_ACTIVITY_UNKNOWN; ++cat) {
+            long cat_tickets = service_stats->category_tickets[cat];
+            double cat_hours = service_stats->category_hours[cat];
+            if (cat_tickets == 0 && fabs(cat_hours) < 1e-9) {
+                continue;
+            }
+            if (!first_activity) {
+                if (!buffer_append_char(&buf, ',')) goto oom;
+            }
+            first_activity = false;
+            if (!buffer_append_char(&buf, '{')) goto oom;
+            if (!buffer_append_cstr(&buf, "\"category\":")) goto oom;
+            if (!buffer_append_json_string(&buf, service_activity_category_name((ServiceActivityCategory)cat))) goto oom;
+            if (!buffer_append_char(&buf, ',')) goto oom;
+            if (!buffer_append_cstr(&buf, "\"short_label\":")) goto oom;
+            if (!buffer_append_json_string(&buf, service_activity_category_short((ServiceActivityCategory)cat))) goto oom;
+            if (!buffer_append_char(&buf, ',')) goto oom;
+            if (!buffer_append_cstr(&buf, "\"tickets\":")) goto oom;
+            if (!buffer_appendf(&buf, "%ld", cat_tickets)) goto oom;
+            if (!buffer_append_char(&buf, ',')) goto oom;
+            if (!buffer_append_cstr(&buf, "\"hours\":")) goto oom;
+            if (!buffer_appendf(&buf, "%.2f", cat_hours)) goto oom;
+            if (!buffer_append_char(&buf, ',')) goto oom;
+            if (!buffer_append_cstr(&buf, "\"share\":")) goto oom;
+            double share = (service_activity_total > 0.0) ? ((double)cat_tickets / service_activity_total) : 0.0;
+            if (!buffer_appendf(&buf, "%.4f", share)) goto oom;
+            if (!buffer_append_char(&buf, '}')) goto oom;
+        }
+    }
+    if (!buffer_append_char(&buf, ']')) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+
+    if (!buffer_append_cstr(&buf, ",\"financial\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"status\":")) goto oom;
+    if (!buffer_append_json_string(&buf, coverage_status(financial_available))) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"metrics\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"total_spend\":")) goto oom;
+    if (financial_available) {
+        if (!buffer_appendf(&buf, "%.2f", financial_total_spend)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"approved_spend\":")) goto oom;
+    if (financial_available) {
+        if (!buffer_appendf(&buf, "%.2f", financial_approved)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"open_spend\":")) goto oom;
+    if (financial_available) {
+        if (!buffer_appendf(&buf, "%.2f", financial_open)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"per_device\":")) goto oom;
+    if (isnan(financial_per_device)) {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    } else {
+        if (!buffer_appendf(&buf, "%.2f", financial_per_device)) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"savings_total\":")) goto oom;
+    if (financial_available) {
+        if (!buffer_appendf(&buf, "%.2f", savings_total_amount)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"savings_rate\":")) goto oom;
+    if (isnan(savings_rate_decimal)) {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    } else {
+        if (!buffer_appendf(&buf, "%.4f", savings_rate_decimal)) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"savings_per_device\":")) goto oom;
+    if (isnan(savings_per_device)) {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    } else {
+        if (!buffer_appendf(&buf, "%.2f", savings_per_device)) goto oom;
+    }
+    if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"trend\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"direction\":")) goto oom;
+    if (!buffer_append_json_string(&buf, financial_trend)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"percent_change\":")) goto oom;
+    if (financial_percent_valid) {
+        if (!buffer_appendf(&buf, "%.2f", financial_percent_change)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"forecast\":")) goto oom;
+    if (financial_forecast_valid) {
+        if (!buffer_appendf(&buf, "%.2f", financial_forecast)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"savings_trend\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"direction\":")) goto oom;
+    if (!buffer_append_json_string(&buf, savings_trend)) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"percent_change\":")) goto oom;
+    if (savings_percent_valid) {
+        if (!buffer_appendf(&buf, "%.2f", savings_percent_change)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"forecast\":")) goto oom;
+    if (savings_forecast_valid) {
+        if (!buffer_appendf(&buf, "%.2f", savings_forecast)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+
+    if (!buffer_append_char(&buf, '}')) goto oom;
+
+    return buf.data;
+
+oom:
+    buffer_free(&buf);
     return NULL;
 }
 

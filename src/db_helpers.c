@@ -155,11 +155,25 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
 
     static const char *ITEM_SQL =
         "WITH stats AS ("
-        "    SELECT a.location_id, SUM(CASE WHEN d.resolved_at IS NULL THEN 1 ELSE 0 END) AS open_deficiencies "
+        "    SELECT a.location_id,"
+        "           SUM(CASE WHEN d.resolved_at IS NULL THEN 1 ELSE 0 END) AS open_deficiencies,"
+        "           COUNT(*) > 0 AS has_audits "
         "    FROM audits a "
         "    LEFT JOIN audit_deficiencies d ON d.audit_uuid = a.audit_uuid "
         "    WHERE a.location_id IS NOT NULL "
         "    GROUP BY a.location_id"
+        "), "
+        "service AS ("
+        "    SELECT sd_location_id AS location_code "
+        "    FROM esa_in_progress "
+        "    WHERE sd_location_id IS NOT NULL "
+        "    GROUP BY sd_location_id"
+        "), "
+        "finance AS ("
+        "    SELECT location_id "
+        "    FROM financial_data "
+        "    WHERE location_id IS NOT NULL "
+        "    GROUP BY location_id"
         ") "
         "SELECT "
         "    l.location_id AS location_code, "
@@ -173,9 +187,14 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         "    l.owner_name, "
         "    l.vendor_name, "
         "    COALESCE(l.units, 0) AS device_count, "
-        "    COALESCE(stats.open_deficiencies, 0) AS open_deficiencies "
+        "    COALESCE(stats.open_deficiencies, 0) AS open_deficiencies, "
+        "    COALESCE(stats.has_audits, false) AS has_audits, "
+        "    (service.location_code IS NOT NULL) AS has_service_records, "
+        "    (finance.location_id IS NOT NULL) AS has_financial_records "
         "FROM locations l "
         "LEFT JOIN stats ON stats.location_id = l.id "
+        "LEFT JOIN service ON service.location_code = l.location_id "
+        "LEFT JOIN finance ON finance.location_id = l.id "
         "WHERE ($3 IS NULL OR "
         "       l.location_id ILIKE $3 OR "
         "       l.site_name ILIKE $3 OR "
@@ -235,6 +254,9 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         const char *vendor = PQgetisnull(res, row, 9) ? NULL : PQgetvalue(res, row, 9);
         const char *device_count = PQgetisnull(res, row, 10) ? "0" : PQgetvalue(res, row, 10);
         const char *open_def = PQgetisnull(res, row, 11) ? "0" : PQgetvalue(res, row, 11);
+        const char *has_audits = PQgetisnull(res, row, 12) ? "f" : PQgetvalue(res, row, 12);
+        const char *has_service = PQgetisnull(res, row, 13) ? "f" : PQgetvalue(res, row, 13);
+        const char *has_financial = PQgetisnull(res, row, 14) ? "f" : PQgetvalue(res, row, 14);
 
         if (!first) {
             if (!buffer_append_char(&buf, ',')) goto oom;
@@ -275,6 +297,12 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         if (!buffer_append_cstr(&buf, device_count)) goto oom;
         if (!buffer_append_cstr(&buf, ",\"open_deficiencies\":")) goto oom;
         if (!buffer_append_cstr(&buf, open_def)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"has_audits\":")) goto oom;
+        if (!buffer_append_cstr(&buf, (has_audits && (has_audits[0] == 't' || has_audits[0] == '1')) ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"has_service_records\":")) goto oom;
+        if (!buffer_append_cstr(&buf, (has_service && (has_service[0] == 't' || has_service[0] == '1')) ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"has_financial_records\":")) goto oom;
+        if (!buffer_append_cstr(&buf, (has_financial && (has_financial[0] == 't' || has_financial[0] == '1')) ? "true" : "false")) goto oom;
         if (!buffer_append_char(&buf, '}')) goto oom;
     }
 

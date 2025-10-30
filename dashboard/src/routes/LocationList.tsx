@@ -47,6 +47,8 @@ const LocationList: Component<LocationListProps> = (props) => {
     return start + items().length - 1;
   });
 
+  const coverageClass = (flag?: boolean) => (flag ? 'data-dot data-dot--available' : 'data-dot data-dot--missing');
+
   const handleSearchInput = (event: InputEvent & { currentTarget: HTMLInputElement }) => {
     const value = event.currentTarget.value;
     setSearchInput(value);
@@ -105,6 +107,7 @@ const LocationList: Component<LocationListProps> = (props) => {
               <thead>
                 <tr>
                   <th scope="col">Location</th>
+                  <th scope="col" aria-label="Data availability">Data</th>
                   <th scope="col">Street</th>
                   <th scope="col">City</th>
                   <th scope="col">State</th>
@@ -121,6 +124,9 @@ const LocationList: Component<LocationListProps> = (props) => {
                     const deviceCount = location.device_count ?? 0;
                     const detailParts = [location.street, location.city, location.state].filter(Boolean).join(', ');
                     const displayName = location.site_name ?? location.formatted_address ?? location.address;
+                    const hasAudits = Boolean(location.has_audits);
+                    const hasService = Boolean(location.has_service_records);
+                    const hasFinancial = Boolean(location.has_financial_records);
 
                     return (
                       <tr
@@ -147,6 +153,14 @@ const LocationList: Component<LocationListProps> = (props) => {
                           <Show when={openCount > 0}>
                             <span class="deficiency-chip" role="img" aria-label="Open deficiencies">⚠</span>
                           </Show>
+                        </td>
+                        <td class="coverage-cell" aria-label="Data coverage">
+                          <span class="sr-only">
+                            Data coverage: audits {hasAudits ? 'available' : 'missing'}, service {hasService ? 'available' : 'missing'}, financial {hasFinancial ? 'available' : 'missing'}
+                          </span>
+                          <span class={coverageClass(hasAudits)} title={hasAudits ? 'Audit data available' : 'Audit data missing'} aria-hidden="true" />
+                          <span class={coverageClass(hasService)} title={hasService ? 'Service data available' : 'Service data missing'} aria-hidden="true" />
+                          <span class={coverageClass(hasFinancial)} title={hasFinancial ? 'Financial data available' : 'Financial data missing'} aria-hidden="true" />
                         </td>
                         <td>{location.street ?? '—'}</td>
                         <td>{location.city ?? '—'}</td>
