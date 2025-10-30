@@ -529,7 +529,18 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const serviceTrendMax = createMemo(() => {
     const trend = serviceTrend();
     if (trend.length === 0) return 0;
-    return Math.max(...trend.map((point) => (typeof point.tickets === 'number' ? point.tickets : 0)));
+    const totals = trend.map((point) => {
+      const pm = Math.max(point.pm ?? 0, 0);
+      const cbEmergency = Math.max(point.cb_emergency ?? 0, 0);
+      const cbEnv = Math.max(point.cb_env ?? 0, 0);
+      const tst = Math.max(point.tst ?? 0, 0);
+      const rp = Math.max(point.rp ?? 0, 0);
+      const totalTickets = Math.max(point.tickets ?? pm + cbEmergency + cbEnv + tst + rp, 0);
+      const tracked = pm + cbEmergency + cbEnv + tst + rp;
+      const other = Math.max(totalTickets - tracked, 0);
+      return tracked + other;
+    });
+    return Math.max(1, ...totals);
   });
 
   const financialTrend = createMemo(() => financialSummary()?.monthly_trend ?? []);
@@ -599,10 +610,16 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const timelineMaxVisits = createMemo(() => {
     const data = timelineData();
     if (!data.length) return 1;
-    return Math.max(
-      1,
-      ...data.map((point) => Math.max(point.pm_visits ?? 0, point.callback_visits ?? 0))
-    );
+    const totals = data.map((point) => {
+      const pm = Math.max(point.pm ?? 0, 0);
+      const cbEmergency = Math.max(point.cb_emergency ?? 0, 0);
+      const cbEnv = Math.max(point.cb_env ?? 0, 0);
+      const tst = Math.max(point.tst ?? 0, 0);
+      const rp = Math.max(point.rp ?? 0, 0);
+      const total = point.total ?? pm + cbEmergency + cbEnv + tst + rp;
+      return total;
+    });
+    return Math.max(1, ...totals);
   });
   const timelineMaxSpend = createMemo(() => {
     const data = timelineData();
@@ -612,9 +629,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const timelineGeometry = createMemo(() => {
     const data = timelineData();
     const maxSpend = timelineMaxSpend();
+    const maxVisits = timelineMaxVisits();
     const columnWidth = 56;
     const columnGap = 24;
-    const chartHeight = 140;
+    const chartHeight = Math.min(360, Math.max(160, maxVisits * 32));
     const segments: string[] = [];
     const points: Array<{ x: number; y: number; spend: number }> = [];
     data.forEach((point, index) => {
@@ -914,8 +932,11 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                       <>
                         <div class="timeline-legend">
                           <Show when={timelineHasService()}>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> PM visits</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb" /> Callback visits</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> PM</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-emergency" /> CB-EF / CB-EMG</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-env" /> CB-ENV</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--tst" /> TST</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--rp" /> RP</span>
                           </Show>
                           <Show when={timelineHasFinancial()}>
                             <span class="legend-item"><span class="legend-line" /> Spend</span>
@@ -927,21 +948,45 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                               <div class="timeline-bars" style={{ height: `${geometry.height}px` }}>
                                 <For each={data}>
                                   {(entry) => {
-                                    const pmValue = Math.max(entry.pm_visits ?? 0, 0);
-                                    const cbValue = Math.max(entry.callback_visits ?? 0, 0);
-                                    const pmHeight = maxVisits > 0 ? Math.max(0, Math.round((pmValue / maxVisits) * 100)) : 0;
-                                    const cbHeight = maxVisits > 0 ? Math.max(0, Math.round((cbValue / maxVisits) * 100)) : 0;
+                                    const pmValue = Math.max(entry.pm ?? 0, 0);
+                                    const cbEmergencyValue = Math.max(entry.cb_emergency ?? 0, 0);
+                                    const cbEnvValue = Math.max(entry.cb_env ?? 0, 0);
+                                    const tstValue = Math.max(entry.tst ?? 0, 0);
+                                    const rpValue = Math.max(entry.rp ?? 0, 0);
+                                    const totalValue = Math.max(entry.total ?? pmValue + cbEmergencyValue + cbEnvValue + tstValue + rpValue, 0);
+                                    const segments = [
+                                      { value: rpValue, className: 'timeline-bar--rp', label: 'RP' },
+                                      { value: tstValue, className: 'timeline-bar--tst', label: 'TST' },
+                                      { value: cbEnvValue, className: 'timeline-bar--cb-env', label: 'CB-ENV' },
+                                      { value: cbEmergencyValue, className: 'timeline-bar--cb-emergency', label: 'CB-EF/CB-EMG' },
+                                      { value: pmValue, className: 'timeline-bar--pm', label: 'PM' }
+                                    ];
                                     const spendValue = entry.spend ?? 0;
                                     const columnTitleParts = [];
                                     columnTitleParts.push(`PM: ${pmValue}`);
-                                    columnTitleParts.push(`Callbacks: ${cbValue}`);
+                                    columnTitleParts.push(`CB-EF/EMG: ${cbEmergencyValue}`);
+                                    columnTitleParts.push(`CB-ENV: ${cbEnvValue}`);
+                                    columnTitleParts.push(`TST: ${tstValue}`);
+                                    columnTitleParts.push(`RP: ${rpValue}`);
+                                    columnTitleParts.push(`Total tracked: ${totalValue}`);
                                     columnTitleParts.push(`Spend: ${formatCurrency(spendValue)}`);
                                     const columnTitle = `${formatMonthLabel(entry.month)} — ${columnTitleParts.join(', ')}`;
                                     return (
                                       <div class="timeline-column" style={{ width: `${geometry.columnWidth}px` }} title={columnTitle}>
                                         <div class="timeline-bars-stack">
-                                          <div class="timeline-bar timeline-bar--pm" style={{ height: `${pmHeight}%` }} aria-hidden="true" />
-                                          <div class="timeline-bar timeline-bar--cb" style={{ height: `${cbHeight}%` }} aria-hidden="true" />
+                                          <For each={segments}>
+                                            {(segment) => {
+                                              if (segment.value <= 0) return null;
+                                              const segmentHeight = maxVisits > 0 ? Math.min(100, (segment.value / maxVisits) * 100) : 0;
+                                              return (
+                                                <div
+                                                  class={`timeline-bar ${segment.className}`}
+                                                  style={{ height: `${segmentHeight}%` }}
+                                                  aria-hidden="true"
+                                                />
+                                              );
+                                            }}
+                                          </For>
                                         </div>
                                         <span class="timeline-month">{formatMonthLabel(entry.month)}</span>
                                       </div>
@@ -1236,15 +1281,56 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                         <div class="trend-list">
                           <For each={serviceTrend()}>
                             {(point) => {
-                              const width = serviceTrendMax() > 0 ? Math.max(8, ((point.tickets ?? 0) / serviceTrendMax()) * 100) : 8;
+                              const pmValue = Math.max(point.pm ?? 0, 0);
+                              const cbEmergencyValue = Math.max(point.cb_emergency ?? 0, 0);
+                              const cbEnvValue = Math.max(point.cb_env ?? 0, 0);
+                              const tstValue = Math.max(point.tst ?? 0, 0);
+                              const rpValue = Math.max(point.rp ?? 0, 0);
+                              const totalTickets = Math.max(point.tickets ?? 0, 0);
+                              const trackedTotal = pmValue + cbEmergencyValue + cbEnvValue + tstValue + rpValue;
+                              const otherValue = Math.max(totalTickets - trackedTotal, 0);
+                              const segments = [
+                                { value: pmValue, className: 'trend-segment--pm', label: 'PM' },
+                                { value: cbEmergencyValue, className: 'trend-segment--cb-emergency', label: 'CB-EF/CB-EMG' },
+                                { value: cbEnvValue, className: 'trend-segment--cb-env', label: 'CB-ENV' },
+                                { value: tstValue, className: 'trend-segment--tst', label: 'TST' },
+                                { value: rpValue, className: 'trend-segment--rp', label: 'RP' }
+                              ];
+                              if (otherValue > 0) {
+                                segments.push({ value: otherValue, className: 'trend-segment--other', label: 'Other' });
+                              }
+                              const segmentTotal = segments.reduce((sum, seg) => sum + Math.max(seg.value, 0), 0);
+                              const width = segmentTotal > 0 && serviceTrendMax() > 0 ? Math.max(8, (segmentTotal / serviceTrendMax()) * 100) : 0;
                               const tooltipBits = [] as string[];
-                              if (point.tickets != null) tooltipBits.push(`${point.tickets} tickets`);
+                              if (totalTickets > 0) tooltipBits.push(`${totalTickets} tickets`);
                               if (typeof point.hours === 'number') tooltipBits.push(`${point.hours.toFixed(1)} hours`);
+                              tooltipBits.push(`PM: ${pmValue}`);
+                              tooltipBits.push(`CB-EF/EMG: ${cbEmergencyValue}`);
+                              tooltipBits.push(`CB-ENV: ${cbEnvValue}`);
+                              tooltipBits.push(`TST: ${tstValue}`);
+                              tooltipBits.push(`RP: ${rpValue}`);
+                              if (otherValue > 0) tooltipBits.push(`Other: ${otherValue}`);
                               return (
                                 <div class="trend-row" title={`${point.month ?? '—'}: ${tooltipBits.join(' · ') || 'No data'}`}>
                                   <span class="trend-label">{point.month ?? '—'}</span>
-                                  <div class="trend-bar"><div class="trend-fill" style={{ width: `${width}%` }} /></div>
-                                  <span class="trend-value">{point.tickets ?? 0}</span>
+                                  <div class="trend-bar">
+                                    <div class="trend-stack" style={{ width: `${Math.min(100, width)}%` }}>
+                                      <For each={segments}>
+                                        {(segment) => {
+                                          if (segment.value <= 0 || segmentTotal <= 0) return null;
+                                          const segmentWidth = (segment.value / segmentTotal) * 100;
+                                          return (
+                                            <span
+                                              class={`trend-segment ${segment.className}`}
+                                              style={{ width: `${segmentWidth}%` }}
+                                              aria-hidden="true"
+                                            />
+                                          );
+                                        }}
+                                      </For>
+                                    </div>
+                                  </div>
+                                  <span class="trend-value">{totalTickets}</span>
                                 </div>
                               );
                             }}

@@ -221,6 +221,11 @@ export interface ServiceTrendPoint {
   spend?: number; // compatibility
   tickets?: number;
   hours?: number;
+  pm?: number;
+  cb_emergency?: number;
+  cb_env?: number;
+  tst?: number;
+  rp?: number;
 }
 
 export interface ServiceActivityBreakdown {
@@ -428,8 +433,13 @@ export interface ServiceCorrelation {
 
 export interface TimelinePoint {
   month: string;
-  pm_visits: number;
-  callback_visits: number;
+  pm: number;
+  cb_emergency: number;
+  cb_env: number;
+  tst: number;
+  rp: number;
+  total?: number;
+  callback_visits?: number;
   spend: number;
 }
 

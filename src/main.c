@@ -277,7 +277,12 @@ typedef struct {
 typedef struct {
     char *month;
     long pm_count;
+    long cb_emergency_count;
+    long cb_env_count;
+    long tst_count;
+    long rp_count;
     long callback_count;
+    long total_count;
     double spend_amount;
 } TimelineEntry;
 
@@ -6448,16 +6453,16 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         if (!PQgetisnull(trend_res, 0, 1)) {
             latest_tickets = strtol(PQgetvalue(trend_res, 0, 1), NULL, 10);
         }
-        if (!PQgetisnull(trend_res, 0, 2)) {
-            latest_hours = strtod(PQgetvalue(trend_res, 0, 2), NULL);
+        if (!PQgetisnull(trend_res, 0, 7)) {
+            latest_hours = strtod(PQgetvalue(trend_res, 0, 7), NULL);
         }
     }
     if (trend_rows > 1) {
         if (!PQgetisnull(trend_res, 1, 1)) {
             previous_tickets = strtol(PQgetvalue(trend_res, 1, 1), NULL, 10);
         }
-        if (!PQgetisnull(trend_res, 1, 2)) {
-            previous_hours = strtod(PQgetvalue(trend_res, 1, 2), NULL);
+        if (!PQgetisnull(trend_res, 1, 7)) {
+            previous_hours = strtod(PQgetvalue(trend_res, 1, 7), NULL);
         }
     }
     for (int i = trend_rows - 1; i >= 0; --i) {
@@ -6469,8 +6474,28 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         long tickets = PQgetisnull(trend_res, i, 1) ? 0 : strtol(PQgetvalue(trend_res, i, 1), NULL, 10);
         if (!buffer_appendf(&buf, "%ld", tickets)) goto oom;
         if (!buffer_append_char(&buf, ',')) goto oom;
+        long pm = PQgetisnull(trend_res, i, 2) ? 0 : strtol(PQgetvalue(trend_res, i, 2), NULL, 10);
+        long cb_emergency = PQgetisnull(trend_res, i, 3) ? 0 : strtol(PQgetvalue(trend_res, i, 3), NULL, 10);
+        long cb_env = PQgetisnull(trend_res, i, 4) ? 0 : strtol(PQgetvalue(trend_res, i, 4), NULL, 10);
+        long tst = PQgetisnull(trend_res, i, 5) ? 0 : strtol(PQgetvalue(trend_res, i, 5), NULL, 10);
+        long rp = PQgetisnull(trend_res, i, 6) ? 0 : strtol(PQgetvalue(trend_res, i, 6), NULL, 10);
+        if (!buffer_append_cstr(&buf, "\"pm\":")) goto oom;
+        if (!buffer_appendf(&buf, "%ld", pm)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"cb_emergency\":")) goto oom;
+        if (!buffer_appendf(&buf, "%ld", cb_emergency)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"cb_env\":")) goto oom;
+        if (!buffer_appendf(&buf, "%ld", cb_env)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"tst\":")) goto oom;
+        if (!buffer_appendf(&buf, "%ld", tst)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"rp\":")) goto oom;
+        if (!buffer_appendf(&buf, "%ld", rp)) goto oom;
+        if (!buffer_append_char(&buf, ',')) goto oom;
         if (!buffer_append_cstr(&buf, "\"hours\":")) goto oom;
-        double hours = PQgetisnull(trend_res, i, 2) ? 0.0 : strtod(PQgetvalue(trend_res, i, 2), NULL);
+        double hours = PQgetisnull(trend_res, i, 7) ? 0.0 : strtod(PQgetvalue(trend_res, i, 7), NULL);
         if (!buffer_appendf(&buf, "%.2f", hours)) goto oom;
         if (!buffer_append_char(&buf, '}')) goto oom;
         if (i > 0 && !buffer_append_char(&buf, ',')) goto oom;
@@ -7260,7 +7285,12 @@ static int timeline_ensure_entry(TimelineEntry **entries, size_t *count, size_t 
         return 0;
     }
     entry->pm_count = 0;
+    entry->cb_emergency_count = 0;
+    entry->cb_env_count = 0;
+    entry->tst_count = 0;
+    entry->rp_count = 0;
     entry->callback_count = 0;
+    entry->total_count = 0;
     entry->spend_amount = 0.0;
     *out_entry = entry;
     (*count)++;
@@ -7343,7 +7373,10 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
     const char *service_sql =
         "SELECT to_char(sd_work_date, 'YYYY-MM') AS bucket, "
         "       SUM(CASE WHEN upper(sd_cw_at) = 'PM' THEN 1 ELSE 0 END)::bigint AS pm_visits, "
-        "       SUM(CASE WHEN upper(sd_cw_at) LIKE 'CB-%' THEN 1 ELSE 0 END)::bigint AS cb_visits "
+        "       SUM(CASE WHEN upper(sd_cw_at) IN ('CB-EF','CB-EMG') THEN 1 ELSE 0 END)::bigint AS cb_emergency_visits, "
+        "       SUM(CASE WHEN upper(sd_cw_at) = 'CB-ENV' THEN 1 ELSE 0 END)::bigint AS cb_env_visits, "
+        "       SUM(CASE WHEN upper(sd_cw_at) LIKE 'TST%' THEN 1 ELSE 0 END)::bigint AS tst_visits, "
+        "       SUM(CASE WHEN upper(sd_cw_at) LIKE 'RP%' THEN 1 ELSE 0 END)::bigint AS rp_visits "
         "FROM esa_in_progress "
         "WHERE sd_work_date IS NOT NULL AND " SERVICE_FILTER " "
         "GROUP BY bucket "
@@ -7390,7 +7423,10 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
             }
             const char *month = PQgetvalue(service_res, i, 0);
             long pm_visits = PQgetisnull(service_res, i, 1) ? 0 : strtol(PQgetvalue(service_res, i, 1), NULL, 10);
-            long cb_visits = PQgetisnull(service_res, i, 2) ? 0 : strtol(PQgetvalue(service_res, i, 2), NULL, 10);
+            long cb_emergency = PQgetisnull(service_res, i, 2) ? 0 : strtol(PQgetvalue(service_res, i, 2), NULL, 10);
+            long cb_env = PQgetisnull(service_res, i, 3) ? 0 : strtol(PQgetvalue(service_res, i, 3), NULL, 10);
+            long tst_visits = PQgetisnull(service_res, i, 4) ? 0 : strtol(PQgetvalue(service_res, i, 4), NULL, 10);
+            long rp_visits = PQgetisnull(service_res, i, 5) ? 0 : strtol(PQgetvalue(service_res, i, 5), NULL, 10);
             TimelineEntry *entry = NULL;
             if (!timeline_ensure_entry(&entries, &entry_count, &entry_capacity, month, &entry)) {
                 if (error_out && !*error_out) {
@@ -7405,7 +7441,12 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
                 return NULL;
             }
             entry->pm_count = pm_visits;
-            entry->callback_count = cb_visits;
+            entry->cb_emergency_count = cb_emergency;
+            entry->cb_env_count = cb_env;
+            entry->tst_count = tst_visits;
+            entry->rp_count = rp_visits;
+            entry->callback_count = cb_emergency + cb_env + rp_visits;
+            entry->total_count = pm_visits + cb_emergency + cb_env + tst_visits + rp_visits;
         }
     }
     if (service_res) PQclear(service_res);
@@ -7561,8 +7602,18 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
         if (!buffer_append_char(&buf, '{')) goto timeline_oom;
         if (!buffer_append_cstr(&buf, "\"month\":")) goto timeline_oom;
         if (!buffer_append_json_string(&buf, entries[i].month)) goto timeline_oom;
-        if (!buffer_append_cstr(&buf, ",\"pm_visits\":")) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"pm\":")) goto timeline_oom;
         if (!buffer_appendf(&buf, "%ld", entries[i].pm_count)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"cb_emergency\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%ld", entries[i].cb_emergency_count)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"cb_env\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%ld", entries[i].cb_env_count)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"tst\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%ld", entries[i].tst_count)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"rp\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%ld", entries[i].rp_count)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"total\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%ld", entries[i].total_count)) goto timeline_oom;
         if (!buffer_append_cstr(&buf, ",\"callback_visits\":")) goto timeline_oom;
         if (!buffer_appendf(&buf, "%ld", entries[i].callback_count)) goto timeline_oom;
         if (!buffer_append_cstr(&buf, ",\"spend\":")) goto timeline_oom;
