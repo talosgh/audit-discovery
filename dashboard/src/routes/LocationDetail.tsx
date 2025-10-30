@@ -101,8 +101,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   });
   const [timelineAutoScrolled, setTimelineAutoScrolled] = createSignal(false);
   const [timelineHintVisible, setTimelineHintVisible] = createSignal(false);
+  const [timelineViewportWidth, setTimelineViewportWidth] = createSignal(0);
   let timelineChartRef: HTMLDivElement | undefined;
   let timelineHintTimer: number | undefined;
+  let timelineResizeObserver: ResizeObserver | undefined;
 
   const [showResolvedDeficiencies, setShowResolvedDeficiencies] = createSignal(false);
   const [pendingDeficiencyKey, setPendingDeficiencyKey] = createSignal<string | null>(null);
@@ -206,6 +208,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       window.clearTimeout(timelineHintTimer);
       timelineHintTimer = undefined;
     }
+    if (timelineResizeObserver) {
+      timelineResizeObserver.disconnect();
+      timelineResizeObserver = undefined;
+    }
   });
 
   createEffect(() => {
@@ -238,9 +244,14 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setActivePanel('overview');
     setTimelineAutoScrolled(false);
     setTimelineHintVisible(false);
+    setTimelineViewportWidth(0);
     if (timelineHintTimer !== undefined) {
       window.clearTimeout(timelineHintTimer);
       timelineHintTimer = undefined;
+    }
+    if (timelineResizeObserver) {
+      timelineResizeObserver.disconnect();
+      timelineResizeObserver = undefined;
     }
     if (timelineChartRef) {
       timelineChartRef.scrollLeft = 0;
@@ -629,6 +640,32 @@ const handleTimelineScroll = () => {
   }
 };
 
+createEffect(() => {
+  const container = timelineChartRef;
+  if (!container) {
+    return;
+  }
+  const updateWidth = () => {
+    setTimelineViewportWidth(container.clientWidth);
+  };
+  updateWidth();
+  if (typeof ResizeObserver !== 'undefined') {
+    const observer = new ResizeObserver(() => updateWidth());
+    observer.observe(container);
+    timelineResizeObserver = observer;
+    onCleanup(() => {
+      observer.disconnect();
+      if (timelineResizeObserver === observer) {
+        timelineResizeObserver = undefined;
+      }
+    });
+  } else {
+    const handleResize = () => updateWidth();
+    window.addEventListener('resize', handleResize);
+    onCleanup(() => window.removeEventListener('resize', handleResize));
+  }
+});
+
 const fallbackTimeline = createMemo(() => detail()?.timeline ?? null);
 const timelineBundle = createMemo(() => analytics()?.timeline ?? fallbackTimeline() ?? null);
 const timelineData = createMemo(() => timelineBundle()?.data ?? []);
@@ -700,8 +737,31 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
     const maxSpend = timelineMaxSpend();
     const maxVisits = timelineMaxVisits();
     const financePresence = showFinance();
-    const columnWidth = 70;
-    const columnGap = 26;
+    const viewport = timelineViewportWidth();
+    let columnWidth = 70;
+    let columnGap = 26;
+    const minColumnWidth = 28;
+    const minColumnGap = 10;
+    const activeMonths = data.length;
+    if (viewport > 0 && activeMonths > 0) {
+      const baseWidth = columnWidth * activeMonths + columnGap * Math.max(activeMonths - 1, 0);
+      if (baseWidth > viewport) {
+        const scale = viewport / baseWidth;
+        columnWidth = Math.max(minColumnWidth, columnWidth * scale);
+        columnGap = Math.max(minColumnGap, columnGap * scale);
+        let scaledWidth = columnWidth * activeMonths + columnGap * Math.max(activeMonths - 1, 0);
+        if (scaledWidth > viewport) {
+          const availableForColumns = viewport - columnGap * Math.max(activeMonths - 1, 0);
+          if (availableForColumns > 0) {
+            columnWidth = Math.max(minColumnWidth, availableForColumns / activeMonths);
+          }
+          scaledWidth = columnWidth * activeMonths + columnGap * Math.max(activeMonths - 1, 0);
+          if (scaledWidth > viewport) {
+            columnGap = Math.max(minColumnGap, (viewport - columnWidth * activeMonths) / Math.max(activeMonths - 1, 1));
+          }
+        }
+      }
+    }
     const baseHeight = maxVisits * 28;
     const financeHeight = financePresence && maxSpend > 0 ? 220 : 0;
     const chartHeight = Math.min(360, Math.max(160, Math.max(baseHeight, financeHeight)));
@@ -796,10 +856,11 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
     const perColumn = geometry.columnWidth + geometry.columnGap || 0;
     const contentWidth = geometry.width;
     const viewportWidth = container.clientWidth;
-    const inferredVisible = perColumn > 0 ? Math.max(Math.floor(viewportWidth / perColumn), 1) : 12;
-    const windowSize = Math.max(12, inferredVisible);
+    const inferredVisible = perColumn > 0 ? Math.max(Math.floor(viewportWidth / perColumn), 1) : data.length;
+    const windowSize = Math.max(data.length > 0 ? Math.min(data.length, inferredVisible) : inferredVisible, 1);
     let lastServiceIndex = -1;
     let lastFinanceIndex = -1;
+    let firstActiveIndex = -1;
     data.forEach((point, index) => {
       const serviceTotal =
         (point.pm ?? 0) +
@@ -811,14 +872,27 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
         (point.misc ?? 0);
       if (serviceTotal > 0) {
         lastServiceIndex = index;
+        if (firstActiveIndex === -1) {
+          firstActiveIndex = index;
+        }
       }
       const financeTotal = (point.bc ?? 0) + (point.opex ?? 0) + (point.capex ?? 0) + (point.other ?? 0);
       if (financeTotal > 0) {
         lastFinanceIndex = index;
+        if (firstActiveIndex === -1) {
+          firstActiveIndex = index;
+        }
       }
     });
-    const lastActiveIndex = lastServiceIndex >= 0 ? lastServiceIndex : lastFinanceIndex;
-    const targetIndex = lastActiveIndex >= 0 ? Math.max(lastActiveIndex - windowSize + 1, 0) : Math.max(data.length - windowSize, 0);
+    const lastActiveIndex = Math.max(lastServiceIndex, lastFinanceIndex);
+    let targetIndex = lastActiveIndex >= 0 ? Math.max(lastActiveIndex - windowSize + 1, 0) : 0;
+    if (firstActiveIndex >= 0 && lastActiveIndex >= firstActiveIndex) {
+      const activeRange = lastActiveIndex - firstActiveIndex + 1;
+      if (activeRange <= windowSize) {
+        const slack = windowSize - activeRange;
+        targetIndex = Math.max(firstActiveIndex - Math.floor(slack / 2), 0);
+      }
+    }
     const rawTarget = perColumn > 0 ? targetIndex * perColumn : 0;
     const maxScroll = Math.max(contentWidth - viewportWidth, 0);
     const targetScroll = Math.max(Math.min(rawTarget, maxScroll), 0);
