@@ -639,6 +639,36 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     FinancialAnalytics financial_stats;
     memset(&financial_stats, 0, sizeof(financial_stats));
     char *financial_json = build_financial_summary_json(conn, &profile, &financial_stats, error_out);
+    if (!financial_json) {
+        const char *log_code = (profile.location_code && profile.location_code[0]) ? profile.location_code : "(unknown)";
+        char id_buf[32];
+        const char *log_row = "(unknown)";
+        if (profile.row_id.has_value && profile.row_id.value > 0) {
+            snprintf(id_buf, sizeof(id_buf), "%d", profile.row_id.value);
+            log_row = id_buf;
+        }
+        if (error_out && *error_out) {
+            log_error("Financial summary failed for location_code=%s row_id=%s: %s", log_code, log_row, *error_out);
+        } else {
+            log_info("Financial summary missing for location_code=%s row_id=%s; using empty financial payload", log_code, log_row);
+            financial_json = strdup("{\"total_records\":0,\"total_spend\":0.00,\"proposed_spend\":0.00,\"approved_spend\":0.00,\"open_spend\":0.00,\"last_statement\":null,\"monthly_trend\":[],\"category_breakdown\":[],\"status_breakdown\":[],\"classification_breakdown\":[],\"type_breakdown\":[],\"vendor_breakdown\":[],\"work_summary\":[],\"total_savings\":0.00,\"savings_rate\":0.0,\"monthly_savings\":[],\"cumulative_savings\":[]}");
+            if (!financial_json) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory preparing empty financial summary");
+                }
+                free(summary_json);
+                report_data_clear(&report);
+                free(profile_json);
+                free(service_json);
+                location_profile_clear(&profile);
+                free(lookup_address);
+                if (status_out) {
+                    *status_out = 500;
+                }
+                return NULL;
+            }
+        }
+    }
     char *visits_json = build_visit_summary_json(conn, &profile, lookup_address, error_out);
     char *reports_json = build_report_version_list(conn, lookup_address, false, error_out);
     char *deficiency_reports_json = build_report_version_list(conn, lookup_address, true, error_out);
@@ -689,7 +719,34 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     }
     report_data_clear(&report);
 
-    if (!profile_json || !service_json || !financial_json || !visits_json || !reports_json || !deficiency_reports_json || !analytics_json) {
+    const char *missing_component = NULL;
+    if (!profile_json) {
+        missing_component = "location profile";
+    } else if (!service_json) {
+        missing_component = "service summary";
+    } else if (!financial_json) {
+        missing_component = "financial summary";
+    } else if (!visits_json) {
+        missing_component = "visit summary";
+    } else if (!reports_json) {
+        missing_component = "report history";
+    } else if (!deficiency_reports_json) {
+        missing_component = "deficiency report history";
+    } else if (!analytics_json) {
+        missing_component = "analytics payload";
+    }
+
+    if (missing_component) {
+        if (error_out && !*error_out) {
+            size_t msg_len = strlen(missing_component) + 64;
+            char *msg = malloc(msg_len);
+            if (msg) {
+                snprintf(msg, msg_len, "Failed to assemble %s for location payload", missing_component);
+                *error_out = msg;
+            } else {
+                *error_out = strdup("Failed to assemble location payload");
+            }
+        }
         free(summary_json);
         free(profile_json);
         free(service_json);
@@ -5201,6 +5258,16 @@ static int get_normalized_address_cached(const char *raw_address, NormalizedAddr
     }
     pthread_mutex_unlock(&g_address_cache_mutex);
 
+    if (!g_google_api_key || g_google_api_key[0] == '\0') {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Address validation disabled");
+        }
+        pthread_mutex_lock(&g_address_cache_mutex);
+        address_cache_store(&g_address_cache, raw_address, NULL, 0, "Address validation disabled");
+        pthread_mutex_unlock(&g_address_cache_mutex);
+        return 0;
+    }
+
     NormalizedAddress temp;
     normalized_address_init(&temp);
     char *local_error = NULL;
@@ -5992,6 +6059,11 @@ static int resolve_location_profile(PGconn *conn, const LocationDetailRequest *r
         audit_visit_clear(&visit);
     }
 
+    if (matched && address_copy) {
+        free(address_copy);
+        address_copy = NULL;
+    }
+
     location_profile_set_address_label(&temp);
 
     if (!temp.address_label && address_copy) {
@@ -6029,16 +6101,22 @@ static int resolve_location_profile(PGconn *conn, const LocationDetailRequest *r
     *profile = temp;
 
     char *lookup_address = NULL;
-    if (address_copy) {
+    if (profile->row_id.has_value) {
+        if (profile->street && profile->city && profile->state) {
+            size_t len = strlen(profile->street) + strlen(profile->city) + strlen(profile->state) + 8;
+            lookup_address = malloc(len);
+            if (lookup_address) {
+                snprintf(lookup_address, len, "%s, %s, %s", profile->street, profile->city, profile->state);
+            }
+        } else if (profile->address_label) {
+            lookup_address = strdup(profile->address_label);
+        }
+    }
+
+    if (!lookup_address && address_copy) {
         lookup_address = address_copy;
         address_copy = NULL;
-    } else if (profile->street && profile->city && profile->state) {
-        size_t len = strlen(profile->street) + strlen(profile->city) + strlen(profile->state) + 8;
-        lookup_address = malloc(len);
-        if (lookup_address) {
-            snprintf(lookup_address, len, "%s, %s, %s", profile->street, profile->city, profile->state);
-        }
-    } else if (profile->site_name) {
+    } else if (!lookup_address && profile->site_name) {
         lookup_address = strdup(profile->site_name);
     }
 
@@ -6050,6 +6128,9 @@ static int resolve_location_profile(PGconn *conn, const LocationDetailRequest *r
         if (error_out && !*error_out) {
             *error_out = strdup("Out of memory preparing lookup address");
         }
+        if (address_copy) {
+            free(address_copy);
+        }
         return 0;
     }
 
@@ -6059,7 +6140,9 @@ static int resolve_location_profile(PGconn *conn, const LocationDetailRequest *r
         free(lookup_address);
     }
 
-    free(address_copy);
+    if (address_copy) {
+        free(address_copy);
+    }
     return 1;
 }
 
@@ -6774,11 +6857,11 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
     }
 
     const char *sql_vendor =
-        "SELECT fd.vendor_id, "
+        "SELECT fd.vendor_id::text AS vendor_id, "
         "       COALESCE(NULLIF(v.vendor, ''), 'Unknown vendor') AS vendor_name, "
         "       COALESCE(SUM(COALESCE(fd.new_cost,0)),0)::numeric AS spend "
         "FROM financial_data fd "
-        "LEFT JOIN vendors v ON v.vendor_id = fd.vendor_id "
+        "LEFT JOIN vendors v ON (v.vendor_id ~ '^[0-9]+$' AND v.vendor_id::int = fd.vendor_id) "
         "WHERE fd.location_id = COALESCE($1::int, $2::int) "
         "GROUP BY fd.vendor_id, vendor_name "
         "ORDER BY spend DESC "
@@ -13170,11 +13253,12 @@ int main(int argc, char **argv) {
 
     char *google_key_trimmed = trim_copy(getenv("GOOGLE_API_KEY"));
     if (!google_key_trimmed || google_key_trimmed[0] == '\0') {
-        log_error("GOOGLE_API_KEY must be set");
+        log_info("GOOGLE_API_KEY not provided; address validation disabled");
         free(google_key_trimmed);
-        goto cleanup;
+        g_google_api_key = NULL;
+    } else {
+        g_google_api_key = google_key_trimmed;
     }
-    g_google_api_key = google_key_trimmed;
 
     char *google_region_trimmed = trim_copy(getenv("GOOGLE_REGION_CODE"));
     if (!google_region_trimmed || google_region_trimmed[0] == '\0') {
