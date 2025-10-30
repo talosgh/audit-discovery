@@ -99,6 +99,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     const preventative = summary.find((item) => item.category?.toLowerCase().includes('preventative'));
     return preventative ? preventative.share * 100 : null;
   });
+  const [timelineAutoScrolled, setTimelineAutoScrolled] = createSignal(false);
+  const [timelineHintVisible, setTimelineHintVisible] = createSignal(false);
+  let timelineChartRef: HTMLDivElement | undefined;
+  let timelineHintTimer: number | undefined;
 
   const [showResolvedDeficiencies, setShowResolvedDeficiencies] = createSignal(false);
   const [pendingDeficiencyKey, setPendingDeficiencyKey] = createSignal<string | null>(null);
@@ -198,6 +202,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
   onCleanup(() => {
     stopPolling();
+    if (timelineHintTimer !== undefined) {
+      window.clearTimeout(timelineHintTimer);
+      timelineHintTimer = undefined;
+    }
   });
 
   createEffect(() => {
@@ -228,6 +236,15 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setIncludeAllVisits(true);
     clearVisitSelection();
     setActivePanel('overview');
+    setTimelineAutoScrolled(false);
+    setTimelineHintVisible(false);
+    if (timelineHintTimer !== undefined) {
+      window.clearTimeout(timelineHintTimer);
+      timelineHintTimer = undefined;
+    }
+    if (timelineChartRef) {
+      timelineChartRef.scrollLeft = 0;
+    }
   });
 
   createEffect(() => {
@@ -599,8 +616,18 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const financialTypes = createMemo(() => financialSummary()?.type_breakdown ?? []);
   const financialVendors = createMemo(() => financialSummary()?.vendor_breakdown ?? []);
   const financialWorkSummary = createMemo(() => financialSummary()?.work_summary ?? []);
-  const classificationTotal = createMemo(() => financialClassifications().reduce((sum, item) => sum + (item.spend ?? 0), 0));
+const classificationTotal = createMemo(() => financialClassifications().reduce((sum, item) => sum + (item.spend ?? 0), 0));
 const typeTotal = createMemo(() => financialTypes().reduce((sum, item) => sum + (item.spend ?? 0), 0));
+
+const handleTimelineScroll = () => {
+  if (timelineHintVisible()) {
+    setTimelineHintVisible(false);
+    if (timelineHintTimer !== undefined) {
+      window.clearTimeout(timelineHintTimer);
+      timelineHintTimer = undefined;
+    }
+  }
+};
 
 const fallbackTimeline = createMemo(() => detail()?.timeline ?? null);
 const timelineBundle = createMemo(() => analytics()?.timeline ?? fallbackTimeline() ?? null);
@@ -746,6 +773,95 @@ const showFinance = createMemo(() => hasFinanceData());
     }
     return `${names[idx]} ${year}`;
   };
+  const formatMonthRange = (start?: string | null, end?: string | null) => {
+    if (!start || !end) {
+      return null;
+    }
+    if (start === end) {
+      return formatMonthLabel(start);
+    }
+    return `${formatMonthLabel(start)} – ${formatMonthLabel(end)}`;
+  };
+
+  createEffect(() => {
+    const container = timelineChartRef;
+    const data = timelineData();
+    if (!container || data.length === 0) {
+      return;
+    }
+    const geometry = timelineGeometry();
+    const perColumn = geometry.columnWidth + geometry.columnGap || 0;
+    const contentWidth = geometry.width;
+    const viewportWidth = container.clientWidth;
+    const inferredVisible = perColumn > 0 ? Math.max(Math.floor(viewportWidth / perColumn), 1) : 12;
+    const windowSize = Math.max(12, inferredVisible);
+    const targetIndex = Math.max(data.length - windowSize, 0);
+    const rawTarget = perColumn > 0 ? targetIndex * perColumn : 0;
+    const maxScroll = Math.max(contentWidth - viewportWidth, 0);
+    const targetScroll = Math.max(Math.min(rawTarget, maxScroll), 0);
+    if (timelineAutoScrolled()) {
+      return;
+    }
+    if (targetScroll === 0) {
+      setTimelineAutoScrolled(true);
+      return;
+    }
+    requestAnimationFrame(() => {
+      if (!timelineAutoScrolled() && container) {
+        container.scrollLeft = targetScroll;
+        setTimelineAutoScrolled(true);
+        if (targetScroll > 0) {
+          setTimelineHintVisible(true);
+          if (timelineHintTimer !== undefined) {
+            window.clearTimeout(timelineHintTimer);
+          }
+          timelineHintTimer = window.setTimeout(() => {
+            setTimelineHintVisible(false);
+            timelineHintTimer = undefined;
+          }, 4000);
+        }
+      }
+    });
+  });
+
+  const serviceTimelineMonths = createMemo(() => {
+    const data = timelineData();
+    return data
+      .filter((point) => {
+        const total =
+          (point.pm ?? 0) +
+          (point.cb_emergency ?? 0) +
+          (point.cb_env ?? 0) +
+          (point.cb_other ?? 0) +
+          (point.tst ?? 0) +
+          (point.rp ?? 0) +
+          (point.misc ?? 0);
+        return total > 0;
+      })
+      .map((point) => point.month);
+  });
+
+  const financeTimelineMonths = createMemo(() => {
+    const data = timelineData();
+    return data
+      .filter((point) => {
+        const total = (point.bc ?? 0) + (point.opex ?? 0) + (point.capex ?? 0) + (point.other ?? 0);
+        return total > 0;
+      })
+      .map((point) => point.month);
+  });
+
+  const serviceTimelineSummary = createMemo(() => {
+    const months = serviceTimelineMonths();
+    if (!months.length) return null;
+    return { count: months.length, first: months[0], last: months[months.length - 1] };
+  });
+
+  const financeTimelineSummary = createMemo(() => {
+    const months = financeTimelineMonths();
+    if (!months.length) return null;
+    return { count: months.length, first: months[0], last: months[months.length - 1] };
+  });
 
   const summaryCardClass = (panel: 'deficiencies' | 'service' | 'financial', status?: CoverageStatus) => {
     const classes = ['summary-card'];
@@ -851,6 +967,36 @@ const showFinance = createMemo(() => hasFinanceData());
         hasValue: savingsRate != null
       }
     ];
+
+    const serviceTimeline = serviceTimelineSummary();
+    if (serviceTimeline) {
+      const rangeLabel = formatMonthRange(serviceTimeline.first, serviceTimeline.last);
+      items.push({
+        key: 'service-timeline',
+        label: 'Service months analyzed',
+        tooltip: rangeLabel
+          ? `Months with recorded service activity in the timeline (${rangeLabel}).`
+          : 'Months with recorded service activity in the timeline.',
+        value: serviceTimeline.count,
+        formatted: `${serviceTimeline.count}`,
+        hasValue: true
+      });
+    }
+
+    const financeTimeline = financeTimelineSummary();
+    if (financeTimeline) {
+      const rangeLabel = formatMonthRange(financeTimeline.first, financeTimeline.last);
+      items.push({
+        key: 'finance-timeline',
+        label: 'Financial months analyzed',
+        tooltip: rangeLabel
+          ? `Months with recorded spend in the timeline (${rangeLabel}).`
+          : 'Months with recorded spend in the timeline.',
+        value: financeTimeline.count,
+        formatted: `${financeTimeline.count}`,
+        hasValue: true
+      });
+    }
 
     if (correlation && typeof correlation.coefficient === 'number' && !Number.isNaN(correlation.coefficient)) {
       items.push({
@@ -1032,7 +1178,20 @@ const showFinance = createMemo(() => hasFinanceData());
                             <span class="legend-item"><span class="legend-line" /> Total spend</span>
                           </Show>
                         </div>
-                        <div class="timeline-chart" role="img" aria-label="Timeline of service visits and spend">
+                        <div
+                          class="timeline-chart"
+                          role="img"
+                          aria-label="Timeline of service visits and spend"
+                          ref={(el) => {
+                            timelineChartRef = el;
+                          }}
+                          onScroll={handleTimelineScroll}
+                        >
+                          <Show when={timelineHintVisible()}>
+                            <div class="timeline-hint">
+                              Latest activity <span aria-hidden="true">→</span>
+                            </div>
+                          </Show>
                           <div class="timeline-content" style={{ width: `${geometry.width}px` }}>
                             <Show when={showService() || showFinance()}>
                               <div class="timeline-bars" style={{ height: `${geometry.height}px` }}>

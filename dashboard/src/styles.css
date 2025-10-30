@@ -1314,6 +1314,7 @@ tbody tr:hover {
   overflow-x: auto;
   padding: 1rem 0 0.75rem;
   margin-top: 0.75rem;
+  scroll-behavior: smooth;
 }
 
 .timeline-content {
@@ -1333,6 +1334,27 @@ tbody tr:hover {
   align-items: center;
   gap: 0.45rem;
   color: var(--text-subtle);
+}
+
+.timeline-hint {
+  position: absolute;
+  top: 0.2rem;
+  right: 1rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.01em;
+  padding: 0.25rem 0.55rem;
+  border-radius: 999px;
+  background: rgba(14, 165, 233, 0.12);
+  color: #0284c7;
+  pointer-events: none;
+  box-shadow: 0 1px 3px rgba(2, 132, 199, 0.15);
+}
+
+.timeline-hint span {
+  font-weight: 600;
 }
 
 
