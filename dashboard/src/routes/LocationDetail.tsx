@@ -632,6 +632,9 @@ const handleTimelineScroll = () => {
 const fallbackTimeline = createMemo(() => detail()?.timeline ?? null);
 const timelineBundle = createMemo(() => analytics()?.timeline ?? fallbackTimeline() ?? null);
 const timelineData = createMemo(() => timelineBundle()?.data ?? []);
+const timelineHasService = createMemo(() => timelineBundle()?.has_service ?? false);
+const timelineHasFinancial = createMemo(() => timelineBundle()?.has_financial ?? false);
+
 const serviceTotals = createMemo(() => {
   const data = timelineData();
   if (!data.length) return [] as number[];
@@ -689,8 +692,8 @@ const serviceSegmentLabels = {
   other: 'Other spend'
 } as const;
 
-const showService = createMemo(() => hasServiceData());
-const showFinance = createMemo(() => hasFinanceData());
+const showService = createMemo(() => timelineHasService() || hasServiceData());
+const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData());
 
   const timelineGeometry = createMemo(() => {
     const data = timelineData();
