@@ -75,7 +75,12 @@ const App = () => {
   onMount(() => {
     void fetchMetricsSummary()
       .then((metrics) => {
-        setGlobalSavings(metrics.total_savings ?? 0);
+        const value = Number(metrics.total_savings ?? 0);
+        if (Number.isFinite(value)) {
+          setGlobalSavings(value);
+        } else {
+          setGlobalSavings(null);
+        }
       })
       .catch(() => {
         setGlobalSavings(null);
