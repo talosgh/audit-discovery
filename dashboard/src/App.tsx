@@ -1,10 +1,9 @@
-import { Show, createSignal, createEffect, onCleanup, onMount } from 'solid-js';
+import { Show, createSignal, createEffect, createMemo, onCleanup, onMount } from 'solid-js';
 import LocationList from './routes/LocationList';
 import LocationDetail from './routes/LocationDetail';
 import AuditDetail from './routes/AuditDetail';
 import type { LocationSummary } from './types';
 import { fetchMetricsSummary } from './api';
-import { formatCurrency, formatCurrencyCompact } from './utils';
 
 interface LocationSelection {
   address: string;
@@ -75,18 +74,19 @@ const App = () => {
   onMount(() => {
     void fetchMetricsSummary()
       .then((metrics) => {
-        const raw = metrics.total_savings;
-        let parsed: number | null = null;
-        if (typeof raw === 'number' && Number.isFinite(raw)) {
-          parsed = raw;
-        } else if (typeof raw === 'string') {
-          const cleaned = raw.replace(/,/g, '').trim();
-          const value = Number.parseFloat(cleaned);
-          if (Number.isFinite(value)) {
-            parsed = value;
-          }
+        const rawSavings = Number(metrics.total_savings);
+        const proposed = Number(metrics.total_proposed);
+        const spend = Number(metrics.total_spend);
+        let candidate = Number.isFinite(rawSavings) ? rawSavings : Number.NaN;
+        const fallbackDelta = Number.isFinite(proposed) && Number.isFinite(spend) ? proposed - spend : Number.NaN;
+        if ((!Number.isFinite(candidate) || Math.abs(candidate) < 1_000) && Number.isFinite(fallbackDelta) && Math.abs(fallbackDelta) >= 1_000) {
+          candidate = fallbackDelta;
         }
-        setGlobalSavings(parsed);
+        if (Number.isFinite(candidate)) {
+          setGlobalSavings(candidate);
+        } else {
+          setGlobalSavings(null);
+        }
       })
       .catch(() => {
         setGlobalSavings(null);
@@ -142,18 +142,44 @@ const App = () => {
     }
   };
 
+  const globalSavingsDisplay = createMemo(() => {
+    const value = globalSavings();
+    if (value == null || !Number.isFinite(value)) {
+      return null;
+    }
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      maximumFractionDigits: 0
+    }).format(value);
+  });
+
+  const globalSavingsCompact = createMemo(() => {
+    const value = globalSavings();
+    if (value == null || !Number.isFinite(value) || Math.abs(value) < 1_000_000) {
+      return null;
+    }
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: 'USD',
+      notation: 'compact',
+      maximumFractionDigits: 1,
+      minimumFractionDigits: 0
+    }).format(value);
+  });
+
   return (
     <div class="app-shell">
       <header class="app-header">
         <button type="button" class="brand" onClick={navigateToList} aria-label="Citywide Elevator Operations">
           <img src="/citywide.png" alt="Citywide Elevator Operations" />
-          <span class="brand-savings" title={globalSavings() != null ? `Total negotiated savings to date: ${formatCurrency(globalSavings())}` : undefined}>
-            <Show when={globalSavings() != null} fallback={<span>Client savings: <strong>Calculating…</strong></span>}>
-              {(value) => (
+          <span class="brand-savings" title={globalSavingsDisplay() != null ? `Total negotiated savings to date: ${globalSavingsDisplay()}` : undefined}>
+            <Show when={globalSavingsDisplay()} fallback={<span>Client savings: <strong>Calculating…</strong></span>}>
+              {(display) => (
                 <span>
-                  Client savings: <strong>{formatCurrency(value())}</strong>
-                  <Show when={value() !== null && value() !== undefined && Number(value()) >= 1000000}>
-                    <span class="brand-savings-compact">({formatCurrencyCompact(value())})</span>
+                  Client savings: <strong>{display()}</strong>
+                  <Show when={globalSavingsCompact()}>
+                    {(compact) => <span class="brand-savings-compact">({compact()})</span>}
                   </Show>
                 </span>
               )}

@@ -626,13 +626,32 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     if (!data.length) return 0;
     return Math.max(...data.map((point) => point.spend ?? 0));
   });
+  const serviceSegmentLabels = {
+    pm: 'Preventative maintenance',
+    cbEmergency: 'Emergency callbacks',
+    cbEnv: 'Environmental callbacks',
+    tst: 'Testing',
+    rp: 'Repair / modernization',
+    other: 'Other / unclassified'
+  } as const;
+
+  const financialSegmentLabels = {
+    bc: 'Base contract spend',
+    opex: 'Operational expenses',
+    capex: 'Capital expenditures',
+    other: 'Other spend'
+  } as const;
+
   const timelineGeometry = createMemo(() => {
     const data = timelineData();
     const maxSpend = timelineMaxSpend();
     const maxVisits = timelineMaxVisits();
-    const columnWidth = 56;
-    const columnGap = 24;
-    const chartHeight = Math.min(360, Math.max(160, maxVisits * 32));
+    const financePresence = timelineHasFinancial();
+    const columnWidth = 70;
+    const columnGap = 26;
+    const baseHeight = maxVisits * 28;
+    const financeHeight = financePresence && maxSpend > 0 ? 220 : 0;
+    const chartHeight = Math.min(360, Math.max(160, Math.max(baseHeight, financeHeight)));
     const segments: string[] = [];
     const points: Array<{ x: number; y: number; spend: number }> = [];
     data.forEach((point, index) => {
@@ -932,14 +951,18 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                       <>
                         <div class="timeline-legend">
                           <Show when={timelineHasService()}>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> PM</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-emergency" /> CB-EF / CB-EMG</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-env" /> CB-ENV</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--tst" /> TST</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--rp" /> RP</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> {serviceSegmentLabels.pm}</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-emergency" /> {serviceSegmentLabels.cbEmergency}</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-env" /> {serviceSegmentLabels.cbEnv}</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--tst" /> {serviceSegmentLabels.tst}</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--rp" /> {serviceSegmentLabels.rp}</span>
                           </Show>
                           <Show when={timelineHasFinancial()}>
-                            <span class="legend-item"><span class="legend-line" /> Spend</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--finance-bc" /> {financialSegmentLabels.bc}</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--finance-opex" /> {financialSegmentLabels.opex}</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--finance-capex" /> {financialSegmentLabels.capex}</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--finance-other" /> {financialSegmentLabels.other}</span>
+                            <span class="legend-item"><span class="legend-line" /> Total spend</span>
                           </Show>
                         </div>
                         <div class="timeline-chart" role="img" aria-label="Timeline of service visits and spend">
@@ -954,39 +977,60 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                                     const tstValue = Math.max(entry.tst ?? 0, 0);
                                     const rpValue = Math.max(entry.rp ?? 0, 0);
                                     const totalValue = Math.max(entry.total ?? pmValue + cbEmergencyValue + cbEnvValue + tstValue + rpValue, 0);
-                                    const segments = [
-                                      { value: rpValue, className: 'timeline-bar--rp', label: 'RP' },
-                                      { value: tstValue, className: 'timeline-bar--tst', label: 'TST' },
-                                      { value: cbEnvValue, className: 'timeline-bar--cb-env', label: 'CB-ENV' },
-                                      { value: cbEmergencyValue, className: 'timeline-bar--cb-emergency', label: 'CB-EF/CB-EMG' },
-                                      { value: pmValue, className: 'timeline-bar--pm', label: 'PM' }
+                                    const serviceSegments = [
+                                      { value: rpValue, className: 'timeline-bar--rp', label: serviceSegmentLabels.rp },
+                                      { value: tstValue, className: 'timeline-bar--tst', label: serviceSegmentLabels.tst },
+                                      { value: cbEnvValue, className: 'timeline-bar--cb-env', label: serviceSegmentLabels.cbEnv },
+                                      { value: cbEmergencyValue, className: 'timeline-bar--cb-emergency', label: serviceSegmentLabels.cbEmergency },
+                                      { value: pmValue, className: 'timeline-bar--pm', label: serviceSegmentLabels.pm }
+                                    ];
+                                    const bcSpend = Math.max(entry.bc ?? 0, 0);
+                                    const opexSpend = Math.max(entry.opex ?? 0, 0);
+                                    const capexSpend = Math.max(entry.capex ?? 0, 0);
+                                    const otherSpend = Math.max(entry.other ?? 0, 0);
+                                    const financeSegments = [
+                                      { value: bcSpend, className: 'timeline-bar--finance-bc', label: financialSegmentLabels.bc },
+                                      { value: opexSpend, className: 'timeline-bar--finance-opex', label: financialSegmentLabels.opex },
+                                      { value: capexSpend, className: 'timeline-bar--finance-capex', label: financialSegmentLabels.capex },
+                                      { value: otherSpend, className: 'timeline-bar--finance-other', label: financialSegmentLabels.other }
                                     ];
                                     const spendValue = entry.spend ?? 0;
                                     const columnTitleParts = [];
-                                    columnTitleParts.push(`PM: ${pmValue}`);
-                                    columnTitleParts.push(`CB-EF/EMG: ${cbEmergencyValue}`);
-                                    columnTitleParts.push(`CB-ENV: ${cbEnvValue}`);
-                                    columnTitleParts.push(`TST: ${tstValue}`);
-                                    columnTitleParts.push(`RP: ${rpValue}`);
+                                    columnTitleParts.push(`${serviceSegmentLabels.pm}: ${pmValue}`);
+                                    columnTitleParts.push(`${serviceSegmentLabels.cbEmergency}: ${cbEmergencyValue}`);
+                                    columnTitleParts.push(`${serviceSegmentLabels.cbEnv}: ${cbEnvValue}`);
+                                    columnTitleParts.push(`${serviceSegmentLabels.tst}: ${tstValue}`);
+                                    columnTitleParts.push(`${serviceSegmentLabels.rp}: ${rpValue}`);
                                     columnTitleParts.push(`Total tracked: ${totalValue}`);
+                                    columnTitleParts.push(`${financialSegmentLabels.bc}: ${formatCurrency(bcSpend)}`);
+                                    columnTitleParts.push(`${financialSegmentLabels.opex}: ${formatCurrency(opexSpend)}`);
+                                    columnTitleParts.push(`${financialSegmentLabels.capex}: ${formatCurrency(capexSpend)}`);
+                                    columnTitleParts.push(`${financialSegmentLabels.other}: ${formatCurrency(otherSpend)}`);
                                     columnTitleParts.push(`Spend: ${formatCurrency(spendValue)}`);
                                     const columnTitle = `${formatMonthLabel(entry.month)} — ${columnTitleParts.join(', ')}`;
                                     return (
                                       <div class="timeline-column" style={{ width: `${geometry.columnWidth}px` }} title={columnTitle}>
                                         <div class="timeline-bars-stack">
-                                          <For each={segments}>
-                                            {(segment) => {
-                                              if (segment.value <= 0) return null;
-                                              const segmentHeight = maxVisits > 0 ? Math.min(100, (segment.value / maxVisits) * 100) : 0;
-                                              return (
-                                                <div
-                                                  class={`timeline-bar ${segment.className}`}
-                                                  style={{ height: `${segmentHeight}%` }}
-                                                  aria-hidden="true"
-                                                />
-                                              );
-                                            }}
-                                          </For>
+                                          <div class="timeline-stack timeline-stack--service" aria-hidden="true">
+                                            <For each={serviceSegments}>
+                                              {(segment) => {
+                                                if (segment.value <= 0) return null;
+                                                const segmentHeight = maxVisits > 0 ? Math.min(100, (segment.value / maxVisits) * 100) : 0;
+                                                return <div class={`timeline-bar ${segment.className}`} style={{ height: `${segmentHeight}%` }} />;
+                                              }}
+                                            </For>
+                                          </div>
+                                          <Show when={timelineHasFinancial()}>
+                                            <div class="timeline-stack timeline-stack--finance" aria-hidden="true">
+                                              <For each={financeSegments}>
+                                                {(segment) => {
+                                                  if (segment.value <= 0 || maxSpend <= 0) return null;
+                                                  const segmentHeight = Math.min(100, (segment.value / maxSpend) * 100);
+                                                  return <div class={`timeline-bar ${segment.className}`} style={{ height: `${segmentHeight}%` }} />;
+                                                }}
+                                              </For>
+                                            </div>
+                                          </Show>
                                         </div>
                                         <span class="timeline-month">{formatMonthLabel(entry.month)}</span>
                                       </div>
@@ -1290,26 +1334,26 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                               const trackedTotal = pmValue + cbEmergencyValue + cbEnvValue + tstValue + rpValue;
                               const otherValue = Math.max(totalTickets - trackedTotal, 0);
                               const segments = [
-                                { value: pmValue, className: 'trend-segment--pm', label: 'PM' },
-                                { value: cbEmergencyValue, className: 'trend-segment--cb-emergency', label: 'CB-EF/CB-EMG' },
-                                { value: cbEnvValue, className: 'trend-segment--cb-env', label: 'CB-ENV' },
-                                { value: tstValue, className: 'trend-segment--tst', label: 'TST' },
-                                { value: rpValue, className: 'trend-segment--rp', label: 'RP' }
+                                { value: pmValue, className: 'trend-segment--pm', label: serviceSegmentLabels.pm },
+                                { value: cbEmergencyValue, className: 'trend-segment--cb-emergency', label: serviceSegmentLabels.cbEmergency },
+                                { value: cbEnvValue, className: 'trend-segment--cb-env', label: serviceSegmentLabels.cbEnv },
+                                { value: tstValue, className: 'trend-segment--tst', label: serviceSegmentLabels.tst },
+                                { value: rpValue, className: 'trend-segment--rp', label: serviceSegmentLabels.rp }
                               ];
                               if (otherValue > 0) {
-                                segments.push({ value: otherValue, className: 'trend-segment--other', label: 'Other' });
+                                segments.push({ value: otherValue, className: 'trend-segment--other', label: serviceSegmentLabels.other });
                               }
                               const segmentTotal = segments.reduce((sum, seg) => sum + Math.max(seg.value, 0), 0);
                               const width = segmentTotal > 0 && serviceTrendMax() > 0 ? Math.max(8, (segmentTotal / serviceTrendMax()) * 100) : 0;
                               const tooltipBits = [] as string[];
                               if (totalTickets > 0) tooltipBits.push(`${totalTickets} tickets`);
                               if (typeof point.hours === 'number') tooltipBits.push(`${point.hours.toFixed(1)} hours`);
-                              tooltipBits.push(`PM: ${pmValue}`);
-                              tooltipBits.push(`CB-EF/EMG: ${cbEmergencyValue}`);
-                              tooltipBits.push(`CB-ENV: ${cbEnvValue}`);
-                              tooltipBits.push(`TST: ${tstValue}`);
-                              tooltipBits.push(`RP: ${rpValue}`);
-                              if (otherValue > 0) tooltipBits.push(`Other: ${otherValue}`);
+                              tooltipBits.push(`${serviceSegmentLabels.pm}: ${pmValue}`);
+                              tooltipBits.push(`${serviceSegmentLabels.cbEmergency}: ${cbEmergencyValue}`);
+                              tooltipBits.push(`${serviceSegmentLabels.cbEnv}: ${cbEnvValue}`);
+                              tooltipBits.push(`${serviceSegmentLabels.tst}: ${tstValue}`);
+                              tooltipBits.push(`${serviceSegmentLabels.rp}: ${rpValue}`);
+                              if (otherValue > 0) tooltipBits.push(`${serviceSegmentLabels.other}: ${otherValue}`);
                               return (
                                 <div class="trend-row" title={`${point.month ?? '—'}: ${tooltipBits.join(' · ') || 'No data'}`}>
                                   <span class="trend-label">{point.month ?? '—'}</span>
@@ -1357,12 +1401,40 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                         <div class="trend-list">
                           <For each={financialTrend()}>
                             {(point) => {
-                              const width = financialTrendMax() > 0 ? Math.max(8, ((point.spend ?? 0) / financialTrendMax()) * 100) : 8;
+                              const bc = Math.max(point.bc ?? 0, 0);
+                              const opex = Math.max(point.opex ?? 0, 0);
+                              const capex = Math.max(point.capex ?? 0, 0);
+                              const other = Math.max(point.other ?? 0, 0);
+                              const total = Math.max(point.spend ?? bc + opex + capex + other, 0);
+                              const segments = [
+                                { value: bc, className: 'trend-segment--finance-bc', label: financialSegmentLabels.bc },
+                                { value: opex, className: 'trend-segment--finance-opex', label: financialSegmentLabels.opex },
+                                { value: capex, className: 'trend-segment--finance-capex', label: financialSegmentLabels.capex },
+                                { value: other, className: 'trend-segment--finance-other', label: financialSegmentLabels.other }
+                              ];
+                              const width = total > 0 && financialTrendMax() > 0 ? Math.max(8, (total / financialTrendMax()) * 100) : 0;
+                              const tooltipParts = [
+                                `${formatCurrency(total)} total`,
+                                `${financialSegmentLabels.bc}: ${formatCurrency(bc)}`,
+                                `${financialSegmentLabels.opex}: ${formatCurrency(opex)}`,
+                                `${financialSegmentLabels.capex}: ${formatCurrency(capex)}`
+                              ];
+                              if (other > 0) tooltipParts.push(`${financialSegmentLabels.other}: ${formatCurrency(other)}`);
                               return (
-                                <div class="trend-row" title={`${point.month ?? '—'}: ${formatCurrency(point.spend ?? 0)}`}>
+                                <div class="trend-row" title={`${point.month ?? '—'}: ${tooltipParts.join(' · ')}`}>
                                   <span class="trend-label">{point.month ?? '—'}</span>
-                                  <div class="trend-bar"><div class="trend-fill" style={{ width: `${width}%` }} /></div>
-                                  <span class="trend-value">{formatCurrency(point.spend)}</span>
+                                  <div class="trend-bar">
+                                    <div class="trend-stack" style={{ width: `${Math.min(100, width)}%` }}>
+                                      <For each={segments}>
+                                        {(segment) => {
+                                          if (segment.value <= 0 || total <= 0) return null;
+                                          const segmentWidth = (segment.value / total) * 100;
+                                          return <span class={`trend-segment ${segment.className}`} style={{ width: `${segmentWidth}%` }} />;
+                                        }}
+                                      </For>
+                                    </div>
+                                  </div>
+                                  <span class="trend-value">{formatCurrency(total)}</span>
                                 </div>
                               );
                             }}
@@ -1384,63 +1456,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                     </article>
                   </section>
 
-                  <div class="table-wrapper" role="region" aria-live="polite">
-                    <table>
-                      <thead>
-                        <tr>
-                          <th scope="col">Device</th>
-                          <th scope="col">Type</th>
-                          <th scope="col">Bank</th>
-                          <th scope="col">Controller</th>
-                          <th scope="col">Tests</th>
-                          <th scope="col">Open Deficiencies</th>
-                          <th scope="col">Last Audit</th>
-                          <th scope="col">Actions</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        <For each={devices()}>
-                          {(device: LocationDevice) => {
-                            const total = device.total_deficiencies ?? 0;
-                            const open = device.open_deficiencies ?? 0;
-                            const controllerInfo = device.controller_install_year ?? device.controller_age
-                              ? `${device.controller_install_year ?? '—'} (${device.controller_age ?? '—'} yrs)`
-                              : '—';
-
-                            return (
-                              <tr>
-                                <td>{device.device_id ?? '—'}</td>
-                                <td>{device.device_type ?? '—'}</td>
-                                <td>{device.bank_name ?? '—'}</td>
-                                <td>{controllerInfo}</td>
-                                <td>
-                                  <div class="status-stack">
-                                    <span>Cat 1: {device.cat1_tag_current === null ? '—' : device.cat1_tag_current ? '✓' : '✗'}</span>
-                                    <span>Cat 5: {device.cat5_tag_current === null ? '—' : device.cat5_tag_current ? '✓' : '✗'}</span>
-                                    <span>DLM: {device.dlm_compliant === null ? '—' : device.dlm_compliant ? '✓' : '✗'}</span>
-                                  </div>
-                                </td>
-                                <td>
-                                  <span class="deficiency-count">{open}</span>
-                                  <Show when={total > open}>
-                                    <span class="deficiency-note"> / {total}</span>
-                                  </Show>
-                                </td>
-                                <td>{formatDateTime(device.submitted_on)}</td>
-                                <td>
-                                  <div class="action-group">
-                                    <button type="button" onClick={() => props.onSelectAudit(device.audit_uuid)}>
-                                      View audit
-                                    </button>
-                                  </div>
-                                </td>
-                              </tr>
-                            );
-                          }}
-                        </For>
-                      </tbody>
-                    </table>
-                  </div>
+                  <p class="muted">Dive into individual devices and audit history by selecting the “Deficiencies &amp; Violations” panel above.</p>
                 </Match>
 
                 <Match when={activePanel() === 'deficiencies'}>

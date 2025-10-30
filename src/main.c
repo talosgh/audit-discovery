@@ -284,6 +284,10 @@ typedef struct {
     long callback_count;
     long total_count;
     double spend_amount;
+    double spend_bc;
+    double spend_opex;
+    double spend_capex;
+    double spend_other;
 } TimelineEntry;
 
 static const char *REPORT_SUMMARY_DOCSTRING =
@@ -2618,6 +2622,12 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
     const char *sql_trend =
         "SELECT to_char(sd_work_date, 'YYYY-MM') AS bucket, "
         "       COUNT(*)::bigint AS tickets, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'PM%' THEN 1 ELSE 0 END)::bigint AS pm_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-EF%' "
+        "                     OR upper(btrim(sd_cw_at)) LIKE 'CB-EMG%' THEN 1 ELSE 0 END)::bigint AS cb_emergency_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-ENV%' THEN 1 ELSE 0 END)::bigint AS cb_env_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'TST%' THEN 1 ELSE 0 END)::bigint AS tst_count, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'RP%' THEN 1 ELSE 0 END)::bigint AS rp_count, "
         "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS hours "
         "FROM esa_in_progress "
         "WHERE sd_work_date IS NOT NULL AND " SERVICE_FILTER " "
@@ -6370,7 +6380,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
     }
 
     const char *sql_activity =
-        "SELECT COALESCE(NULLIF(sd_cw_at, ''), 'NDE') AS activity_code, "
+        "SELECT COALESCE(NULLIF(btrim(sd_cw_at), ''), 'NDE') AS activity_code, "
         "       COUNT(*)::bigint AS tickets, "
         "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS hours "
         "FROM esa_in_progress "
@@ -6537,7 +6547,8 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
     double category_hours[SERVICE_ACTIVITY_UNKNOWN + 1] = {0};
     long category_tickets[SERVICE_ACTIVITY_UNKNOWN + 1] = {0};
     for (int i = 0; i < activity_rows; ++i) {
-        const char *code = PQgetisnull(activity_res, i, 0) ? NULL : PQgetvalue(activity_res, i, 0);
+        char *code_trim = PQgetisnull(activity_res, i, 0) ? NULL : trim_copy(PQgetvalue(activity_res, i, 0));
+        const char *code = code_trim ? code_trim : (PQgetisnull(activity_res, i, 0) ? NULL : PQgetvalue(activity_res, i, 0));
         const ServiceActivityInfo *info = service_activity_lookup(code);
         ServiceActivityCategory category = info ? info->category : SERVICE_ACTIVITY_UNKNOWN;
         long tickets = PQgetisnull(activity_res, i, 1) ? 0 : strtol(PQgetvalue(activity_res, i, 1), NULL, 10);
@@ -6550,26 +6561,34 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         category_tickets[category] += tickets;
         category_hours[category] += hours;
 
-        if (!buffer_append_char(&buf, '{')) goto oom;
-        if (!buffer_append_cstr(&buf, "\"code\":")) goto oom;
-        if (!buffer_append_json_string(&buf, code)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-        if (!buffer_append_cstr(&buf, "\"label\":")) goto oom;
-        if (!buffer_append_json_string(&buf, info ? info->label : "Unclassified")) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-        if (!buffer_append_cstr(&buf, "\"category\":")) goto oom;
-        if (!buffer_append_json_string(&buf, service_activity_category_name(category))) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-        if (!buffer_append_cstr(&buf, "\"tickets\":")) goto oom;
-        if (!buffer_appendf(&buf, "%ld", tickets)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-        if (!buffer_append_cstr(&buf, "\"hours\":")) goto oom;
-        if (!buffer_appendf(&buf, "%.2f", hours)) goto oom;
-        if (!buffer_append_char(&buf, ',')) goto oom;
-        if (!buffer_append_cstr(&buf, "\"description\":")) goto oom;
-        if (!buffer_append_json_string(&buf, info ? info->description : "Unclassified or missing activity code")) goto oom;
-        if (!buffer_append_char(&buf, '}')) goto oom;
-        if (i + 1 < activity_rows && !buffer_append_char(&buf, ',')) goto oom;
+        int ok = 1;
+        ok = ok && buffer_append_char(&buf, '{');
+        ok = ok && buffer_append_cstr(&buf, "\"code\":");
+        ok = ok && buffer_append_json_string(&buf, code);
+        ok = ok && buffer_append_char(&buf, ',');
+        ok = ok && buffer_append_cstr(&buf, "\"label\":");
+        ok = ok && buffer_append_json_string(&buf, info ? info->label : "Unclassified");
+        ok = ok && buffer_append_char(&buf, ',');
+        ok = ok && buffer_append_cstr(&buf, "\"category\":");
+        ok = ok && buffer_append_json_string(&buf, service_activity_category_name(category));
+        ok = ok && buffer_append_char(&buf, ',');
+        ok = ok && buffer_append_cstr(&buf, "\"tickets\":");
+        ok = ok && buffer_appendf(&buf, "%ld", tickets);
+        ok = ok && buffer_append_char(&buf, ',');
+        ok = ok && buffer_append_cstr(&buf, "\"hours\":");
+        ok = ok && buffer_appendf(&buf, "%.2f", hours);
+        ok = ok && buffer_append_char(&buf, ',');
+        ok = ok && buffer_append_cstr(&buf, "\"description\":");
+        ok = ok && buffer_append_json_string(&buf, info ? info->description : "Unclassified or missing activity code");
+        ok = ok && buffer_append_char(&buf, '}');
+        if (ok && i + 1 < activity_rows) {
+            ok = ok && buffer_append_char(&buf, ',');
+        }
+        if (!ok) {
+            free(code_trim);
+            goto oom;
+        }
+        free(code_trim);
     }
     if (!buffer_append_char(&buf, ']')) goto oom;
     if (!buffer_append_char(&buf, ',')) goto oom;
@@ -7007,7 +7026,26 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         if (!buffer_append_char(&buf, ',')) goto fin_oom;
         if (!buffer_append_cstr(&buf, "\"spend\":")) goto fin_oom;
         double spend = PQgetisnull(trend_res, i, 1) ? 0.0 : strtod(PQgetvalue(trend_res, i, 1), NULL);
+        double spend_bc = PQgetisnull(trend_res, i, 2) ? 0.0 : strtod(PQgetvalue(trend_res, i, 2), NULL);
+        double spend_opex = PQgetisnull(trend_res, i, 3) ? 0.0 : strtod(PQgetvalue(trend_res, i, 3), NULL);
+        double spend_capex = PQgetisnull(trend_res, i, 4) ? 0.0 : strtod(PQgetvalue(trend_res, i, 4), NULL);
+        double spend_other = spend - spend_bc - spend_opex - spend_capex;
+        if (fabs(spend_other) < 0.005) {
+            spend_other = 0.0;
+        }
         if (!buffer_appendf(&buf, "%.2f", spend)) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"bc\":")) goto fin_oom;
+        if (!buffer_appendf(&buf, "%.2f", spend_bc)) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"opex\":")) goto fin_oom;
+        if (!buffer_appendf(&buf, "%.2f", spend_opex)) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"capex\":")) goto fin_oom;
+        if (!buffer_appendf(&buf, "%.2f", spend_capex)) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"other\":")) goto fin_oom;
+        if (!buffer_appendf(&buf, "%.2f", spend_other)) goto fin_oom;
         if (!buffer_append_char(&buf, '}')) goto fin_oom;
         if (i > 0 && !buffer_append_char(&buf, ',')) goto fin_oom;
     }
@@ -7292,6 +7330,10 @@ static int timeline_ensure_entry(TimelineEntry **entries, size_t *count, size_t 
     entry->callback_count = 0;
     entry->total_count = 0;
     entry->spend_amount = 0.0;
+    entry->spend_bc = 0.0;
+    entry->spend_opex = 0.0;
+    entry->spend_capex = 0.0;
+    entry->spend_other = 0.0;
     *out_entry = entry;
     (*count)++;
     return 1;
@@ -7372,11 +7414,12 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
     const Oid service_types[4] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID };
     const char *service_sql =
         "SELECT to_char(sd_work_date, 'YYYY-MM') AS bucket, "
-        "       SUM(CASE WHEN upper(sd_cw_at) = 'PM' THEN 1 ELSE 0 END)::bigint AS pm_visits, "
-        "       SUM(CASE WHEN upper(sd_cw_at) IN ('CB-EF','CB-EMG') THEN 1 ELSE 0 END)::bigint AS cb_emergency_visits, "
-        "       SUM(CASE WHEN upper(sd_cw_at) = 'CB-ENV' THEN 1 ELSE 0 END)::bigint AS cb_env_visits, "
-        "       SUM(CASE WHEN upper(sd_cw_at) LIKE 'TST%' THEN 1 ELSE 0 END)::bigint AS tst_visits, "
-        "       SUM(CASE WHEN upper(sd_cw_at) LIKE 'RP%' THEN 1 ELSE 0 END)::bigint AS rp_visits "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'PM%' THEN 1 ELSE 0 END)::bigint AS pm_visits, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-EF%' "
+        "                     OR upper(btrim(sd_cw_at)) LIKE 'CB-EMG%' THEN 1 ELSE 0 END)::bigint AS cb_emergency_visits, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'CB-ENV%' THEN 1 ELSE 0 END)::bigint AS cb_env_visits, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'TST%' THEN 1 ELSE 0 END)::bigint AS tst_visits, "
+        "       SUM(CASE WHEN upper(btrim(sd_cw_at)) LIKE 'RP%' THEN 1 ELSE 0 END)::bigint AS rp_visits "
         "FROM esa_in_progress "
         "WHERE sd_work_date IS NOT NULL AND " SERVICE_FILTER " "
         "GROUP BY bucket "
@@ -7399,11 +7442,13 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
     PGresult *finance_res = NULL;
     const char *finance_sql =
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
-        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend_total, "
+        "       COALESCE(SUM(CASE WHEN upper(COALESCE(main_catagory,'')) LIKE 'BC%' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_bc, "
+        "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'OPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_opex, "
+        "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'CAPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_capex "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) "
         "  AND statement_creation_date IS NOT NULL "
-        "  AND (COALESCE(TRIM(main_catagory), '') = '' OR UPPER(TRIM(main_catagory)) NOT LIKE 'BC%') "
         "GROUP BY bucket "
         "ORDER BY bucket";
     if (finance_params[0] || finance_params[1]) {
@@ -7445,7 +7490,7 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
             entry->cb_env_count = cb_env;
             entry->tst_count = tst_visits;
             entry->rp_count = rp_visits;
-            entry->callback_count = cb_emergency + cb_env + rp_visits;
+            entry->callback_count = cb_emergency + cb_env;
             entry->total_count = pm_visits + cb_emergency + cb_env + tst_visits + rp_visits;
         }
     }
@@ -7471,7 +7516,19 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
                 free(state_trim);
                 return NULL;
             }
-            entry->spend_amount = PQgetisnull(finance_res, i, 1) ? 0.0 : strtod(PQgetvalue(finance_res, i, 1), NULL);
+            double spend_total = PQgetisnull(finance_res, i, 1) ? 0.0 : strtod(PQgetvalue(finance_res, i, 1), NULL);
+            double spend_bc = PQgetisnull(finance_res, i, 2) ? 0.0 : strtod(PQgetvalue(finance_res, i, 2), NULL);
+            double spend_opex = PQgetisnull(finance_res, i, 3) ? 0.0 : strtod(PQgetvalue(finance_res, i, 3), NULL);
+            double spend_capex = PQgetisnull(finance_res, i, 4) ? 0.0 : strtod(PQgetvalue(finance_res, i, 4), NULL);
+            double spend_other = spend_total - spend_bc - spend_opex - spend_capex;
+            if (fabs(spend_other) < 0.005) {
+                spend_other = 0.0;
+            }
+            entry->spend_amount = spend_total;
+            entry->spend_bc = spend_bc;
+            entry->spend_opex = spend_opex;
+            entry->spend_capex = spend_capex;
+            entry->spend_other = spend_other;
         }
     }
     if (finance_res) {
@@ -7527,13 +7584,31 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
                     }
                     TimelineEntry *source = timeline_find_entry(original_entries, original_count, label);
                     if (source) {
-                        expanded[idx].pm_count = source->pm_count;
+                    expanded[idx].pm_count = source->pm_count;
+                        expanded[idx].cb_emergency_count = source->cb_emergency_count;
+                        expanded[idx].cb_env_count = source->cb_env_count;
+                        expanded[idx].tst_count = source->tst_count;
+                        expanded[idx].rp_count = source->rp_count;
                         expanded[idx].callback_count = source->callback_count;
+                        expanded[idx].total_count = source->total_count;
                         expanded[idx].spend_amount = source->spend_amount;
+                        expanded[idx].spend_bc = source->spend_bc;
+                        expanded[idx].spend_opex = source->spend_opex;
+                        expanded[idx].spend_capex = source->spend_capex;
+                        expanded[idx].spend_other = source->spend_other;
                     } else {
                         expanded[idx].pm_count = 0;
+                        expanded[idx].cb_emergency_count = 0;
+                        expanded[idx].cb_env_count = 0;
+                        expanded[idx].tst_count = 0;
+                        expanded[idx].rp_count = 0;
                         expanded[idx].callback_count = 0;
+                        expanded[idx].total_count = 0;
                         expanded[idx].spend_amount = 0.0;
+                        expanded[idx].spend_bc = 0.0;
+                        expanded[idx].spend_opex = 0.0;
+                        expanded[idx].spend_capex = 0.0;
+                        expanded[idx].spend_other = 0.0;
                     }
                     month += 1;
                     if (month > 12) {
@@ -7618,6 +7693,14 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
         if (!buffer_appendf(&buf, "%ld", entries[i].callback_count)) goto timeline_oom;
         if (!buffer_append_cstr(&buf, ",\"spend\":")) goto timeline_oom;
         if (!buffer_appendf(&buf, "%.2f", entries[i].spend_amount)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"bc\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%.2f", entries[i].spend_bc)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"opex\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%.2f", entries[i].spend_opex)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"capex\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%.2f", entries[i].spend_capex)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"other\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%.2f", entries[i].spend_other)) goto timeline_oom;
         if (!buffer_append_char(&buf, '}')) goto timeline_oom;
     }
     if (!buffer_append_char(&buf, ']')) goto timeline_oom;

@@ -264,6 +264,10 @@ export interface ServiceSummary {
 export interface FinancialTrendPoint {
   month: string | null;
   spend: number;
+  bc?: number;
+  opex?: number;
+  capex?: number;
+  other?: number;
 }
 
 export interface FinancialSavingsPoint {
@@ -441,6 +445,10 @@ export interface TimelinePoint {
   total?: number;
   callback_visits?: number;
   spend: number;
+  bc?: number;
+  opex?: number;
+  capex?: number;
+  other?: number;
 }
 
 export interface LocationAnalyticsOverview {

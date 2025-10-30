@@ -62,20 +62,23 @@ static int service_activity_code_equals(const char *a, const char *b) {
     if (!a || !b) {
         return 0;
     }
-    size_t la = strlen(a);
-    size_t lb = strlen(b);
-    if (la != lb) {
-        return 0;
-    }
-    for (size_t i = 0; i < la; ++i) {
-        if (toupper((unsigned char)a[i]) != toupper((unsigned char)b[i])) {
+    while (*a && isspace((unsigned char)*a)) ++a;
+    while (*b && isspace((unsigned char)*b)) ++b;
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        if (toupper(ca) != toupper(cb)) {
             return 0;
         }
+        ++a;
+        ++b;
     }
-    return 1;
+    while (*a && isspace((unsigned char)*a)) ++a;
+    while (*b && isspace((unsigned char)*b)) ++b;
+    return *a == '\0' && *b == '\0';
 }
 
-const ServiceActivityInfo *service_activity_lookup(const char *code) {
+static const ServiceActivityInfo *find_activity_entry(const char *code) {
     if (!code || !*code) {
         return NULL;
     }
@@ -85,6 +88,87 @@ const ServiceActivityInfo *service_activity_lookup(const char *code) {
         }
     }
     return NULL;
+}
+
+static void normalize_activity_code(const char *code, char *buffer, size_t buffer_len) {
+    if (!buffer || buffer_len == 0) {
+        return;
+    }
+    buffer[0] = '\0';
+    if (!code) {
+        return;
+    }
+    size_t dst = 0;
+    size_t len = strlen(code);
+    size_t start = 0;
+    while (start < len && isspace((unsigned char)code[start])) {
+        ++start;
+    }
+    size_t end = len;
+    while (end > start && isspace((unsigned char)code[end - 1])) {
+        --end;
+    }
+    for (size_t i = start; i < end && dst + 1 < buffer_len; ++i) {
+        unsigned char ch = (unsigned char)code[i];
+        if (isspace(ch)) {
+            continue;
+        }
+        buffer[dst++] = (char)toupper(ch);
+    }
+    buffer[dst] = '\0';
+}
+
+const ServiceActivityInfo *service_activity_lookup(const char *code) {
+    if (!code || !*code) {
+        return NULL;
+    }
+    char normalized[32];
+    normalize_activity_code(code, normalized, sizeof(normalized));
+    if (normalized[0] == '\0') {
+        return NULL;
+    }
+    const ServiceActivityInfo *direct = find_activity_entry(normalized);
+    if (direct) {
+        return direct;
+    }
+
+    if (strncmp(normalized, "PM", 2) == 0) {
+        return find_activity_entry("PM");
+    }
+    if (strncmp(normalized, "TST-FL", 6) == 0) {
+        return find_activity_entry("TST-FL");
+    }
+    if (strncmp(normalized, "TST", 3) == 0) {
+        return find_activity_entry("TST");
+    }
+    if (strncmp(normalized, "CB-EMG", 6) == 0) {
+        return find_activity_entry("CB-EMG");
+    }
+    if (strncmp(normalized, "CB-EF", 5) == 0) {
+        return find_activity_entry("CB-EF");
+    }
+    if (strncmp(normalized, "CB-ENV", 6) == 0) {
+        return find_activity_entry("CB-ENV");
+    }
+    if (strncmp(normalized, "CB-", 3) == 0) {
+        return find_activity_entry("CB-MISC");
+    }
+    if (strncmp(normalized, "RP", 2) == 0) {
+        return find_activity_entry("RP");
+    }
+    if (strncmp(normalized, "RS", 2) == 0) {
+        return find_activity_entry("RS");
+    }
+    if (strncmp(normalized, "SV", 2) == 0) {
+        return find_activity_entry("SV");
+    }
+    if (strncmp(normalized, "STBY", 4) == 0) {
+        return find_activity_entry("STBY");
+    }
+    if (strncmp(normalized, "NDE", 3) == 0) {
+        return find_activity_entry("NDE");
+    }
+    return find_activity_entry("NDE");
 }
 
 const char *service_activity_category_name(ServiceActivityCategory category) {
@@ -124,4 +208,3 @@ const char *service_activity_category_short(ServiceActivityCategory category) {
         default: return "Unclassified";
     }
 }
-

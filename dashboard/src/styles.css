@@ -1277,6 +1277,22 @@ tbody tr:hover {
   background: #6b7280;
 }
 
+.legend-swatch--finance-bc {
+  background: #94a3b8;
+}
+
+.legend-swatch--finance-opex {
+  background: #f97316;
+}
+
+.legend-swatch--finance-capex {
+  background: #14b8a6;
+}
+
+.legend-swatch--finance-other {
+  background: #22c55e;
+}
+
 .legend-line {
   display: inline-block;
   width: 26px;
@@ -1311,13 +1327,30 @@ tbody tr:hover {
   color: var(--text-subtle);
 }
 
+
 .timeline-bars-stack {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 0.7rem;
+  width: 100%;
+  height: 100%;
+}
+
+.timeline-stack {
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
-  gap: 2px;
-  width: 100%;
+  gap: 3px;
   height: 100%;
+}
+
+.timeline-stack--service {
+  width: 22px;
+}
+
+.timeline-stack--finance {
+  width: 16px;
 }
 
 .timeline-bar {
@@ -1351,19 +1384,36 @@ tbody tr:hover {
   background: #6b7280;
 }
 
+.timeline-bar--finance-bc,
+.trend-segment--finance-bc {
+  background: #94a3b8;
+}
+
+.timeline-bar--finance-opex,
+.trend-segment--finance-opex {
+  background: #f97316;
+}
+
+.timeline-bar--finance-capex,
+.trend-segment--finance-capex {
+  background: #14b8a6;
+}
+
+.timeline-bar--finance-other,
+.trend-segment--finance-other {
+  background: #22c55e;
+}
+
 .trend-segment--other {
   background: #cbd5e1;
 }
-
-.timeline-bar + .timeline-bar {
-  border-radius: 4px;
-}
-
-.timeline-bars-stack .timeline-bar:first-child {
+.timeline-stack--service .timeline-bar:first-child,
+.timeline-stack--finance .timeline-bar:first-child {
   border-radius: 4px 4px 0 0;
 }
 
-.timeline-bars-stack .timeline-bar:last-child {
+.timeline-stack--service .timeline-bar:last-child,
+.timeline-stack--finance .timeline-bar:last-child {
   border-radius: 0 0 4px 4px;
 }
 
@@ -1883,14 +1933,6 @@ tbody tr:hover {
   flex-direction: column;
   gap: 0.75rem;
   margin: 1.5rem 0;
-}
-
-.status-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 0.2rem;
-  font-size: 0.8rem;
-  color: var(--text-subtle);
 }
 
 .coverage-cell {
