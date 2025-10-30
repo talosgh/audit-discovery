@@ -884,10 +884,11 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
         }
       }
     });
+    const preferredEndIndex = lastServiceIndex >= 0 ? lastServiceIndex : lastFinanceIndex;
     const lastActiveIndex = Math.max(lastServiceIndex, lastFinanceIndex);
-    let targetIndex = lastActiveIndex >= 0 ? Math.max(lastActiveIndex - windowSize + 1, 0) : 0;
-    if (firstActiveIndex >= 0 && lastActiveIndex >= firstActiveIndex) {
-      const activeRange = lastActiveIndex - firstActiveIndex + 1;
+    let targetIndex = preferredEndIndex >= 0 ? Math.max(preferredEndIndex - windowSize + 1, 0) : 0;
+    if (firstActiveIndex >= 0 && preferredEndIndex >= firstActiveIndex) {
+      const activeRange = preferredEndIndex - firstActiveIndex + 1;
       if (activeRange <= windowSize) {
         const slack = windowSize - activeRange;
         targetIndex = Math.max(firstActiveIndex - Math.floor(slack / 2), 0);
