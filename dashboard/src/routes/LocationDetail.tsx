@@ -642,17 +642,34 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     other: 'Other spend'
   } as const;
 
+  const showService = createMemo(() => timelineHasService());
+  const showFinance = createMemo(() => timelineHasFinancial());
+
   const timelineGeometry = createMemo(() => {
     const data = timelineData();
     const maxSpend = timelineMaxSpend();
     const maxVisits = timelineMaxVisits();
-    const financePresence = timelineHasFinancial();
+    const financePresence = showFinance();
     const columnWidth = 70;
     const columnGap = 26;
     const baseHeight = maxVisits * 28;
     const financeHeight = financePresence && maxSpend > 0 ? 220 : 0;
     const chartHeight = Math.min(360, Math.max(160, Math.max(baseHeight, financeHeight)));
     const segments: string[] = [];
+    const financeSegments = {
+      total: [] as string[],
+      bc: [] as string[],
+      opex: [] as string[],
+      capex: [] as string[],
+      other: [] as string[]
+    };
+    const financeActive = {
+      total: false,
+      bc: false,
+      opex: false,
+      capex: false,
+      other: false
+    };
     const points: Array<{ x: number; y: number; spend: number }> = [];
     data.forEach((point, index) => {
       const spendValue = point.spend ?? 0;
@@ -661,6 +678,26 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       const y = chartHeight - ratio * chartHeight;
       segments.push(`${index === 0 ? 'M' : 'L'}${x},${y.toFixed(2)}`);
       points.push({ x, y, spend: spendValue });
+
+      const bcValue = point.bc ?? 0;
+      const opexValue = point.opex ?? 0;
+      const capexValue = point.capex ?? 0;
+      const otherValue = point.other ?? 0;
+
+      const pushFinance = (type: keyof typeof financeSegments, value: number) => {
+        const ratioValue = maxSpend > 0 ? Math.min(1, value / maxSpend) : 0;
+        const yValue = chartHeight - ratioValue * chartHeight;
+        financeSegments[type].push(`${index === 0 ? 'M' : 'L'}${x},${yValue.toFixed(2)}`);
+        if (value > 0) {
+          financeActive[type] = true;
+        }
+      };
+
+      pushFinance('total', spendValue);
+      pushFinance('bc', bcValue);
+      pushFinance('opex', opexValue);
+      pushFinance('capex', capexValue);
+      pushFinance('other', otherValue);
     });
     return {
       width: Math.max(data.length > 0 ? columnWidth * data.length + columnGap * Math.max(data.length - 1, 0) : columnWidth, columnWidth),
@@ -668,6 +705,14 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       columnWidth,
       columnGap,
       path: segments.join(' '),
+      financePaths: {
+        total: financeSegments.total.join(' '),
+        bc: financeSegments.bc.join(' '),
+        opex: financeSegments.opex.join(' '),
+        capex: financeSegments.capex.join(' '),
+        other: financeSegments.other.join(' ')
+      },
+      financeActive,
       points
     };
   });
@@ -935,7 +980,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
               </div>
             </section>
 
-            <Show when={timelineHasService() || timelineHasFinancial()}>
+            <Show when={showService() || showFinance()}>
               <section class="timeline-card" aria-labelledby="timeline-title">
                 <header class="timeline-header">
                   <h2 id="timeline-title">Service &amp; Spend Timeline</h2>
@@ -950,14 +995,14 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                     return (
                       <>
                         <div class="timeline-legend">
-                          <Show when={timelineHasService()}>
+                          <Show when={showService()}>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> {serviceSegmentLabels.pm}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--cb-emergency" /> {serviceSegmentLabels.cbEmergency}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--cb-env" /> {serviceSegmentLabels.cbEnv}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--tst" /> {serviceSegmentLabels.tst}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--rp" /> {serviceSegmentLabels.rp}</span>
                           </Show>
-                          <Show when={timelineHasFinancial()}>
+                          <Show when={showFinance()}>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--finance-bc" /> {financialSegmentLabels.bc}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--finance-opex" /> {financialSegmentLabels.opex}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--finance-capex" /> {financialSegmentLabels.capex}</span>
@@ -967,7 +1012,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                         </div>
                         <div class="timeline-chart" role="img" aria-label="Timeline of service visits and spend">
                           <div class="timeline-content" style={{ width: `${geometry.width}px` }}>
-                            <Show when={timelineHasService()}>
+                            <Show when={showService() || showFinance()}>
                               <div class="timeline-bars" style={{ height: `${geometry.height}px` }}>
                                 <For each={data}>
                                   {(entry) => {
@@ -1011,17 +1056,19 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                                     return (
                                       <div class="timeline-column" style={{ width: `${geometry.columnWidth}px` }} title={columnTitle}>
                                         <div class="timeline-bars-stack">
-                                          <div class="timeline-stack timeline-stack--service" aria-hidden="true">
-                                            <For each={serviceSegments}>
-                                              {(segment) => {
-                                                if (segment.value <= 0) return null;
-                                                const segmentHeight = maxVisits > 0 ? Math.min(100, (segment.value / maxVisits) * 100) : 0;
-                                                return <div class={`timeline-bar ${segment.className}`} style={{ height: `${segmentHeight}%` }} />;
-                                              }}
-                                            </For>
-                                          </div>
-                                          <Show when={timelineHasFinancial()}>
-                                            <div class="timeline-stack timeline-stack--finance" aria-hidden="true">
+                                          <Show when={showService()}>
+                                            <div class="timeline-stack timeline-stack--service" aria-hidden="true">
+                                              <For each={serviceSegments}>
+                                                {(segment) => {
+                                                  if (segment.value <= 0) return null;
+                                                  const segmentHeight = maxVisits > 0 ? Math.min(100, (segment.value / maxVisits) * 100) : 0;
+                                                  return <div class={`timeline-bar ${segment.className}`} style={{ height: `${segmentHeight}%` }} />;
+                                                }}
+                                              </For>
+                                            </div>
+                                          </Show>
+                                          <Show when={showFinance()}>
+                                            <div class={`timeline-stack timeline-stack--finance${showService() ? '' : ' timeline-stack--finance-only'}`} aria-hidden="true">
                                               <For each={financeSegments}>
                                                 {(segment) => {
                                                   if (segment.value <= 0 || maxSpend <= 0) return null;
@@ -1039,7 +1086,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                                 </For>
                               </div>
                             </Show>
-                            <Show when={timelineHasFinancial()}>
+                            <Show when={showFinance()}>
                               <svg
                                 class="timeline-svg"
                                 width={geometry.width}
@@ -1048,7 +1095,19 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                                 preserveAspectRatio="none"
                                 aria-hidden="true"
                               >
-                                <path class="timeline-line" d={geometry.path.length > 0 ? geometry.path : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
+                                <path class="timeline-line timeline-line--total" d={geometry.path.length > 0 ? geometry.path : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
+                                <Show when={geometry.financeActive.bc}>
+                                  <path class="timeline-line timeline-line--bc" d={geometry.financePaths.bc.length > 0 ? geometry.financePaths.bc : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
+                                </Show>
+                                <Show when={geometry.financeActive.opex}>
+                                  <path class="timeline-line timeline-line--opex" d={geometry.financePaths.opex.length > 0 ? geometry.financePaths.opex : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
+                                </Show>
+                                <Show when={geometry.financeActive.capex}>
+                                  <path class="timeline-line timeline-line--capex" d={geometry.financePaths.capex.length > 0 ? geometry.financePaths.capex : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
+                                </Show>
+                                <Show when={geometry.financeActive.other}>
+                                  <path class="timeline-line timeline-line--other" d={geometry.financePaths.other.length > 0 ? geometry.financePaths.other : `M0,${geometry.height} L${geometry.width},${geometry.height}`} />
+                                </Show>
                                 <For each={geometry.points}>
                                   {(point) => (
                                     <circle class="timeline-dot" cx={point.x} cy={point.y} r={4} />

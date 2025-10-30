@@ -1353,6 +1353,10 @@ tbody tr:hover {
   width: 16px;
 }
 
+.timeline-stack--finance-only {
+  width: 22px;
+}
+
 .timeline-bar {
   width: 100%;
   border-radius: 4px;
@@ -1429,10 +1433,31 @@ tbody tr:hover {
 }
 
 .timeline-line {
-  stroke: #14b8a6;
-  stroke-width: 3;
+  stroke-width: 2;
   fill: none;
   opacity: 0.85;
+}
+
+.timeline-line--total {
+  stroke: #14b8a6;
+  stroke-width: 3;
+}
+
+.timeline-line--bc {
+  stroke: #94a3b8;
+}
+
+.timeline-line--opex {
+  stroke: #f97316;
+}
+
+.timeline-line--capex {
+  stroke: #0ea5e9;
+}
+
+.timeline-line--other {
+  stroke: #22c55e;
+  stroke-dasharray: 6 4;
 }
 
 .timeline-dot {
