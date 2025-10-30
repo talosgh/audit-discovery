@@ -274,6 +274,24 @@ typedef struct {
     int sample_count;
 } TimelineStats;
 
+static bool timeline_json_has_entries(const char *json) {
+    if (!json) {
+        return false;
+    }
+    const unsigned char *p = (const unsigned char *)json;
+    while (*p && isspace(*p)) {
+        ++p;
+    }
+    if (*p != '[') {
+        return false;
+    }
+    ++p;
+    while (*p && isspace(*p)) {
+        ++p;
+    }
+    return *p && *p != ']';
+}
+
 typedef struct {
     char *month;
     long pm_count;
@@ -7790,8 +7808,9 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
     bool deficiencies_available = report->summary.audit_count > 0;
     bool service_available = service_stats && service_stats->has_records;
     bool financial_available = financial_stats && financial_stats->has_records;
-    bool service_available_timeline = service_available || timeline_has_service;
-    bool financial_available_timeline = financial_available || timeline_has_financial;
+    bool timeline_has_entries = timeline_json_has_entries(timeline_json);
+    bool service_available_timeline = service_available || timeline_has_service || timeline_has_entries;
+    bool financial_available_timeline = financial_available || timeline_has_financial || timeline_has_entries;
 
     int total_deficiencies = report->summary.total_deficiencies;
     double avg_per_device = (device_count > 0) ? report->summary.average_deficiencies_per_device : NAN;
@@ -8141,7 +8160,7 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
 
     if (!buffer_append_char(&buf, '}')) goto oom;
 
-    if (timeline_has_service || timeline_has_financial) {
+    if (timeline_has_entries || timeline_has_service || timeline_has_financial) {
         if (!buffer_append_cstr(&buf, ",\"timeline\":{")) goto oom;
         if (!buffer_append_cstr(&buf, "\"data\":")) goto oom;
         if (timeline_json && timeline_json[0]) {
@@ -8151,10 +8170,10 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
         }
         if (!buffer_append_char(&buf, ',')) goto oom;
         if (!buffer_append_cstr(&buf, "\"has_service\":")) goto oom;
-        if (!buffer_append_cstr(&buf, timeline_has_service ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, (timeline_has_service || timeline_has_entries) ? "true" : "false")) goto oom;
         if (!buffer_append_char(&buf, ',')) goto oom;
         if (!buffer_append_cstr(&buf, "\"has_financial\":")) goto oom;
-        if (!buffer_append_cstr(&buf, timeline_has_financial ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, (timeline_has_financial || timeline_has_entries) ? "true" : "false")) goto oom;
         if (!buffer_append_char(&buf, '}')) goto oom;
     }
 
