@@ -1236,10 +1236,22 @@ tbody tr:hover {
 
 .timeline-legend {
   display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 1.5rem;
+  flex-direction: column;
+  gap: 0.55rem;
   margin-top: 1rem;
+}
+
+.timeline-legend-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+}
+
+.legend-heading {
+  font-weight: 600;
+  color: var(--text-strong);
+  letter-spacing: 0.01em;
 }
 
 .legend-item {

@@ -1180,24 +1180,32 @@ const showFinance = createMemo(() => hasFinanceData());
                     const maxSpend = timelineMaxSpend();
                     return (
                       <>
-                        <div class="timeline-legend">
-                          <Show when={showService()}>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> {serviceSegmentLabels.pm}</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-emergency" /> {serviceSegmentLabels.cbEmergency}</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-env" /> {serviceSegmentLabels.cbEnv}</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-other" /> {serviceSegmentLabels.cbOther}</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--tst" /> {serviceSegmentLabels.tst}</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--rp" /> {serviceSegmentLabels.rp}</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--misc" /> {serviceSegmentLabels.misc}</span>
-                          </Show>
-                          <Show when={showFinance()}>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--finance-bc" /> {financialSegmentLabels.bc}</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--finance-opex" /> {financialSegmentLabels.opex}</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--finance-capex" /> {financialSegmentLabels.capex}</span>
-                            <span class="legend-item"><span class="legend-swatch legend-swatch--finance-other" /> {financialSegmentLabels.other}</span>
-                            <span class="legend-item"><span class="legend-line" /> Total spend</span>
-                          </Show>
-                        </div>
+                        <Show when={showService() || showFinance()}>
+                          <div class="timeline-legend">
+                            <Show when={showService()}>
+                              <div class="timeline-legend-row" aria-label="Service legend">
+                                <span class="legend-item legend-heading">Service</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> {serviceSegmentLabels.pm}</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--cb-emergency" /> {serviceSegmentLabels.cbEmergency}</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--cb-env" /> {serviceSegmentLabels.cbEnv}</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--cb-other" /> {serviceSegmentLabels.cbOther}</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--tst" /> {serviceSegmentLabels.tst}</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--rp" /> {serviceSegmentLabels.rp}</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--misc" /> {serviceSegmentLabels.misc}</span>
+                              </div>
+                            </Show>
+                            <Show when={showFinance()}>
+                              <div class="timeline-legend-row" aria-label="Financial legend">
+                                <span class="legend-item legend-heading">Financial</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--finance-bc" /> {financialSegmentLabels.bc}</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--finance-opex" /> {financialSegmentLabels.opex}</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--finance-capex" /> {financialSegmentLabels.capex}</span>
+                                <span class="legend-item"><span class="legend-swatch legend-swatch--finance-other" /> {financialSegmentLabels.other}</span>
+                                <span class="legend-item"><span class="legend-line" /> Total spend</span>
+                              </div>
+                            </Show>
+                          </div>
+                        </Show>
                         <div
                           class="timeline-chart"
                           role="img"
