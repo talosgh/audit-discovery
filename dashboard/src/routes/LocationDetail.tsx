@@ -1361,18 +1361,7 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                                               </For>
                                             </div>
                                           </Show>
-                                          <Show when={showFinance()}>
-                                            <div class={`timeline-stack timeline-stack--finance${showService() ? '' : ' timeline-stack--finance-only'}`} aria-hidden="true">
-                                              <For each={financeSegments}>
-                                                {(segment) => {
-                                                  if (segment.value <= 0 || maxSpend <= 0) return null;
-                                                  const rawHeight = (segment.value / maxSpend) * 100;
-                                                  const segmentHeight = rawHeight > 0 ? Math.max(4, Math.min(100, rawHeight)) : 0;
-                                                  return <div class={`timeline-bar ${segment.className}`} style={{ height: `${segmentHeight}%` }} />;
-                                                }}
-                                              </For>
-                                            </div>
-                                          </Show>
+                                          {/* Financial bars intentionally omitted; spend is shown via overlay lines. */}
                                         </div>
                                         <span class="timeline-month">{formatMonthLabel(entry.month)}</span>
                                       </div>
