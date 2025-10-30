@@ -141,6 +141,15 @@ const App = () => {
       <header class="app-header">
         <button type="button" class="brand" onClick={navigateToList} aria-label="Citywide Elevator Operations">
           <img src="/citywide.png" alt="Citywide Elevator Operations" />
+          <span class="brand-savings">
+            <Show when={globalSavings() != null} fallback={<span>Client savings: <strong>Calculating…</strong></span>}>
+              {(value) => (
+                <span>
+                  Client savings: <strong>{formatCurrency(value())}</strong>
+                </span>
+              )}
+            </Show>
+          </span>
         </button>
         <div class="header-right">
           <nav class="nav-links">
@@ -155,11 +164,6 @@ const App = () => {
               )}
             </Show>
           </nav>
-          <div class="header-metrics">
-            <Show when={globalSavings() != null} fallback={<span>Tracking savings…</span>}>
-              {(value) => <span>Client savings: <strong>{formatCurrency(value())}</strong></span>}
-            </Show>
-          </div>
         </div>
       </header>
       <main class="app-main">

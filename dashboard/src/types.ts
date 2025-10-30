@@ -269,7 +269,21 @@ export interface FinancialSavingsPoint {
 export interface FinancialBreakdownItem {
   category?: string | null;
   status?: string | null;
+  classification?: string | null;
+  type?: string | null;
   spend: number;
+}
+
+export interface FinancialVendorBreakdown {
+  vendor_id?: string | null;
+  vendor_name: string;
+  spend: number;
+}
+
+export interface FinancialWorkSummaryItem {
+  description: string;
+  spend: number;
+  records: number;
 }
 
 export interface FinancialSummary {
@@ -282,6 +296,10 @@ export interface FinancialSummary {
   monthly_trend: FinancialTrendPoint[];
   category_breakdown: FinancialBreakdownItem[];
   status_breakdown: FinancialBreakdownItem[];
+  classification_breakdown: FinancialBreakdownItem[];
+  type_breakdown: FinancialBreakdownItem[];
+  vendor_breakdown: FinancialVendorBreakdown[];
+  work_summary: FinancialWorkSummaryItem[];
   total_savings: number;
   savings_rate: number;
   monthly_savings: FinancialSavingsPoint[];

@@ -58,13 +58,10 @@ body {
   background: none;
   border: none;
   display: inline-flex;
-  align-items: center;
-  gap: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.4rem;
   padding: 0;
-  font-size: 1.1rem;
-  font-weight: 600;
-  color: var(--text-strong);
-  text-decoration: none;
   cursor: pointer;
 }
 
@@ -73,6 +70,17 @@ body {
   width: auto;
   border-radius: 0;
   box-shadow: none;
+}
+
+.brand-savings {
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+}
+
+.brand-savings strong {
+  color: var(--accent);
 }
 
 .header-right {
@@ -100,23 +108,6 @@ body {
 .nav-links button.active {
   background: rgba(70, 166, 180, 0.14);
   color: var(--accent);
-}
-
-.header-metrics {
-  font-size: 0.95rem;
-  font-weight: 600;
-  color: var(--text-strong);
-  white-space: nowrap;
-}
-
-.header-metrics span {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.35rem;
-}
-
-.header-metrics strong {
-  color: #0284c7;
 }
 
 .app-main {

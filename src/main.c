@@ -6726,6 +6726,107 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         return NULL;
     }
 
+    const char *sql_classification =
+        "SELECT COALESCE(NULLIF(classification, ''), 'Unclassified') AS classification, "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
+        "FROM financial_data "
+        "WHERE location_id = COALESCE($1::int, $2::int) "
+        "GROUP BY classification "
+        "ORDER BY spend DESC "
+        "LIMIT 6";
+    PGresult *classification_res = PQexecParams(conn, sql_classification, 2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(classification_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(classification_res);
+            *error_out = strdup(msg ? msg : "Failed to load financial classifications");
+        }
+        PQclear(classification_res);
+        PQclear(savings_res);
+        PQclear(status_res);
+        PQclear(category_res);
+        PQclear(trend_res);
+        free(last_statement);
+        return NULL;
+    }
+
+    const char *sql_type =
+        "SELECT COALESCE(NULLIF(type, ''), 'Unspecified') AS record_type, "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
+        "FROM financial_data "
+        "WHERE location_id = COALESCE($1::int, $2::int) "
+        "GROUP BY record_type "
+        "ORDER BY spend DESC "
+        "LIMIT 6";
+    PGresult *type_res = PQexecParams(conn, sql_type, 2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(type_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(type_res);
+            *error_out = strdup(msg ? msg : "Failed to load financial types");
+        }
+        PQclear(type_res);
+        PQclear(classification_res);
+        PQclear(savings_res);
+        PQclear(status_res);
+        PQclear(category_res);
+        PQclear(trend_res);
+        free(last_statement);
+        return NULL;
+    }
+
+    const char *sql_vendor =
+        "SELECT fd.vendor_id, "
+        "       COALESCE(NULLIF(v.vendor, ''), 'Unknown vendor') AS vendor_name, "
+        "       COALESCE(SUM(COALESCE(fd.new_cost,0)),0)::numeric AS spend "
+        "FROM financial_data fd "
+        "LEFT JOIN vendors v ON v.vendor_id = fd.vendor_id "
+        "WHERE fd.location_id = COALESCE($1::int, $2::int) "
+        "GROUP BY fd.vendor_id, vendor_name "
+        "ORDER BY spend DESC "
+        "LIMIT 6";
+    PGresult *vendor_res = PQexecParams(conn, sql_vendor, 2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(vendor_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(vendor_res);
+            *error_out = strdup(msg ? msg : "Failed to load financial vendors");
+        }
+        PQclear(vendor_res);
+        PQclear(type_res);
+        PQclear(classification_res);
+        PQclear(savings_res);
+        PQclear(status_res);
+        PQclear(category_res);
+        PQclear(trend_res);
+        free(last_statement);
+        return NULL;
+    }
+
+    const char *sql_work =
+        "SELECT COALESCE(NULLIF(work_stated, ''), 'Unspecified work') AS summary, "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend, "
+        "       COUNT(*)::bigint AS records "
+        "FROM financial_data "
+        "WHERE location_id = COALESCE($1::int, $2::int) "
+        "GROUP BY summary "
+        "ORDER BY spend DESC "
+        "LIMIT 6";
+    PGresult *work_res = PQexecParams(conn, sql_work, 2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(work_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(work_res);
+            *error_out = strdup(msg ? msg : "Failed to load work summaries");
+        }
+        PQclear(work_res);
+        PQclear(vendor_res);
+        PQclear(type_res);
+        PQclear(classification_res);
+        PQclear(savings_res);
+        PQclear(status_res);
+        PQclear(category_res);
+        PQclear(trend_res);
+        free(last_statement);
+        return NULL;
+    }
+
     Buffer buf;
     if (!buffer_init(&buf)) {
         if (error_out && !*error_out) {
@@ -6735,6 +6836,10 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         PQclear(status_res);
         PQclear(category_res);
         PQclear(trend_res);
+        PQclear(classification_res);
+        PQclear(type_res);
+        PQclear(vendor_res);
+        PQclear(work_res);
         free(last_statement);
         return NULL;
     }
@@ -6796,6 +6901,77 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         if (!buffer_appendf(&buf, "%.2f", spend)) goto fin_oom;
         if (!buffer_append_char(&buf, '}')) goto fin_oom;
         if (i > 0 && !buffer_append_char(&buf, ',')) goto fin_oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto fin_oom;
+    if (!buffer_append_char(&buf, ',')) goto fin_oom;
+
+    if (!buffer_append_cstr(&buf, "\"classification_breakdown\":[")) goto fin_oom;
+    int classification_rows = PQntuples(classification_res);
+    for (int i = 0; i < classification_rows; ++i) {
+        if (!buffer_append_char(&buf, '{')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"classification\":")) goto fin_oom;
+        if (!buffer_append_json_string(&buf, PQgetisnull(classification_res, i, 0) ? NULL : PQgetvalue(classification_res, i, 0))) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"spend\":")) goto fin_oom;
+        double spend = PQgetisnull(classification_res, i, 1) ? 0.0 : strtod(PQgetvalue(classification_res, i, 1), NULL);
+        if (!buffer_appendf(&buf, "%.2f", spend)) goto fin_oom;
+        if (!buffer_append_char(&buf, '}')) goto fin_oom;
+        if (i + 1 < classification_rows && !buffer_append_char(&buf, ',')) goto fin_oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto fin_oom;
+    if (!buffer_append_char(&buf, ',')) goto fin_oom;
+
+    if (!buffer_append_cstr(&buf, "\"type_breakdown\":[")) goto fin_oom;
+    int type_rows = PQntuples(type_res);
+    for (int i = 0; i < type_rows; ++i) {
+        if (!buffer_append_char(&buf, '{')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"type\":")) goto fin_oom;
+        if (!buffer_append_json_string(&buf, PQgetisnull(type_res, i, 0) ? NULL : PQgetvalue(type_res, i, 0))) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"spend\":")) goto fin_oom;
+        double spend = PQgetisnull(type_res, i, 1) ? 0.0 : strtod(PQgetvalue(type_res, i, 1), NULL);
+        if (!buffer_appendf(&buf, "%.2f", spend)) goto fin_oom;
+        if (!buffer_append_char(&buf, '}')) goto fin_oom;
+        if (i + 1 < type_rows && !buffer_append_char(&buf, ',')) goto fin_oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto fin_oom;
+    if (!buffer_append_char(&buf, ',')) goto fin_oom;
+
+    if (!buffer_append_cstr(&buf, "\"vendor_breakdown\":[")) goto fin_oom;
+    int vendor_rows = PQntuples(vendor_res);
+    for (int i = 0; i < vendor_rows; ++i) {
+        if (!buffer_append_char(&buf, '{')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"vendor_id\":")) goto fin_oom;
+        if (!buffer_append_json_string(&buf, PQgetisnull(vendor_res, i, 0) ? NULL : PQgetvalue(vendor_res, i, 0))) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"vendor_name\":")) goto fin_oom;
+        if (!buffer_append_json_string(&buf, PQgetisnull(vendor_res, i, 1) ? NULL : PQgetvalue(vendor_res, i, 1))) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"spend\":")) goto fin_oom;
+        double spend = PQgetisnull(vendor_res, i, 2) ? 0.0 : strtod(PQgetvalue(vendor_res, i, 2), NULL);
+        if (!buffer_appendf(&buf, "%.2f", spend)) goto fin_oom;
+        if (!buffer_append_char(&buf, '}')) goto fin_oom;
+        if (i + 1 < vendor_rows && !buffer_append_char(&buf, ',')) goto fin_oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto fin_oom;
+    if (!buffer_append_char(&buf, ',')) goto fin_oom;
+
+    if (!buffer_append_cstr(&buf, "\"work_summary\":[")) goto fin_oom;
+    int work_rows = PQntuples(work_res);
+    for (int i = 0; i < work_rows; ++i) {
+        if (!buffer_append_char(&buf, '{')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"description\":")) goto fin_oom;
+        if (!buffer_append_json_string(&buf, PQgetisnull(work_res, i, 0) ? NULL : PQgetvalue(work_res, i, 0))) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"spend\":")) goto fin_oom;
+        double spend = PQgetisnull(work_res, i, 1) ? 0.0 : strtod(PQgetvalue(work_res, i, 1), NULL);
+        if (!buffer_appendf(&buf, "%.2f", spend)) goto fin_oom;
+        if (!buffer_append_char(&buf, ',')) goto fin_oom;
+        if (!buffer_append_cstr(&buf, "\"records\":")) goto fin_oom;
+        long records = PQgetisnull(work_res, i, 2) ? 0 : strtol(PQgetvalue(work_res, i, 2), NULL, 10);
+        if (!buffer_appendf(&buf, "%ld", records)) goto fin_oom;
+        if (!buffer_append_char(&buf, '}')) goto fin_oom;
+        if (i + 1 < work_rows && !buffer_append_char(&buf, ',')) goto fin_oom;
     }
     if (!buffer_append_char(&buf, ']')) goto fin_oom;
     if (!buffer_append_char(&buf, ',')) goto fin_oom;
@@ -6891,6 +7067,10 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
     PQclear(status_res);
     PQclear(category_res);
     PQclear(trend_res);
+    PQclear(classification_res);
+    PQclear(type_res);
+    PQclear(vendor_res);
+    PQclear(work_res);
     free(last_statement);
     return buf.data;
 
@@ -6903,6 +7083,10 @@ fin_oom:
     PQclear(status_res);
     PQclear(category_res);
     PQclear(trend_res);
+    PQclear(classification_res);
+    PQclear(type_res);
+    PQclear(vendor_res);
+    PQclear(work_res);
     free(last_statement);
     return NULL;
 }
@@ -7494,6 +7678,13 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
     if (!buffer_append_cstr(&buf, "\"total_spend\":")) goto oom;
     if (financial_available) {
         if (!buffer_appendf(&buf, "%.2f", financial_total_spend)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"proposed_spend\":")) goto oom;
+    if (financial_available) {
+        if (!buffer_appendf(&buf, "%.2f", financial_proposed)) goto oom;
     } else {
         if (!buffer_append_cstr(&buf, "null")) goto oom;
     }

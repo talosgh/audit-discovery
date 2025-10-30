@@ -518,8 +518,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     return entries.sort((a, b) => b[1] - a[1]).slice(0, 5);
   });
 
-  const formatCurrency = (value: number | null | undefined) => {
-    const numeric = typeof value === 'number' ? value : 0;
+  const formatCurrency = (value: number | string | null | undefined) => {
+    if (value === null || value === undefined) return '—';
+    const numeric = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(numeric)) return '—';
     return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(numeric);
   };
 
@@ -582,6 +584,12 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const negotiatedSavings = createMemo(() => financialTotals().savings ?? totalSavings());
   const savingsDeltaGap = createMemo(() => Math.abs((proposedTotal() - approvedTotal()) - negotiatedSavings()));
   const serviceCorrelation = createMemo(() => financialAnalyticsSection()?.service_correlation ?? null);
+  const financialClassifications = createMemo(() => financialSummary()?.classification_breakdown ?? []);
+  const financialTypes = createMemo(() => financialSummary()?.type_breakdown ?? []);
+  const financialVendors = createMemo(() => financialSummary()?.vendor_breakdown ?? []);
+  const financialWorkSummary = createMemo(() => financialSummary()?.work_summary ?? []);
+  const classificationTotal = createMemo(() => financialClassifications().reduce((sum, item) => sum + (item.spend ?? 0), 0));
+  const typeTotal = createMemo(() => financialTypes().reduce((sum, item) => sum + (item.spend ?? 0), 0));
 
   const timeline = createMemo(() => analytics()?.timeline);
   const timelineData = createMemo(() => timeline()?.data ?? []);
@@ -664,6 +672,12 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     const label = trend.direction === 'up' ? 'Rising' : 'Declining';
     const change = trend.percent_change != null ? `${trend.percent_change.toFixed(1)}%` : '';
     return change ? `${label} (${change})` : label;
+  };
+  const formatShare = (value: number, total: number) => {
+    if (!total || !Number.isFinite(total) || total <= 0) return '—';
+    const ratio = (value / total) * 100;
+    if (!Number.isFinite(ratio)) return '—';
+    return `${ratio.toFixed(1)}%`;
   };
 
   const analyticsMetrics = createMemo(() => {
@@ -1890,6 +1904,36 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                   </div>
                   <div class="detail-columns">
                     <div class="insight-card">
+                      <h3>By classification</h3>
+                      <Show when={financialClassifications().length > 0} fallback={<p class="muted">No classification data.</p>}>
+                        <ul class="analytics-list">
+                          <For each={financialClassifications()}>
+                            {(item) => (
+                              <li>
+                                <span class="list-primary">{item.classification ?? 'Unclassified'}</span>
+                                <span class="list-secondary">{formatCurrency(item.spend)} · {formatShare(item.spend ?? 0, classificationTotal() || actualSpend() || 0)}</span>
+                              </li>
+                            )}
+                          </For>
+                        </ul>
+                      </Show>
+                    </div>
+                    <div class="insight-card">
+                      <h3>By record type</h3>
+                      <Show when={financialTypes().length > 0} fallback={<p class="muted">No type data.</p>}>
+                        <ul class="analytics-list">
+                          <For each={financialTypes()}>
+                            {(item) => (
+                              <li>
+                                <span class="list-primary">{item.type ?? 'Unspecified'}</span>
+                                <span class="list-secondary">{formatCurrency(item.spend)} · {formatShare(item.spend ?? 0, typeTotal() || actualSpend() || 0)}</span>
+                              </li>
+                            )}
+                          </For>
+                        </ul>
+                      </Show>
+                    </div>
+                    <div class="insight-card">
                       <h3>Spend by category</h3>
                       <Show when={financialSummary()?.category_breakdown?.length} fallback={<p class="muted">No category data.</p>}>
                         <ul class="analytics-list">
@@ -1897,7 +1941,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                             {(item) => (
                               <li>
                                 <span class="list-primary">{item.category ?? 'Uncategorized'}</span>
-                                <span class="list-secondary">{formatCurrency(item.spend)}</span>
+                                <span class="list-secondary">{formatCurrency(item.spend)} · {formatShare(item.spend ?? 0, actualSpend() || 0)}</span>
                               </li>
                             )}
                           </For>
@@ -1912,7 +1956,39 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                             {(item) => (
                               <li>
                                 <span class="list-primary">{item.status ?? 'Unknown'}</span>
+                                <span class="list-secondary">{formatCurrency(item.spend)} · {formatShare(item.spend ?? 0, actualSpend() || 0)}</span>
+                              </li>
+                            )}
+                          </For>
+                        </ul>
+                      </Show>
+                    </div>
+                  </div>
+                  <div class="detail-columns">
+                    <div class="insight-card">
+                      <h3>Top vendors</h3>
+                      <Show when={financialVendors().length > 0} fallback={<p class="muted">No vendor records yet.</p>}>
+                        <ul class="analytics-list">
+                          <For each={financialVendors()}>
+                            {(item) => (
+                              <li>
+                                <span class="list-primary">{item.vendor_name}</span>
                                 <span class="list-secondary">{formatCurrency(item.spend)}</span>
+                              </li>
+                            )}
+                          </For>
+                        </ul>
+                      </Show>
+                    </div>
+                    <div class="insight-card">
+                      <h3>Work statements</h3>
+                      <Show when={financialWorkSummary().length > 0} fallback={<p class="muted">Work statements will appear as records accumulate.</p>}>
+                        <ul class="analytics-list">
+                          <For each={financialWorkSummary()}>
+                            {(item) => (
+                              <li>
+                                <span class="list-primary">{item.description}</span>
+                                <span class="list-secondary">{item.records} records · {formatCurrency(item.spend)}</span>
                               </li>
                             )}
                           </For>
