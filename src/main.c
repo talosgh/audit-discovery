@@ -534,6 +534,7 @@ static TimelineEntry *timeline_find_entry(TimelineEntry *entries, size_t count, 
 static int timeline_ensure_entry(TimelineEntry **entries, size_t *count, size_t *capacity, const char *month, TimelineEntry **out_entry);
 static void timeline_free_entries(TimelineEntry *entries, size_t count);
 static int compare_timeline_entries(const void *a, const void *b);
+static int parse_year_month(const char *text, int *year_out, int *month_out);
 static int append_service_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
 static int append_financial_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
 static void address_cache_init(AddressCache *cache);
@@ -7284,6 +7285,34 @@ static int compare_timeline_entries(const void *a, const void *b) {
     return strcmp(ma, mb);
 }
 
+static int parse_year_month(const char *text, int *year_out, int *month_out) {
+    if (!text || !year_out || !month_out) {
+        return 0;
+    }
+    size_t len = strlen(text);
+    if (len < 7 || text[4] != '-') {
+        return 0;
+    }
+    for (int i = 0; i < 4; ++i) {
+        if (!isdigit((unsigned char)text[i])) {
+            return 0;
+        }
+    }
+    for (int i = 5; i < 7; ++i) {
+        if (!isdigit((unsigned char)text[i])) {
+            return 0;
+        }
+    }
+    int year = (text[0] - '0') * 1000 + (text[1] - '0') * 100 + (text[2] - '0') * 10 + (text[3] - '0');
+    int month = (text[5] - '0') * 10 + (text[6] - '0');
+    if (month < 1 || month > 12) {
+        return 0;
+    }
+    *year_out = year;
+    *month_out = month;
+    return 1;
+}
+
 static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out) {
     (void)lookup_address;
     if (service_available) *service_available = false;
@@ -7339,7 +7368,9 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
-        "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
+        "WHERE location_id = COALESCE($1::int, $2::int) "
+        "  AND statement_creation_date IS NOT NULL "
+        "  AND (COALESCE(TRIM(main_catagory), '') = '' OR UPPER(TRIM(main_catagory)) NOT LIKE 'BC%') "
         "GROUP BY bucket "
         "ORDER BY bucket";
     if (finance_params[0] || finance_params[1]) {
@@ -7417,6 +7448,64 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
     }
 
     qsort(entries, entry_count, sizeof(TimelineEntry), compare_timeline_entries);
+
+    if (entry_count > 0) {
+        int start_year = 0, start_month = 0;
+        int end_year = 0, end_month = 0;
+        if (parse_year_month(entries[0].month, &start_year, &start_month) &&
+            parse_year_month(entries[entry_count - 1].month, &end_year, &end_month)) {
+            int span = (end_year - start_year) * 12 + (end_month - start_month);
+            if (span < 0) {
+                span = 0;
+            }
+            size_t needed = (size_t)span + 1;
+            if (needed > entry_count) {
+                TimelineEntry *expanded = calloc(needed, sizeof(TimelineEntry));
+                if (!expanded) {
+                    if (error_out && !*error_out) {
+                        *error_out = strdup("Out of memory building timeline");
+                    }
+                    timeline_free_entries(entries, entry_count);
+                    return NULL;
+                }
+                TimelineEntry *original_entries = entries;
+                size_t original_count = entry_count;
+                int year = start_year;
+                int month = start_month;
+                for (size_t idx = 0; idx < needed; ++idx) {
+                    char label[8];
+                    snprintf(label, sizeof(label), "%04d-%02d", year, month);
+                    expanded[idx].month = strdup(label);
+                    if (!expanded[idx].month) {
+                        timeline_free_entries(expanded, idx);
+                        timeline_free_entries(original_entries, original_count);
+                        if (error_out && !*error_out) {
+                            *error_out = strdup("Out of memory building timeline");
+                        }
+                        return NULL;
+                    }
+                    TimelineEntry *source = timeline_find_entry(original_entries, original_count, label);
+                    if (source) {
+                        expanded[idx].pm_count = source->pm_count;
+                        expanded[idx].callback_count = source->callback_count;
+                        expanded[idx].spend_amount = source->spend_amount;
+                    } else {
+                        expanded[idx].pm_count = 0;
+                        expanded[idx].callback_count = 0;
+                        expanded[idx].spend_amount = 0.0;
+                    }
+                    month += 1;
+                    if (month > 12) {
+                        month = 1;
+                        year += 1;
+                    }
+                }
+                timeline_free_entries(original_entries, original_count);
+                entries = expanded;
+                entry_count = needed;
+            }
+        }
+    }
 
     if (stats) {
         if (!financial_available || !service_available) {

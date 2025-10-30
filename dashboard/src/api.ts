@@ -88,7 +88,8 @@ export function fetchLocationDetail(params: LocationQuery): Promise<LocationDeta
 }
 
 export function fetchMetricsSummary(): Promise<MetricsSummary> {
-  return fetchJSON<MetricsSummary>('/metrics/summary');
+  const ts = Date.now().toString(36);
+  return fetchJSON<MetricsSummary>(`/metrics/summary?ts=${ts}`);
 }
 
 export async function createReportJob(request: ReportJobCreateRequest): Promise<ReportJobCreateResponse> {
