@@ -6296,8 +6296,13 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
     char *city_trim = (profile && profile->city) ? trim_copy(profile->city) : NULL;
     char *state_trim = (profile && profile->state) ? trim_copy(profile->state) : NULL;
 
-    const char *params[4] = { location_code, street_trim, city_trim, state_trim };
-    const Oid param_types[4] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID };
+    char row_id_buf_service[32];
+    const char *params[5] = { location_code, street_trim, city_trim, state_trim, NULL };
+    if (profile && profile->row_id.has_value) {
+        snprintf(row_id_buf_service, sizeof(row_id_buf_service), "%d", profile->row_id.value);
+        params[4] = row_id_buf_service;
+    }
+    const Oid param_types[5] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
     const char *sql_summary =
         "SELECT COUNT(*)::bigint AS total_tickets, "
         "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS total_hours, "
