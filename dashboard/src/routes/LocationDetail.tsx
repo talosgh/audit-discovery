@@ -600,32 +600,49 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const financialVendors = createMemo(() => financialSummary()?.vendor_breakdown ?? []);
   const financialWorkSummary = createMemo(() => financialSummary()?.work_summary ?? []);
   const classificationTotal = createMemo(() => financialClassifications().reduce((sum, item) => sum + (item.spend ?? 0), 0));
-  const typeTotal = createMemo(() => financialTypes().reduce((sum, item) => sum + (item.spend ?? 0), 0));
+const typeTotal = createMemo(() => financialTypes().reduce((sum, item) => sum + (item.spend ?? 0), 0));
 
-  const fallbackTimeline = createMemo(() => detail()?.timeline ?? null);
-  const timelineBundle = createMemo(() => analytics()?.timeline ?? fallbackTimeline() ?? null);
-  const timelineData = createMemo(() => timelineBundle()?.data ?? []);
-  const timelineHasService = createMemo(() => Boolean(timelineBundle()?.has_service));
-  const timelineHasFinancial = createMemo(() => Boolean(timelineBundle()?.has_financial));
-  const timelineMaxVisits = createMemo(() => {
-    const data = timelineData();
-    if (!data.length) return 1;
-    const totals = data.map((point) => {
-      const pm = Math.max(point.pm ?? 0, 0);
-      const cbEmergency = Math.max(point.cb_emergency ?? 0, 0);
-      const cbEnv = Math.max(point.cb_env ?? 0, 0);
-      const tst = Math.max(point.tst ?? 0, 0);
-      const rp = Math.max(point.rp ?? 0, 0);
-      const total = point.total ?? pm + cbEmergency + cbEnv + tst + rp;
-      return total;
-    });
-    return Math.max(1, ...totals);
+const fallbackTimeline = createMemo(() => detail()?.timeline ?? null);
+const timelineBundle = createMemo(() => analytics()?.timeline ?? fallbackTimeline() ?? null);
+const timelineData = createMemo(() => timelineBundle()?.data ?? []);
+const serviceTotals = createMemo(() => {
+  const data = timelineData();
+  if (!data.length) return [] as number[];
+  return data.map((point) => {
+    const pm = Math.max(point.pm ?? 0, 0);
+    const cbEmergency = Math.max(point.cb_emergency ?? 0, 0);
+    const cbEnv = Math.max(point.cb_env ?? 0, 0);
+    const tst = Math.max(point.tst ?? 0, 0);
+    const rp = Math.max(point.rp ?? 0, 0);
+    return point.total ?? pm + cbEmergency + cbEnv + tst + rp;
   });
-  const timelineMaxSpend = createMemo(() => {
-    const data = timelineData();
-    if (!data.length) return 0;
-    return Math.max(...data.map((point) => point.spend ?? 0));
+});
+const financeTotals = createMemo(() => {
+  const data = timelineData();
+  if (!data.length) return [] as number[];
+  return data.map((point) => {
+    const bc = Math.max(point.bc ?? 0, 0);
+    const opex = Math.max(point.opex ?? 0, 0);
+    const capex = Math.max(point.capex ?? 0, 0);
+    const other = Math.max(point.other ?? 0, 0);
+    return bc + opex + capex + other;
   });
+});
+const timelineMaxVisits = createMemo(() => {
+  const totals = serviceTotals();
+  if (!totals.length) return 1;
+  return Math.max(1, ...totals);
+});
+const timelineMaxSpend = createMemo(() => {
+  const data = timelineData();
+  if (!data.length) return 0;
+  const spendTotals = data.map((point) => Math.max(point.spend ?? 0, 0));
+  const financeBuckets = financeTotals();
+  const combined = spendTotals.concat(financeBuckets.length ? financeBuckets : []);
+  return combined.length ? Math.max(...combined) : 0;
+});
+const hasServiceData = createMemo(() => serviceTotals().some((total) => total > 0));
+const hasFinanceData = createMemo(() => financeTotals().some((total) => total > 0));
   const serviceSegmentLabels = {
     pm: 'Preventative maintenance',
     cbEmergency: 'Emergency callbacks',
@@ -638,12 +655,12 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const financialSegmentLabels = {
     bc: 'Base contract spend',
     opex: 'Operational expenses',
-    capex: 'Capital expenditures',
-    other: 'Other spend'
-  } as const;
+  capex: 'Capital expenditures',
+  other: 'Other spend'
+} as const;
 
-  const showService = createMemo(() => timelineHasService());
-  const showFinance = createMemo(() => timelineHasFinancial());
+const showService = createMemo(() => hasServiceData());
+const showFinance = createMemo(() => hasFinanceData());
 
   const timelineGeometry = createMemo(() => {
     const data = timelineData();
@@ -1061,7 +1078,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                                               <For each={serviceSegments}>
                                                 {(segment) => {
                                                   if (segment.value <= 0) return null;
-                                                  const segmentHeight = maxVisits > 0 ? Math.min(100, (segment.value / maxVisits) * 100) : 0;
+                                                  const rawHeight = maxVisits > 0 ? (segment.value / maxVisits) * 100 : 0;
+                                                  const segmentHeight = rawHeight > 0 ? Math.max(4, Math.min(100, rawHeight)) : 0;
                                                   return <div class={`timeline-bar ${segment.className}`} style={{ height: `${segmentHeight}%` }} />;
                                                 }}
                                               </For>
@@ -1072,7 +1090,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                                               <For each={financeSegments}>
                                                 {(segment) => {
                                                   if (segment.value <= 0 || maxSpend <= 0) return null;
-                                                  const segmentHeight = Math.min(100, (segment.value / maxSpend) * 100);
+                                                  const rawHeight = (segment.value / maxSpend) * 100;
+                                                  const segmentHeight = rawHeight > 0 ? Math.max(4, Math.min(100, rawHeight)) : 0;
                                                   return <div class={`timeline-bar ${segment.className}`} style={{ height: `${segmentHeight}%` }} />;
                                                 }}
                                               </For>
