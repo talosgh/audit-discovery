@@ -1346,6 +1346,7 @@ tbody tr:hover {
   align-items: center;
   gap: 0.45rem;
   color: var(--text-subtle);
+  position: relative;
 }
 
 .timeline-hint {
@@ -1387,12 +1388,17 @@ tbody tr:hover {
   height: 100%;
 }
 
+
 .timeline-stack--service {
   width: 22px;
+  position: relative;
+  z-index: 2;
 }
 
 .timeline-stack--finance {
   width: 16px;
+  position: relative;
+  z-index: 1;
 }
 
 .timeline-stack--finance-only {
@@ -1403,6 +1409,8 @@ tbody tr:hover {
   width: 100%;
   border-radius: 4px;
   transition: height 0.3s ease;
+  position: relative;
+  z-index: 2;
 }
 
 .timeline-bar--pm,
