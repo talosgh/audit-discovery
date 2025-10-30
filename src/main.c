@@ -514,6 +514,7 @@ static char *build_visit_summary_json(PGconn *conn, const LocationProfile *profi
 static char *build_report_version_list(PGconn *conn, const char *address, bool deficiency_only, char **error_out);
 static const char *determine_trend_direction(double latest, double previous, double tolerance_percent, double *percent_change_out);
 static double forecast_next_value(double latest, double previous);
+static bool string_is_integer(const char *text);
 static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats);
 static int append_service_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
 static int append_financial_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
@@ -2779,13 +2780,26 @@ static int append_financial_summary_section(Buffer *buf, PGconn *conn, const Rep
         return 0;
     }
 
-    if (!profile || !profile->row_id.has_value) {
+    if (!profile) {
         return 1;
     }
 
-    char idbuf[32];
-    snprintf(idbuf, sizeof(idbuf), "%d", profile->row_id.value);
-    const char *params[1] = { idbuf };
+    char codebuf[32];
+    char rowbuf[32];
+    const char *params[2] = { NULL, NULL };
+
+    if (profile->location_code && string_is_integer(profile->location_code)) {
+        snprintf(codebuf, sizeof(codebuf), "%s", profile->location_code);
+        params[0] = codebuf;
+    }
+    if (profile->row_id.has_value && profile->row_id.value > 0) {
+        snprintf(rowbuf, sizeof(rowbuf), "%d", profile->row_id.value);
+        params[1] = rowbuf;
+    }
+
+    if (!params[0] && !params[1]) {
+        return 1;
+    }
 
     const char *sql_summary =
         "SELECT COUNT(*)::bigint AS total_records, "
@@ -2796,33 +2810,33 @@ static int append_financial_summary_section(Buffer *buf, PGconn *conn, const Rep
         "       COALESCE(SUM(COALESCE(delta,0)),0)::numeric AS total_savings, "
         "       MAX(statement_creation_date) AS last_statement "
         "FROM financial_data "
-        "WHERE location_id = $1";
+        "WHERE location_id = COALESCE($1::int, $2::int)";
     const char *sql_trend =
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
-        "WHERE location_id = $1 AND statement_creation_date IS NOT NULL "
+        "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
         "GROUP BY bucket "
         "ORDER BY bucket DESC "
         "LIMIT 12";
     const char *sql_category =
-        "SELECT COALESCE(NULLIF(category, ''), 'Uncategorized') AS category, "
+        "SELECT COALESCE(NULLIF(main_catagory, ''), 'Uncategorized') AS category, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
-        "WHERE location_id = $1 "
-        "GROUP BY category "
-        "ORDER BY SUM(COALESCE(new_cost,0)) DESC "
+        "WHERE location_id = COALESCE($1::int, $2::int) "
+        "GROUP BY 1 "
+        "ORDER BY spend DESC "
         "LIMIT 5";
     const char *sql_status =
         "SELECT COALESCE(NULLIF(status, ''), 'Unspecified') AS status, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
-        "WHERE location_id = $1 "
+        "WHERE location_id = COALESCE($1::int, $2::int) "
         "GROUP BY status "
         "ORDER BY SUM(COALESCE(new_cost,0)) DESC "
         "LIMIT 5";
 
-    PGresult *summary_res = PQexecParams(conn, sql_summary, 1, NULL, params, NULL, NULL, 0);
+    PGresult *summary_res = PQexecParams(conn, sql_summary, 2, NULL, params, NULL, NULL, 0);
     if (!summary_res || PQresultStatus(summary_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = summary_res ? PQresultErrorMessage(summary_res) : PQerrorMessage(conn);
@@ -2835,7 +2849,7 @@ static int append_financial_summary_section(Buffer *buf, PGconn *conn, const Rep
         goto fin_cleanup;
     }
 
-    PGresult *trend_res = PQexecParams(conn, sql_trend, 1, NULL, params, NULL, NULL, 0);
+    PGresult *trend_res = PQexecParams(conn, sql_trend, 2, NULL, params, NULL, NULL, 0);
     if (!trend_res || PQresultStatus(trend_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = trend_res ? PQresultErrorMessage(trend_res) : PQerrorMessage(conn);
@@ -2848,7 +2862,7 @@ static int append_financial_summary_section(Buffer *buf, PGconn *conn, const Rep
         goto fin_cleanup_summary;
     }
 
-    PGresult *category_res = PQexecParams(conn, sql_category, 1, NULL, params, NULL, NULL, 0);
+    PGresult *category_res = PQexecParams(conn, sql_category, 2, NULL, params, NULL, NULL, 0);
     if (!category_res || PQresultStatus(category_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = category_res ? PQresultErrorMessage(category_res) : PQerrorMessage(conn);
@@ -2861,7 +2875,7 @@ static int append_financial_summary_section(Buffer *buf, PGconn *conn, const Rep
         goto fin_cleanup_trend;
     }
 
-    PGresult *status_res = PQexecParams(conn, sql_status, 1, NULL, params, NULL, NULL, 0);
+    PGresult *status_res = PQexecParams(conn, sql_status, 2, NULL, params, NULL, NULL, 0);
     if (!status_res || PQresultStatus(status_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = status_res ? PQresultErrorMessage(status_res) : PQerrorMessage(conn);
@@ -6455,8 +6469,21 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         memset(analytics_out, 0, sizeof(*analytics_out));
     }
 
-    if (!profile || !profile->row_id.has_value) {
-        char *fallback = strdup("{\"total_records\":0,\"total_spend\":0.00,\"approved_spend\":0.00,\"open_spend\":0.00,\"last_statement\":null,\"monthly_trend\":[],\"category_breakdown\":[],\"status_breakdown\":[]}");
+    char codebuf[32];
+    char rowbuf[32];
+    const char *params[2] = { NULL, NULL };
+
+    if (profile && profile->location_code && string_is_integer(profile->location_code)) {
+        snprintf(codebuf, sizeof(codebuf), "%s", profile->location_code);
+        params[0] = codebuf;
+    }
+    if (profile && profile->row_id.has_value && profile->row_id.value > 0) {
+        snprintf(rowbuf, sizeof(rowbuf), "%d", profile->row_id.value);
+        params[1] = rowbuf;
+    }
+
+    if (!profile || (!params[0] && !params[1])) {
+        char *fallback = strdup("{\"total_records\":0,\"total_spend\":0.00,\"approved_spend\":0.00,\"open_spend\":0.00,\"last_statement\":null,\"monthly_trend\":[],\"category_breakdown\":[],\"status_breakdown\":[],\"total_savings\":0.00,\"savings_rate\":0.0,\"monthly_savings\":[],\"cumulative_savings\":[]}");
         if (!fallback && error_out && !*error_out) {
             *error_out = strdup("Out of memory assembling financial summary");
         }
@@ -6465,10 +6492,6 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         }
         return fallback;
     }
-
-    char idbuf[32];
-    snprintf(idbuf, sizeof(idbuf), "%d", profile->row_id.value);
-    const char *params[1] = { idbuf };
 
     const char *sql_summary =
         "SELECT COUNT(*)::bigint AS total_records, "
@@ -6479,8 +6502,8 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "       COALESCE(SUM(COALESCE(delta,0)),0)::numeric AS total_savings, "
         "       MAX(statement_creation_date) AS last_statement "
         "FROM financial_data "
-        "WHERE location_id = $1";
-    PGresult *res = PQexecParams(conn, sql_summary, 1, NULL, params, NULL, NULL, 0);
+        "WHERE location_id = COALESCE($1::int, $2::int)";
+    PGresult *res = PQexecParams(conn, sql_summary, 2, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(res);
@@ -6537,11 +6560,11 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
-        "WHERE location_id = $1 AND statement_creation_date IS NOT NULL "
+        "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
         "GROUP BY bucket "
         "ORDER BY bucket DESC "
         "LIMIT 12";
-    PGresult *trend_res = PQexecParams(conn, sql_trend, 1, NULL, params, NULL, NULL, 0);
+    PGresult *trend_res = PQexecParams(conn, sql_trend, 2, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(trend_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(trend_res);
@@ -6556,11 +6579,11 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "SELECT COALESCE(NULLIF(main_catagory, ''), 'Uncategorized') AS category, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
-        "WHERE location_id = $1 "
-        "GROUP BY category "
+        "WHERE location_id = COALESCE($1::int, $2::int) "
+        "GROUP BY 1 "
         "ORDER BY spend DESC "
         "LIMIT 6";
-    PGresult *category_res = PQexecParams(conn, sql_category, 1, NULL, params, NULL, NULL, 0);
+    PGresult *category_res = PQexecParams(conn, sql_category, 2, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(category_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(category_res);
@@ -6576,10 +6599,10 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "SELECT COALESCE(NULLIF(status, ''), 'Unspecified') AS state, "
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
-        "WHERE location_id = $1 "
+        "WHERE location_id = COALESCE($1::int, $2::int) "
         "GROUP BY state "
         "ORDER BY spend DESC";
-    PGresult *status_res = PQexecParams(conn, sql_status, 1, NULL, params, NULL, NULL, 0);
+    PGresult *status_res = PQexecParams(conn, sql_status, 2, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(status_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(status_res);
@@ -6596,11 +6619,11 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
         "       COALESCE(SUM(COALESCE(delta,0)),0)::numeric AS savings "
         "FROM financial_data "
-        "WHERE location_id = $1 AND statement_creation_date IS NOT NULL "
+        "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
         "GROUP BY bucket "
         "ORDER BY bucket DESC "
         "LIMIT 12";
-    PGresult *savings_res = PQexecParams(conn, sql_savings, 1, NULL, params, NULL, NULL, 0);
+    PGresult *savings_res = PQexecParams(conn, sql_savings, 2, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(savings_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(savings_res);
@@ -6819,6 +6842,25 @@ static double forecast_next_value(double latest, double previous) {
         return latest;
     }
     return latest + (latest - previous);
+}
+
+static bool string_is_integer(const char *text) {
+    if (!text || !*text) {
+        return false;
+    }
+    const unsigned char *p = (const unsigned char *)text;
+    if (*p == '+' || *p == '-') {
+        ++p;
+        if (!*p) {
+            return false;
+        }
+    }
+    for (; *p; ++p) {
+        if (!isdigit(*p)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static const char *coverage_status(bool available) {
