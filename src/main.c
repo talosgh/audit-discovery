@@ -2788,9 +2788,23 @@ static int append_financial_summary_section(Buffer *buf, PGconn *conn, const Rep
     char rowbuf[32];
     const char *params[2] = { NULL, NULL };
 
-    if (profile->location_code && string_is_integer(profile->location_code)) {
-        snprintf(codebuf, sizeof(codebuf), "%s", profile->location_code);
-        params[0] = codebuf;
+    if (profile->location_code && profile->location_code[0]) {
+        const char *code_src = profile->location_code;
+        while (*code_src && isspace((unsigned char)*code_src)) {
+            ++code_src;
+        }
+        const char *code_end = code_src + strlen(code_src);
+        while (code_end > code_src && isspace((unsigned char)*(code_end - 1))) {
+            --code_end;
+        }
+        size_t code_len = (size_t)(code_end - code_src);
+        if (code_len > 0 && code_len < sizeof(codebuf)) {
+            memcpy(codebuf, code_src, code_len);
+            codebuf[code_len] = '\0';
+            if (string_is_integer(codebuf)) {
+                params[0] = codebuf;
+            }
+        }
     }
     if (profile->row_id.has_value && profile->row_id.value > 0) {
         snprintf(rowbuf, sizeof(rowbuf), "%d", profile->row_id.value);
@@ -6473,9 +6487,23 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
     char rowbuf[32];
     const char *params[2] = { NULL, NULL };
 
-    if (profile && profile->location_code && string_is_integer(profile->location_code)) {
-        snprintf(codebuf, sizeof(codebuf), "%s", profile->location_code);
-        params[0] = codebuf;
+    if (profile && profile->location_code && profile->location_code[0]) {
+        const char *code_src = profile->location_code;
+        while (*code_src && isspace((unsigned char)*code_src)) {
+            ++code_src;
+        }
+        const char *code_end = code_src + strlen(code_src);
+        while (code_end > code_src && isspace((unsigned char)*(code_end - 1))) {
+            --code_end;
+        }
+        size_t code_len = (size_t)(code_end - code_src);
+        if (code_len > 0 && code_len < sizeof(codebuf)) {
+            memcpy(codebuf, code_src, code_len);
+            codebuf[code_len] = '\0';
+            if (string_is_integer(codebuf)) {
+                params[0] = codebuf;
+            }
+        }
     }
     if (profile && profile->row_id.has_value && profile->row_id.value > 0) {
         snprintf(rowbuf, sizeof(rowbuf), "%d", profile->row_id.value);

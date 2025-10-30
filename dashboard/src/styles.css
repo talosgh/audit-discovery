@@ -330,13 +330,15 @@ tbody tr:hover {
 
 .location-cell {
   display: flex;
-  align-items: center;
-  gap: 0.5rem;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
 }
 
 .location-name {
   flex: 1;
   min-width: 0;
+  display: block;
 }
 
 .location-subtext {
@@ -353,7 +355,7 @@ tbody tr:hover {
 .deficiency-chip {
   font-size: 0.95rem;
   line-height: 1;
-  padding: 0.15rem 0.4rem;
+  padding: 0.2rem 0.5rem;
   border-radius: 999px;
   background: rgba(249, 115, 22, 0.18);
   color: #b45309;
