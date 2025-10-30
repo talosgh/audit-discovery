@@ -5,6 +5,7 @@ import type {
   LocationListParams,
   LocationListResponse,
   LocationSummary,
+  MetricsSummary,
   ReportJobCreateRequest,
   ReportJobCreateResponse,
   ReportJobStatus
@@ -84,6 +85,10 @@ export function fetchLocationDetail(params: LocationQuery): Promise<LocationDeta
     search.set('location_id', String(params.locationId));
   }
   return fetchJSON<LocationDetail>(`/locations?${search.toString()}`);
+}
+
+export function fetchMetricsSummary(): Promise<MetricsSummary> {
+  return fetchJSON<MetricsSummary>('/metrics/summary');
 }
 
 export async function createReportJob(request: ReportJobCreateRequest): Promise<ReportJobCreateResponse> {

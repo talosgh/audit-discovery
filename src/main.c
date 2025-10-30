@@ -268,6 +268,19 @@ typedef struct {
     double savings_rate;
 } FinancialAnalytics;
 
+typedef struct {
+    bool correlation_valid;
+    double correlation;
+    int sample_count;
+} TimelineStats;
+
+typedef struct {
+    char *month;
+    long pm_count;
+    long callback_count;
+    double spend_amount;
+} TimelineEntry;
+
 static const char *REPORT_SUMMARY_DOCSTRING =
     "Contains high-level metrics about the elevator audit.\n"
     "- total_deficiencies: Total number of deficiencies/violations across all devices.\n"
@@ -515,7 +528,12 @@ static char *build_report_version_list(PGconn *conn, const char *address, bool d
 static const char *determine_trend_direction(double latest, double previous, double tolerance_percent, double *percent_change_out);
 static double forecast_next_value(double latest, double previous);
 static bool string_is_integer(const char *text);
-static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats);
+static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, TimelineStats *stats, char **error_out);
+static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats);
+static TimelineEntry *timeline_find_entry(TimelineEntry *entries, size_t count, const char *month);
+static int timeline_ensure_entry(TimelineEntry **entries, size_t *count, size_t *capacity, const char *month, TimelineEntry **out_entry);
+static void timeline_free_entries(TimelineEntry *entries, size_t count);
+static int compare_timeline_entries(const void *a, const void *b);
 static int append_service_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
 static int append_financial_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out);
 static void address_cache_init(AddressCache *cache);
@@ -624,9 +642,48 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     char *visits_json = build_visit_summary_json(conn, &profile, lookup_address, error_out);
     char *reports_json = build_report_version_list(conn, lookup_address, false, error_out);
     char *deficiency_reports_json = build_report_version_list(conn, lookup_address, true, error_out);
+    TimelineStats timeline_stats;
+    memset(&timeline_stats, 0, sizeof(timeline_stats));
+    char *timeline_json = NULL;
+    if (service_json && financial_json) {
+        timeline_json = build_service_financial_timeline_json(conn, &profile, lookup_address, &timeline_stats, error_out);
+        if (!timeline_json && error_out && *error_out) {
+            free(summary_json);
+            free(profile_json);
+            free(service_json);
+            free(financial_json);
+            free(visits_json);
+            free(reports_json);
+            free(deficiency_reports_json);
+            report_data_clear(&report);
+            location_profile_clear(&profile);
+            free(lookup_address);
+            return NULL;
+        }
+        if (!timeline_json) {
+            timeline_json = strdup("[]");
+            if (!timeline_json) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory preparing timeline");
+                }
+                free(summary_json);
+                free(profile_json);
+                free(service_json);
+                free(financial_json);
+                free(visits_json);
+                free(reports_json);
+                free(deficiency_reports_json);
+                report_data_clear(&report);
+                location_profile_clear(&profile);
+                free(lookup_address);
+                return NULL;
+            }
+        }
+    }
     char *analytics_json = NULL;
     if (service_json && financial_json) {
-        analytics_json = build_location_analytics_json(&report, &profile, open_deficiency_count, &service_stats, &financial_stats);
+        const char *timeline_payload = timeline_json && timeline_json[0] ? timeline_json : "[]";
+        analytics_json = build_location_analytics_json(&report, &profile, open_deficiency_count, &service_stats, &financial_stats, timeline_payload, &timeline_stats);
     }
     report_data_clear(&report);
 
@@ -638,6 +695,7 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
         free(visits_json);
         free(reports_json);
         free(deficiency_reports_json);
+        free(timeline_json);
         free(analytics_json);
         location_profile_clear(&profile);
         free(lookup_address);
@@ -713,6 +771,7 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     free(visits_json);
     free(reports_json);
     free(deficiency_reports_json);
+    free(timeline_json);
     free(analytics_json);
     location_profile_clear(&profile);
     free(lookup_address);
@@ -6687,6 +6746,10 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
     if (!buffer_appendf(&buf, "%.2f", total_spend)) goto fin_oom;
     if (!buffer_append_char(&buf, ',')) goto fin_oom;
 
+    if (!buffer_append_cstr(&buf, "\"proposed_spend\":")) goto fin_oom;
+    if (!buffer_appendf(&buf, "%.2f", proposed_spend)) goto fin_oom;
+    if (!buffer_append_char(&buf, ',')) goto fin_oom;
+
     if (!buffer_append_cstr(&buf, "\"approved_spend\":")) goto fin_oom;
     if (!buffer_appendf(&buf, "%.2f", approved_spend)) goto fin_oom;
     if (!buffer_append_char(&buf, ',')) goto fin_oom;
@@ -6891,6 +6954,292 @@ static bool string_is_integer(const char *text) {
     return true;
 }
 
+static TimelineEntry *timeline_find_entry(TimelineEntry *entries, size_t count, const char *month) {
+    if (!entries || !month) {
+        return NULL;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (entries[i].month && strcmp(entries[i].month, month) == 0) {
+            return &entries[i];
+        }
+    }
+    return NULL;
+}
+
+static int timeline_ensure_entry(TimelineEntry **entries, size_t *count, size_t *capacity, const char *month, TimelineEntry **out_entry) {
+    if (!entries || !count || !capacity || !month || !out_entry) {
+        return 0;
+    }
+    TimelineEntry *existing = timeline_find_entry(*entries, *count, month);
+    if (existing) {
+        *out_entry = existing;
+        return 1;
+    }
+    if (*count == *capacity) {
+        size_t new_capacity = (*capacity == 0) ? 8 : (*capacity * 2);
+        TimelineEntry *resized = realloc(*entries, new_capacity * sizeof(TimelineEntry));
+        if (!resized) {
+            return 0;
+        }
+        *entries = resized;
+        *capacity = new_capacity;
+    }
+    TimelineEntry *entry = &(*entries)[*count];
+    entry->month = strdup(month);
+    if (!entry->month) {
+        return 0;
+    }
+    entry->pm_count = 0;
+    entry->callback_count = 0;
+    entry->spend_amount = 0.0;
+    *out_entry = entry;
+    (*count)++;
+    return 1;
+}
+
+static void timeline_free_entries(TimelineEntry *entries, size_t count) {
+    if (!entries) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        free(entries[i].month);
+    }
+    free(entries);
+}
+
+static int compare_timeline_entries(const void *a, const void *b) {
+    const TimelineEntry *ea = (const TimelineEntry *)a;
+    const TimelineEntry *eb = (const TimelineEntry *)b;
+    const char *ma = ea && ea->month ? ea->month : "";
+    const char *mb = eb && eb->month ? eb->month : "";
+    return strcmp(ma, mb);
+}
+
+static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, TimelineStats *stats, char **error_out) {
+    (void)lookup_address;
+    if (stats) {
+        stats->correlation_valid = false;
+        stats->correlation = 0.0;
+        stats->sample_count = 0;
+    }
+    if (error_out) {
+        *error_out = NULL;
+    }
+    if (!conn || !profile) {
+        char *empty = strdup("[]");
+        if (!empty && error_out && !*error_out) {
+            *error_out = strdup("Out of memory building timeline");
+        }
+        return empty;
+    }
+
+    const char *location_code = (profile->location_code && profile->location_code[0]) ? profile->location_code : NULL;
+    char *street_trim = profile->street ? trim_copy(profile->street) : NULL;
+    char *city_trim = profile->city ? trim_copy(profile->city) : NULL;
+    char *state_trim = profile->state ? trim_copy(profile->state) : NULL;
+
+    const char *service_params[4] = { location_code, street_trim, city_trim, state_trim };
+    const Oid service_types[4] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID };
+    const char *service_sql =
+        "SELECT to_char(sd_work_date, 'YYYY-MM') AS bucket, "
+        "       SUM(CASE WHEN upper(sd_cw_at) = 'PM' THEN 1 ELSE 0 END)::bigint AS pm_visits, "
+        "       SUM(CASE WHEN upper(sd_cw_at) LIKE 'CB-%' THEN 1 ELSE 0 END)::bigint AS cb_visits "
+        "FROM esa_in_progress "
+        "WHERE sd_work_date IS NOT NULL AND " SERVICE_FILTER " "
+        "GROUP BY bucket "
+        "ORDER BY bucket";
+
+    PGresult *service_res = PQexecParams(conn, service_sql, 4, service_types, service_params, NULL, NULL, 0);
+    if (!service_res || PQresultStatus(service_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = service_res ? PQresultErrorMessage(service_res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load service timeline");
+        }
+        if (service_res) PQclear(service_res);
+        free(street_trim);
+        free(city_trim);
+        free(state_trim);
+        return NULL;
+    }
+
+    char location_id_buf[32];
+    char row_id_buf[32];
+    const char *finance_params[2] = { NULL, NULL };
+    if (profile->location_code && profile->location_code[0] && string_is_integer(profile->location_code)) {
+        snprintf(location_id_buf, sizeof(location_id_buf), "%s", profile->location_code);
+        finance_params[0] = location_id_buf;
+    }
+    if (profile->row_id.has_value && profile->row_id.value > 0) {
+        snprintf(row_id_buf, sizeof(row_id_buf), "%d", profile->row_id.value);
+        finance_params[1] = row_id_buf;
+    }
+
+    PGresult *finance_res = NULL;
+    const char *finance_sql =
+        "SELECT to_char(statement_creation_date, 'YYYY-MM') AS bucket, "
+        "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
+        "FROM financial_data "
+        "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
+        "GROUP BY bucket "
+        "ORDER BY bucket";
+    if (finance_params[0] || finance_params[1]) {
+        finance_res = PQexecParams(conn, finance_sql, 2, NULL, finance_params, NULL, NULL, 0);
+        if (!finance_res || PQresultStatus(finance_res) != PGRES_TUPLES_OK) {
+            if (error_out && !*error_out) {
+                const char *msg = finance_res ? PQresultErrorMessage(finance_res) : PQerrorMessage(conn);
+                *error_out = strdup(msg ? msg : "Failed to load financial timeline");
+            }
+            if (finance_res) PQclear(finance_res);
+            PQclear(service_res);
+            free(street_trim);
+            free(city_trim);
+            free(state_trim);
+            return NULL;
+        }
+    }
+
+    TimelineEntry *entries = NULL;
+    size_t entry_count = 0;
+    size_t entry_capacity = 0;
+
+    int service_rows = PQntuples(service_res);
+    for (int i = 0; i < service_rows; ++i) {
+        if (PQgetisnull(service_res, i, 0)) {
+            continue;
+        }
+        const char *month = PQgetvalue(service_res, i, 0);
+        long pm_visits = PQgetisnull(service_res, i, 1) ? 0 : strtol(PQgetvalue(service_res, i, 1), NULL, 10);
+        long cb_visits = PQgetisnull(service_res, i, 2) ? 0 : strtol(PQgetvalue(service_res, i, 2), NULL, 10);
+        TimelineEntry *entry = NULL;
+        if (!timeline_ensure_entry(&entries, &entry_count, &entry_capacity, month, &entry)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory building timeline");
+            }
+            timeline_free_entries(entries, entry_count);
+            PQclear(service_res);
+            if (finance_res) PQclear(finance_res);
+            free(street_trim);
+            free(city_trim);
+            free(state_trim);
+            return NULL;
+        }
+        entry->pm_count = pm_visits;
+        entry->callback_count = cb_visits;
+    }
+
+    if (finance_res) {
+        int finance_rows = PQntuples(finance_res);
+        for (int i = 0; i < finance_rows; ++i) {
+            if (PQgetisnull(finance_res, i, 0)) {
+                continue;
+            }
+            const char *month = PQgetvalue(finance_res, i, 0);
+            TimelineEntry *entry = NULL;
+            if (!timeline_ensure_entry(&entries, &entry_count, &entry_capacity, month, &entry)) {
+                if (error_out && !*error_out) {
+                    *error_out = strdup("Out of memory building timeline");
+                }
+                timeline_free_entries(entries, entry_count);
+                PQclear(service_res);
+                PQclear(finance_res);
+                free(street_trim);
+                free(city_trim);
+                free(state_trim);
+                return NULL;
+            }
+            entry->spend_amount = PQgetisnull(finance_res, i, 1) ? 0.0 : strtod(PQgetvalue(finance_res, i, 1), NULL);
+        }
+    }
+
+    PQclear(service_res);
+    if (finance_res) {
+        PQclear(finance_res);
+    }
+    free(street_trim);
+    free(city_trim);
+    free(state_trim);
+
+    if (entry_count == 0) {
+        timeline_free_entries(entries, entry_count);
+        char *empty = strdup("[]");
+        if (!empty && error_out && !*error_out) {
+            *error_out = strdup("Out of memory building timeline");
+        }
+        return empty;
+    }
+
+    qsort(entries, entry_count, sizeof(TimelineEntry), compare_timeline_entries);
+
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    double sum_x2 = 0.0;
+    double sum_y2 = 0.0;
+    double sum_xy = 0.0;
+    int samples = 0;
+    for (size_t i = 0; i < entry_count; ++i) {
+        double x = (double)entries[i].callback_count;
+        double y = entries[i].spend_amount;
+        if (x == 0.0 && y == 0.0) {
+            continue;
+        }
+        sum_x += x;
+        sum_y += y;
+        sum_x2 += x * x;
+        sum_y2 += y * y;
+        sum_xy += x * y;
+        samples += 1;
+    }
+    if (stats) {
+        stats->sample_count = samples;
+        if (samples >= 2) {
+            double numerator = (double)samples * sum_xy - sum_x * sum_y;
+            double denom_part_x = (double)samples * sum_x2 - sum_x * sum_x;
+            double denom_part_y = (double)samples * sum_y2 - sum_y * sum_y;
+            double denom = sqrt(fabs(denom_part_x * denom_part_y));
+            if (denom > 0.0) {
+                stats->correlation = numerator / denom;
+                stats->correlation_valid = true;
+            }
+        }
+    }
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory building timeline");
+        }
+        timeline_free_entries(entries, entry_count);
+        return NULL;
+    }
+
+    if (!buffer_append_char(&buf, '[')) goto timeline_oom;
+    for (size_t i = 0; i < entry_count; ++i) {
+        if (i > 0 && !buffer_append_char(&buf, ',')) goto timeline_oom;
+        if (!buffer_append_char(&buf, '{')) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, "\"month\":")) goto timeline_oom;
+        if (!buffer_append_json_string(&buf, entries[i].month)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"pm_visits\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%ld", entries[i].pm_count)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"callback_visits\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%ld", entries[i].callback_count)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"spend\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%.2f", entries[i].spend_amount)) goto timeline_oom;
+        if (!buffer_append_char(&buf, '}')) goto timeline_oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto timeline_oom;
+
+    timeline_free_entries(entries, entry_count);
+    return buf.data;
+
+timeline_oom:
+    buffer_free(&buf);
+    timeline_free_entries(entries, entry_count);
+    if (error_out && !*error_out) {
+        *error_out = strdup("Out of memory building timeline");
+    }
+    return NULL;
+}
+
 static const char *coverage_status(bool available) {
     return available ? "available" : "missing";
 }
@@ -6902,7 +7251,7 @@ static double safe_divide(double numerator, double denominator) {
     return numerator / denominator;
 }
 
-static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats) {
+static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats) {
     if (!report) {
         return NULL;
     }
@@ -6956,6 +7305,7 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
     }
 
     double financial_total_spend = financial_available ? financial_stats->total_spend : 0.0;
+    double financial_proposed = financial_available ? financial_stats->proposed_spend : 0.0;
     double financial_approved = financial_available ? financial_stats->approved_spend : 0.0;
     double financial_open = financial_available ? financial_stats->open_spend : 0.0;
     double financial_per_device = (financial_available && device_count > 0) ? safe_divide(financial_stats->total_spend, (double)device_count) : NAN;
@@ -7159,6 +7509,13 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
         if (!buffer_append_cstr(&buf, "null")) goto oom;
     }
     if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"proposed_spend\":")) goto oom;
+    if (financial_available) {
+        if (!buffer_appendf(&buf, "%.2f", financial_proposed)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
+    if (!buffer_append_char(&buf, ',')) goto oom;
     if (!buffer_append_cstr(&buf, "\"approved_spend\":")) goto oom;
     if (financial_available) {
         if (!buffer_appendf(&buf, "%.2f", financial_approved)) goto oom;
@@ -7239,9 +7596,29 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
         if (!buffer_append_cstr(&buf, "null")) goto oom;
     }
     if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"service_correlation\":")) goto oom;
+    if (timeline_stats && timeline_stats->correlation_valid) {
+        if (!buffer_append_char(&buf, '{')) goto oom;
+        if (!buffer_append_cstr(&buf, "\"measure\":\"callbacks_vs_spend\",")) goto oom;
+        if (!buffer_append_cstr(&buf, "\"coefficient\":")) goto oom;
+        if (!buffer_appendf(&buf, "%.4f", timeline_stats->correlation)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"sample_months\":")) goto oom;
+        if (!buffer_appendf(&buf, "%d", timeline_stats->sample_count)) goto oom;
+        if (!buffer_append_char(&buf, '}')) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto oom;
+    }
     if (!buffer_append_char(&buf, '}')) goto oom;
 
     if (!buffer_append_char(&buf, '}')) goto oom;
+
+    if (!buffer_append_cstr(&buf, ",\"timeline\":")) goto oom;
+    if (timeline_json && timeline_json[0]) {
+        if (!buffer_append_cstr(&buf, timeline_json)) goto oom;
+    } else {
+        if (!buffer_append_cstr(&buf, "[]")) goto oom;
+    }
 
     return buf.data;
 

@@ -275,6 +275,7 @@ export interface FinancialBreakdownItem {
 export interface FinancialSummary {
   total_records: number;
   total_spend: number;
+  proposed_spend: number;
   approved_spend: number;
   open_spend: number;
   last_statement: string | null;
@@ -383,6 +384,7 @@ export interface FinancialAnalyticsSection {
   status: CoverageStatus;
   metrics: {
     total_spend: number | null;
+    proposed_spend: number | null;
     approved_spend: number | null;
     open_spend: number | null;
     per_device: number | null;
@@ -392,6 +394,20 @@ export interface FinancialAnalyticsSection {
   };
   trend: TrendMetrics;
   savings_trend: TrendMetrics;
+  service_correlation?: ServiceCorrelation | null;
+}
+
+export interface ServiceCorrelation {
+  measure: string;
+  coefficient: number;
+  sample_months: number;
+}
+
+export interface TimelinePoint {
+  month: string;
+  pm_visits: number;
+  callback_visits: number;
+  spend: number;
 }
 
 export interface LocationAnalyticsOverview {
@@ -408,6 +424,13 @@ export interface LocationAnalytics {
   deficiencies: DeficiencyAnalytics;
   service: ServiceAnalyticsSection;
   financial: FinancialAnalyticsSection;
+  timeline: TimelinePoint[];
+}
+
+export interface MetricsSummary {
+  total_savings: number;
+  total_proposed: number;
+  total_spend: number;
 }
 
 export interface ReportJobCreateRequest {

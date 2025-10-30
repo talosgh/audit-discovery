@@ -1,8 +1,10 @@
-import { Show, createSignal, createEffect, onCleanup } from 'solid-js';
+import { Show, createSignal, createEffect, onCleanup, onMount } from 'solid-js';
 import LocationList from './routes/LocationList';
 import LocationDetail from './routes/LocationDetail';
 import AuditDetail from './routes/AuditDetail';
 import type { LocationSummary } from './types';
+import { fetchMetricsSummary } from './api';
+import { formatCurrency } from './utils';
 
 interface LocationSelection {
   address: string;
@@ -47,6 +49,7 @@ const App = () => {
   const [lastLocation, setLastLocation] = createSignal<LocationSelection | null>(
     initial && 'location' in initial ? initial.location : null
   );
+  const [globalSavings, setGlobalSavings] = createSignal<number | null>(null);
 
   if (typeof window !== 'undefined') {
     createEffect(() => {
@@ -68,6 +71,16 @@ const App = () => {
       onCleanup(() => window.removeEventListener('popstate', handlePopState));
     });
   }
+
+  onMount(() => {
+    void fetchMetricsSummary()
+      .then((metrics) => {
+        setGlobalSavings(metrics.total_savings ?? 0);
+      })
+      .catch(() => {
+        setGlobalSavings(null);
+      });
+  });
 
   const navigateToList = () => {
     if (typeof window !== 'undefined') {
@@ -122,21 +135,27 @@ const App = () => {
     <div class="app-shell">
       <header class="app-header">
         <button type="button" class="brand" onClick={navigateToList} aria-label="Citywide Elevator Operations">
-          <img src="/assets/citywide.png" alt="Citywide" />
-          <span>Elevator Operations</span>
+          <img src="/citywide.png" alt="Citywide Elevator Operations" />
         </button>
-        <nav class="nav-links">
-          <button type="button" class={!selectedLocation() && !selectedAudit() ? 'active' : ''} onClick={navigateToList}>
-            Locations
-          </button>
-          <Show when={selectedLocation()}>
-            {(loc) => (
-              <button type="button" class={!selectedAudit() ? 'active' : ''} onClick={() => navigateToLocation(loc())}>
-                {loc().siteName ?? loc().address}
-              </button>
-            )}
-          </Show>
-        </nav>
+        <div class="header-right">
+          <nav class="nav-links">
+            <button type="button" class={!selectedLocation() && !selectedAudit() ? 'active' : ''} onClick={navigateToList}>
+              Locations
+            </button>
+            <Show when={selectedLocation()}>
+              {(loc) => (
+                <button type="button" class={!selectedAudit() ? 'active' : ''} onClick={() => navigateToLocation(loc())}>
+                  {loc().siteName ?? loc().address}
+                </button>
+              )}
+            </Show>
+          </nav>
+          <div class="header-metrics">
+            <Show when={globalSavings() != null} fallback={<span>Tracking savings…</span>}>
+              {(value) => <span>Client savings: <strong>{formatCurrency(value())}</strong></span>}
+            </Show>
+          </div>
+        </div>
       </header>
       <main class="app-main">
         <Show

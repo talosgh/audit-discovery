@@ -3,7 +3,7 @@ import { For, Match, Show, Switch, createEffect, createMemo, createResource, cre
 import { fetchLocationDetail, downloadReport, createReportJob, fetchReportJob, updateDeficiencyStatus, type LocationQuery } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
-import { formatDateTime, formatFileSize, slugify } from '../utils';
+import { formatCurrency, formatDateTime, formatFileSize, slugify } from '../utils';
 import type { CoverageStatus, LocationAnalytics, LocationDetail as LocationDetailType, LocationDevice, ReportJobStatus, ReportVersion } from '../types';
 
 interface LocationSelection {
@@ -570,9 +570,68 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const serviceHours = createMemo(() => serviceAnalyticsSection()?.metrics.hours ?? serviceSummary()?.total_hours ?? 0);
   const financialTotals = createMemo(() => ({
     total: financialAnalyticsSection()?.metrics.total_spend ?? financialSummary()?.total_spend ?? 0,
+    proposed: financialAnalyticsSection()?.metrics.proposed_spend ?? financialSummary()?.proposed_spend ?? 0,
     approved: financialAnalyticsSection()?.metrics.approved_spend ?? financialSummary()?.approved_spend ?? 0,
-    open: financialAnalyticsSection()?.metrics.open_spend ?? financialSummary()?.open_spend ?? 0
+    open: financialAnalyticsSection()?.metrics.open_spend ?? financialSummary()?.open_spend ?? 0,
+    savings: financialAnalyticsSection()?.metrics.savings_total ?? financialSummary()?.total_savings ?? 0
   }));
+  const proposedTotal = createMemo(() => financialTotals().proposed);
+  const approvedTotal = createMemo(() => financialTotals().approved);
+  const openTotal = createMemo(() => financialTotals().open);
+  const actualSpend = createMemo(() => financialTotals().total);
+  const negotiatedSavings = createMemo(() => financialTotals().savings ?? totalSavings());
+  const savingsDeltaGap = createMemo(() => Math.abs((proposedTotal() - approvedTotal()) - negotiatedSavings()));
+  const serviceCorrelation = createMemo(() => financialAnalyticsSection()?.service_correlation ?? null);
+
+  const timelineData = createMemo(() => analytics()?.timeline ?? []);
+  const timelineMaxVisits = createMemo(() => {
+    const data = timelineData();
+    if (!data.length) return 1;
+    return Math.max(
+      1,
+      ...data.map((point) => Math.max(point.pm_visits ?? 0, point.callback_visits ?? 0))
+    );
+  });
+  const timelineMaxSpend = createMemo(() => {
+    const data = timelineData();
+    if (!data.length) return 0;
+    return Math.max(...data.map((point) => point.spend ?? 0));
+  });
+  const timelineGeometry = createMemo(() => {
+    const data = timelineData();
+    const maxSpend = timelineMaxSpend();
+    const columnWidth = 56;
+    const columnGap = 24;
+    const chartHeight = 140;
+    const segments: string[] = [];
+    const points: Array<{ x: number; y: number; spend: number }> = [];
+    data.forEach((point, index) => {
+      const spendValue = point.spend ?? 0;
+      const ratio = maxSpend > 0 ? Math.min(1, spendValue / maxSpend) : 0;
+      const x = index * (columnWidth + columnGap) + columnWidth / 2;
+      const y = chartHeight - ratio * chartHeight;
+      segments.push(`${index === 0 ? 'M' : 'L'}${x},${y.toFixed(2)}`);
+      points.push({ x, y, spend: spendValue });
+    });
+    return {
+      width: Math.max(data.length > 0 ? columnWidth * data.length + columnGap * Math.max(data.length - 1, 0) : columnWidth, columnWidth),
+      height: chartHeight,
+      columnWidth,
+      columnGap,
+      path: segments.join(' '),
+      points
+    };
+  });
+  const formatMonthLabel = (bucket: string) => {
+    if (!bucket) return '—';
+    const [year, month] = bucket.split('-');
+    const idx = Number(month) - 1;
+    const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    if (!Number.isFinite(idx) || idx < 0 || idx >= names.length) {
+      return bucket;
+    }
+    return `${names[idx]} ${year}`;
+  };
 
   const summaryCardClass = (panel: 'deficiencies' | 'service' | 'financial', status?: CoverageStatus) => {
     const classes = ['summary-card'];
@@ -612,6 +671,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     const savingsRate = savingsRatePercent();
     const savingsPerDeviceValue = savingsPerDevice();
     const preventativeShare = preventativeSharePercent();
+    const correlation = serviceCorrelation();
 
     const items = [
       {
@@ -671,6 +731,17 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
         hasValue: savingsRate != null
       }
     ];
+
+    if (correlation && typeof correlation.coefficient === 'number' && !Number.isNaN(correlation.coefficient)) {
+      items.push({
+        key: 'callbacks-spend-corr',
+        label: 'Callbacks vs spend correlation',
+        tooltip: 'Pearson correlation between monthly callback volume and spend (−1 to 1).',
+        value: correlation.coefficient,
+        formatted: correlation.coefficient.toFixed(2),
+        hasValue: true
+      });
+    }
 
     return items;
   });
@@ -809,6 +880,79 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
               </div>
             </section>
 
+            <section class="timeline-card" aria-labelledby="timeline-title">
+              <header class="timeline-header">
+                <h2 id="timeline-title">Service &amp; Spend Timeline</h2>
+                <p>Monthly preventative maintenance (PM) and callback activity compared with invoiced spend.</p>
+              </header>
+              <Show when={timelineData().length > 0} fallback={<p class="muted">No combined service or financial history recorded yet.</p>}>
+                {(() => {
+                  const data = timelineData();
+                  const maxVisits = timelineMaxVisits();
+                  const geometry = timelineGeometry();
+                  const maxSpend = timelineMaxSpend();
+                  return (
+                    <>
+                      <div class="timeline-legend">
+                        <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> PM visits</span>
+                        <span class="legend-item"><span class="legend-swatch legend-swatch--cb" /> Callback visits</span>
+                        <span class="legend-item"><span class="legend-line" /> Spend</span>
+                      </div>
+                      <div class="timeline-chart" role="img" aria-label="Timeline of service visits and spend">
+                        <div class="timeline-content" style={{ width: `${geometry.width}px` }}>
+                          <div class="timeline-bars" style={{ height: `${geometry.height}px` }}>
+                            <For each={data}>
+                              {(entry) => {
+                                const pmValue = Math.max(entry.pm_visits ?? 0, 0);
+                                const cbValue = Math.max(entry.callback_visits ?? 0, 0);
+                                const pmHeight = maxVisits > 0 ? Math.max(0, Math.round((pmValue / maxVisits) * 100)) : 0;
+                                const cbHeight = maxVisits > 0 ? Math.max(0, Math.round((cbValue / maxVisits) * 100)) : 0;
+                                const columnTitle = `${formatMonthLabel(entry.month)} — PM: ${pmValue}, Callbacks: ${cbValue}, Spend: ${formatCurrency(entry.spend ?? 0)}`;
+                                return (
+                                  <div class="timeline-column" style={{ width: `${geometry.columnWidth}px` }} title={columnTitle}>
+                                    <div class="timeline-bars-stack">
+                                      <div
+                                        class="timeline-bar timeline-bar--pm"
+                                        style={{ height: `${pmHeight}%` }}
+                                        aria-hidden="true"
+                                      />
+                                      <div
+                                        class="timeline-bar timeline-bar--cb"
+                                        style={{ height: `${cbHeight}%` }}
+                                        aria-hidden="true"
+                                      />
+                                    </div>
+                                    <span class="timeline-month">{formatMonthLabel(entry.month)}</span>
+                                  </div>
+                                );
+                              }}
+                            </For>
+                          </div>
+                          <Show when={geometry.path.length > 0 && maxSpend > 0}>
+                            <svg
+                              class="timeline-svg"
+                              width={geometry.width}
+                              height={geometry.height}
+                              viewBox={`0 0 ${geometry.width} ${geometry.height}`}
+                              preserveAspectRatio="none"
+                              aria-hidden="true"
+                            >
+                              <path class="timeline-line" d={geometry.path} />
+                              <For each={geometry.points}>
+                                {(point) => (
+                                  <circle class="timeline-dot" cx={point.x} cy={point.y} r={4} />
+                                )}
+                              </For>
+                            </svg>
+                          </Show>
+                        </div>
+                      </div>
+                    </>
+                  );
+                })()}
+              </Show>
+            </section>
+
             <section class="summary-grid" aria-label="Location summary cards">
               <article
                 class={summaryCardClass('deficiencies', deficiencyStatus())}
@@ -905,20 +1049,24 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                 </header>
                 <dl class="summary-stats">
                   <div>
-                    <dt>Total spend</dt>
-                    <dd title="Total invoiced spend recorded in financial data.">{financialMetrics()?.total_spend != null ? formatCurrency(financialMetrics()?.total_spend ?? 0) : formatCurrency(financialTotals().total)}</dd>
+                    <dt>Proposed spend</dt>
+                    <dd title="Total proposed cost submitted for approval.">{formatCurrency(proposedTotal())}</dd>
                   </div>
                   <div>
-                    <dt>Approved</dt>
-                    <dd title="Spend approved for payment.">{financialMetrics()?.approved_spend != null ? formatCurrency(financialMetrics()?.approved_spend ?? 0) : formatCurrency(financialTotals().approved)}</dd>
+                    <dt>Approved spend</dt>
+                    <dd title="Spend approved for payment.">{formatCurrency(approvedTotal())}</dd>
                   </div>
                   <div>
-                    <dt>Open</dt>
-                    <dd title="Open or pending spend.">{financialMetrics()?.open_spend != null ? formatCurrency(financialMetrics()?.open_spend ?? 0) : formatCurrency(financialTotals().open)}</dd>
+                    <dt>Negotiated savings</dt>
+                    <dd title="Cumulative negotiated savings (delta).">{formatCurrency(negotiatedSavings())}</dd>
                   </div>
                   <div>
-                    <dt>Total savings</dt>
-                    <dd title="Cumulative negotiated savings (delta).">{formatCurrency(totalSavings())}</dd>
+                    <dt>Open spend</dt>
+                    <dd title="Open or pending spend awaiting action.">{formatCurrency(openTotal())}</dd>
+                  </div>
+                  <div>
+                    <dt>Invoiced spend</dt>
+                    <dd title="Total invoiced spend recorded in financial data.">{formatCurrency(actualSpend())}</dd>
                   </div>
                   <div>
                     <dt>Savings rate</dt>
@@ -929,6 +1077,9 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                     <dd title="Number of financial statements on record.">{financialSummary()?.total_records ?? 0}</dd>
                   </div>
                 </dl>
+                <Show when={savingsDeltaGap() > 1}>
+                  <p class="summary-note warning">Note: Recorded savings differ from proposed minus approved by {formatCurrency(savingsDeltaGap())}. Review open invoices for alignment.</p>
+                </Show>
               </article>
             </section>
 
@@ -1647,7 +1798,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
                     </div>
                     <div>
                       <span class="metric-label">Total savings</span>
-                      <span class="metric-value">{financialStatus() === 'missing' ? '—' : formatCurrency(totalSavings())}</span>
+                      <span class="metric-value">{financialStatus() === 'missing' ? '—' : formatCurrency(negotiatedSavings())}</span>
                     </div>
                     <div>
                       <span class="metric-label">Savings trend</span>

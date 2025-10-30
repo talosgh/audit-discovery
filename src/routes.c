@@ -137,6 +137,22 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
         return;
     }
 
+    if (strcmp(path, "/metrics/summary") == 0) {
+        char *error = NULL;
+        char *json = db_fetch_metrics_summary(conn, &error);
+        if (!json) {
+            char *body = build_error_response(error ? error : "Failed to load metrics summary");
+            send_http_json(client_fd, 500, "Internal Server Error", body);
+            free(body);
+            free(error);
+            return;
+        }
+        send_http_json(client_fd, 200, "OK", json);
+        free(json);
+        free(error);
+        return;
+    }
+
     if (strcmp(path, "/locations") == 0) {
         char *address_value = http_extract_query_param(query_string, "address");
         char *location_id_value = http_extract_query_param(query_string, "location_id");

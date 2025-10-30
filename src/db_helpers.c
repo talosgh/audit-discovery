@@ -194,10 +194,10 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         "FROM locations l "
         "LEFT JOIN stats ON stats.location_id = l.id "
         "LEFT JOIN service ON service.location_code = l.location_id "
-        "LEFT JOIN finance ON finance.location_id = CASE "
-        "       WHEN l.location_id ~ '^[0-9]+$' THEN l.location_id::int "
-        "       ELSE NULL "
-        "    END "
+        "LEFT JOIN finance ON ("
+        "       finance.location_id = l.id "
+        "    OR (l.location_id ~ '^[0-9]+$' AND finance.location_id = l.location_id::int)"
+        "    ) "
         "WHERE ($3 IS NULL OR "
         "       l.location_id ILIKE $3 OR "
         "       l.site_name ILIKE $3 OR "
@@ -323,6 +323,81 @@ oom:
     PQclear(res);
     if (error_out && !*error_out) {
         *error_out = strdup("Out of memory building location response");
+    }
+    return NULL;
+}
+
+char *db_fetch_metrics_summary(PGconn *conn, char **error_out) {
+    if (error_out) {
+        *error_out = NULL;
+    }
+    if (!conn) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Database connection unavailable");
+        }
+        return NULL;
+    }
+
+    const char *sql =
+        "SELECT "
+        "    COALESCE(SUM(COALESCE(delta, 0)), 0)::numeric AS total_savings, "
+        "    COALESCE(SUM(COALESCE(proposed_cost, 0)), 0)::numeric AS total_proposed, "
+        "    COALESCE(SUM(COALESCE(new_cost, 0)), 0)::numeric AS total_spend "
+        "FROM financial_data";
+
+    PGresult *res = PQexec(conn, sql);
+    if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = res ? PQresultErrorMessage(res) : PQerrorMessage(conn);
+            *error_out = strdup(msg ? msg : "Failed to load metrics summary");
+        }
+        if (res) {
+            PQclear(res);
+        }
+        return NULL;
+    }
+
+    double total_savings = 0.0;
+    double total_proposed = 0.0;
+    double total_spend = 0.0;
+    if (PQntuples(res) > 0) {
+        if (!PQgetisnull(res, 0, 0)) {
+            total_savings = strtod(PQgetvalue(res, 0, 0), NULL);
+        }
+        if (!PQgetisnull(res, 0, 1)) {
+            total_proposed = strtod(PQgetvalue(res, 0, 1), NULL);
+        }
+        if (!PQgetisnull(res, 0, 2)) {
+            total_spend = strtod(PQgetvalue(res, 0, 2), NULL);
+        }
+    }
+    PQclear(res);
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory assembling metrics summary");
+        }
+        return NULL;
+    }
+
+    if (!buffer_append_char(&buf, '{')) goto metrics_oom;
+    if (!buffer_append_cstr(&buf, "\"total_savings\":")) goto metrics_oom;
+    if (!buffer_appendf(&buf, "%.2f", total_savings)) goto metrics_oom;
+    if (!buffer_append_char(&buf, ',')) goto metrics_oom;
+    if (!buffer_append_cstr(&buf, "\"total_proposed\":")) goto metrics_oom;
+    if (!buffer_appendf(&buf, "%.2f", total_proposed)) goto metrics_oom;
+    if (!buffer_append_char(&buf, ',')) goto metrics_oom;
+    if (!buffer_append_cstr(&buf, "\"total_spend\":")) goto metrics_oom;
+    if (!buffer_appendf(&buf, "%.2f", total_spend)) goto metrics_oom;
+    if (!buffer_append_char(&buf, '}')) goto metrics_oom;
+
+    return buf.data;
+
+metrics_oom:
+    buffer_free(&buf);
+    if (error_out && !*error_out) {
+        *error_out = strdup("Out of memory assembling metrics summary");
     }
     return NULL;
 }
