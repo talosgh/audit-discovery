@@ -440,8 +440,10 @@ export interface TimelinePoint {
   pm: number;
   cb_emergency: number;
   cb_env: number;
+  cb_other?: number;
   tst: number;
   rp: number;
+  misc?: number;
   total?: number;
   callback_visits?: number;
   spend: number;

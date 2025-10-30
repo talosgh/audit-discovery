@@ -1269,12 +1269,20 @@ tbody tr:hover {
   background: #f59e0b;
 }
 
+.legend-swatch--cb-other {
+  background: #fb923c;
+}
+
 .legend-swatch--tst {
   background: #a855f7;
 }
 
 .legend-swatch--rp {
   background: #6b7280;
+}
+
+.legend-swatch--misc {
+  background: #94a3b8;
 }
 
 .legend-swatch--finance-bc {
@@ -1378,6 +1386,11 @@ tbody tr:hover {
   background: #f59e0b;
 }
 
+.timeline-bar--cb-other,
+.trend-segment--cb-other {
+  background: #fb923c;
+}
+
 .timeline-bar--tst,
 .trend-segment--tst {
   background: #a855f7;
@@ -1386,6 +1399,11 @@ tbody tr:hover {
 .timeline-bar--rp,
 .trend-segment--rp {
   background: #6b7280;
+}
+
+.timeline-bar--misc,
+.trend-segment--misc {
+  background: #94a3b8;
 }
 
 .timeline-bar--finance-bc,
@@ -1408,9 +1426,6 @@ tbody tr:hover {
   background: #22c55e;
 }
 
-.trend-segment--other {
-  background: #cbd5e1;
-}
 .timeline-stack--service .timeline-bar:first-child,
 .timeline-stack--finance .timeline-bar:first-child {
   border-radius: 4px 4px 0 0;

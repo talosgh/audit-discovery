@@ -612,9 +612,11 @@ const serviceTotals = createMemo(() => {
     const pm = Math.max(point.pm ?? 0, 0);
     const cbEmergency = Math.max(point.cb_emergency ?? 0, 0);
     const cbEnv = Math.max(point.cb_env ?? 0, 0);
+    const cbOther = Math.max(point.cb_other ?? 0, 0);
     const tst = Math.max(point.tst ?? 0, 0);
     const rp = Math.max(point.rp ?? 0, 0);
-    return point.total ?? pm + cbEmergency + cbEnv + tst + rp;
+    const misc = Math.max(point.misc ?? 0, 0);
+    return point.total ?? pm + cbEmergency + cbEnv + cbOther + tst + rp + misc;
   });
 });
 const financeTotals = createMemo(() => {
@@ -643,14 +645,15 @@ const timelineMaxSpend = createMemo(() => {
 });
 const hasServiceData = createMemo(() => serviceTotals().some((total) => total > 0));
 const hasFinanceData = createMemo(() => financeTotals().some((total) => total > 0));
-  const serviceSegmentLabels = {
-    pm: 'Preventative maintenance',
-    cbEmergency: 'Emergency callbacks',
-    cbEnv: 'Environmental callbacks',
-    tst: 'Testing',
-    rp: 'Repair / modernization',
-    other: 'Other / unclassified'
-  } as const;
+const serviceSegmentLabels = {
+  pm: 'Preventative maintenance',
+  cbEmergency: 'Emergency callbacks',
+  cbEnv: 'Environmental callbacks',
+  cbOther: 'Other callbacks',
+  tst: 'Testing',
+  rp: 'Repair / modernization',
+  misc: 'Site visits / misc'
+} as const;
 
   const financialSegmentLabels = {
     bc: 'Base contract spend',
@@ -1016,8 +1019,10 @@ const showFinance = createMemo(() => hasFinanceData());
                             <span class="legend-item"><span class="legend-swatch legend-swatch--pm" /> {serviceSegmentLabels.pm}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--cb-emergency" /> {serviceSegmentLabels.cbEmergency}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--cb-env" /> {serviceSegmentLabels.cbEnv}</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--cb-other" /> {serviceSegmentLabels.cbOther}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--tst" /> {serviceSegmentLabels.tst}</span>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--rp" /> {serviceSegmentLabels.rp}</span>
+                            <span class="legend-item"><span class="legend-swatch legend-swatch--misc" /> {serviceSegmentLabels.misc}</span>
                           </Show>
                           <Show when={showFinance()}>
                             <span class="legend-item"><span class="legend-swatch legend-swatch--finance-bc" /> {financialSegmentLabels.bc}</span>
@@ -1036,13 +1041,17 @@ const showFinance = createMemo(() => hasFinanceData());
                                     const pmValue = Math.max(entry.pm ?? 0, 0);
                                     const cbEmergencyValue = Math.max(entry.cb_emergency ?? 0, 0);
                                     const cbEnvValue = Math.max(entry.cb_env ?? 0, 0);
+                                    const cbOtherValue = Math.max(entry.cb_other ?? 0, 0);
                                     const tstValue = Math.max(entry.tst ?? 0, 0);
                                     const rpValue = Math.max(entry.rp ?? 0, 0);
-                                    const totalValue = Math.max(entry.total ?? pmValue + cbEmergencyValue + cbEnvValue + tstValue + rpValue, 0);
+                                    const miscValue = Math.max(entry.misc ?? 0, 0);
+                                    const totalValue = Math.max(entry.total ?? pmValue + cbEmergencyValue + cbEnvValue + cbOtherValue + tstValue + rpValue + miscValue, 0);
                                     const serviceSegments = [
+                                      { value: miscValue, className: 'timeline-bar--misc', label: serviceSegmentLabels.misc },
                                       { value: rpValue, className: 'timeline-bar--rp', label: serviceSegmentLabels.rp },
                                       { value: tstValue, className: 'timeline-bar--tst', label: serviceSegmentLabels.tst },
                                       { value: cbEnvValue, className: 'timeline-bar--cb-env', label: serviceSegmentLabels.cbEnv },
+                                      { value: cbOtherValue, className: 'timeline-bar--cb-other', label: serviceSegmentLabels.cbOther },
                                       { value: cbEmergencyValue, className: 'timeline-bar--cb-emergency', label: serviceSegmentLabels.cbEmergency },
                                       { value: pmValue, className: 'timeline-bar--pm', label: serviceSegmentLabels.pm }
                                     ];
@@ -1061,8 +1070,10 @@ const showFinance = createMemo(() => hasFinanceData());
                                     columnTitleParts.push(`${serviceSegmentLabels.pm}: ${pmValue}`);
                                     columnTitleParts.push(`${serviceSegmentLabels.cbEmergency}: ${cbEmergencyValue}`);
                                     columnTitleParts.push(`${serviceSegmentLabels.cbEnv}: ${cbEnvValue}`);
+                                    columnTitleParts.push(`${serviceSegmentLabels.cbOther}: ${cbOtherValue}`);
                                     columnTitleParts.push(`${serviceSegmentLabels.tst}: ${tstValue}`);
                                     columnTitleParts.push(`${serviceSegmentLabels.rp}: ${rpValue}`);
+                                    columnTitleParts.push(`${serviceSegmentLabels.misc}: ${miscValue}`);
                                     columnTitleParts.push(`Total tracked: ${totalValue}`);
                                     columnTitleParts.push(`${financialSegmentLabels.bc}: ${formatCurrency(bcSpend)}`);
                                     columnTitleParts.push(`${financialSegmentLabels.opex}: ${formatCurrency(opexSpend)}`);
@@ -1419,7 +1430,7 @@ const showFinance = createMemo(() => hasFinanceData());
                                 { value: rpValue, className: 'trend-segment--rp', label: serviceSegmentLabels.rp }
                               ];
                               if (otherValue > 0) {
-                                segments.push({ value: otherValue, className: 'trend-segment--other', label: serviceSegmentLabels.other });
+                                segments.push({ value: otherValue, className: 'trend-segment--misc', label: serviceSegmentLabels.misc });
                               }
                               const segmentTotal = segments.reduce((sum, seg) => sum + Math.max(seg.value, 0), 0);
                               const width = segmentTotal > 0 && serviceTrendMax() > 0 ? Math.max(8, (segmentTotal / serviceTrendMax()) * 100) : 0;
@@ -1431,7 +1442,7 @@ const showFinance = createMemo(() => hasFinanceData());
                               tooltipBits.push(`${serviceSegmentLabels.cbEnv}: ${cbEnvValue}`);
                               tooltipBits.push(`${serviceSegmentLabels.tst}: ${tstValue}`);
                               tooltipBits.push(`${serviceSegmentLabels.rp}: ${rpValue}`);
-                              if (otherValue > 0) tooltipBits.push(`${serviceSegmentLabels.other}: ${otherValue}`);
+                              if (otherValue > 0) tooltipBits.push(`${serviceSegmentLabels.misc}: ${otherValue}`);
                               return (
                                 <div class="trend-row" title={`${point.month ?? '—'}: ${tooltipBits.join(' · ') || 'No data'}`}>
                                   <span class="trend-label">{point.month ?? '—'}</span>
