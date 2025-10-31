@@ -106,34 +106,6 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     const preventative = summary.find((item) => item.category?.toLowerCase().includes('preventative'));
     return preventative ? preventative.share * 100 : null;
   });
-  const dataCoverage = createMemo(() => {
-    return [
-      {
-        key: 'audits',
-        label: 'Audit',
-        available: deficiencyAvailable(),
-        status: deficiencyStatus()
-      },
-      {
-        key: 'service',
-        label: 'Service',
-        available: serviceAvailable(),
-        status: serviceStatus()
-      },
-      {
-        key: 'financial',
-        label: 'Financial',
-        available: financialAvailable(),
-        status: financialStatus()
-      },
-      {
-        key: 'timeline',
-        label: 'History',
-        available: timelineData().length > 0,
-        status: timelineData().length > 0 ? 'complete' : 'missing'
-      }
-    ];
-  });
   const [timelineAutoScrolled, setTimelineAutoScrolled] = createSignal(false);
   const [timelineHintVisible, setTimelineHintVisible] = createSignal(false);
   const [timelineViewportWidth, setTimelineViewportWidth] = createSignal(0);
@@ -766,6 +738,35 @@ const serviceSegmentLabels = {
 
 const showService = createMemo(() => timelineHasService() || hasServiceData());
 const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData());
+const dataCoverage = createMemo(() => {
+  const hasTimeline = timelineData().length > 0;
+  return [
+    {
+      key: 'audits',
+      label: 'Audit',
+      available: deficiencyAvailable(),
+      status: deficiencyStatus()
+    },
+    {
+      key: 'service',
+      label: 'Service',
+      available: serviceAvailable(),
+      status: serviceStatus()
+    },
+    {
+      key: 'financial',
+      label: 'Financial',
+      available: financialAvailable(),
+      status: financialStatus()
+    },
+    {
+      key: 'timeline',
+      label: 'History',
+      available: hasTimeline,
+      status: hasTimeline ? 'complete' : 'missing'
+    }
+  ];
+});
 
   const timelineGeometry = createMemo(() => {
     const data = timelineData();
