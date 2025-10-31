@@ -13414,14 +13414,27 @@ static int build_location_overview_tex(const ReportJob *job,
             free(label_clean);
             if (!label_tex) goto cleanup;
             if (!buffer_appendf(&buf, "%s & %ld & ", label_tex, tickets)) {
+                log_error("Failed to append service activity tickets (label=%s, tickets=%ld)", label ? label : "Unknown", tickets);
                 free(label_tex);
                 goto cleanup;
             }
             free(label_tex);
-            if (!buffer_appendf(&buf, "%.2f", hours_clamped)) goto cleanup;
-            if (!buffer_append_cstr(&buf, " & ")) goto cleanup;
-            if (!buffer_append_percent(&buf, share, 1)) goto cleanup;
-            if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+            if (!buffer_appendf(&buf, "%.2f", hours_clamped)) {
+                log_error("Failed to append service activity hours (label=%s, hours=%.4f)", label ? label : "Unknown", hours_clamped);
+                goto cleanup;
+            }
+            if (!buffer_append_cstr(&buf, " & ")) {
+                log_error("Failed to append service activity separator (label=%s)", label ? label : "Unknown");
+                goto cleanup;
+            }
+            if (!buffer_append_percent(&buf, share, 1)) {
+                log_error("Failed to append service activity share (label=%s, share=%.4f)", label ? label : "Unknown", share);
+                goto cleanup;
+            }
+            if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                log_error("Failed to finish service activity row (label=%s)", label ? label : "Unknown");
+                goto cleanup;
+            }
         }
         if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
         fail_stage = "writing service performance";
