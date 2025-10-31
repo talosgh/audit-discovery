@@ -1,5 +1,5 @@
 import type { Component } from 'solid-js';
-import { For, Match, Show, Switch, createEffect, createMemo, createResource, createSignal } from 'solid-js';
+import { For, Show, createEffect, createMemo, createResource, createSignal } from 'solid-js';
 import { fetchLocations } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
@@ -91,18 +91,19 @@ const LocationList: Component<LocationListProps> = (props) => {
         </div>
       </div>
 
-      <Switch>
-        <Match when={locations.error}>
-          <ErrorMessage message={(locations.error as Error).message} onRetry={() => refetch()} />
-        </Match>
-        <Match when={isLoading()}>
-          <LoadingIndicator message="Loading locations…" />
-        </Match>
-        <Match when={items().length === 0}>
-          <div class="empty-state">No locations found. Try updating your search or refresh the list.</div>
-        </Match>
-        <Match when={items().length > 0}>
-          <div class="table-wrapper" role="region" aria-live="polite">
+      {(() => {
+        if (locations.error) {
+          return <ErrorMessage message={(locations.error as Error).message} onRetry={() => refetch()} />;
+        }
+        if (isLoading()) {
+          return <LoadingIndicator message="Loading locations…" />;
+        }
+        if (items().length === 0) {
+          return <div class="empty-state">No locations found. Try updating your search or refresh the list.</div>;
+        }
+        return (
+          <>
+            <div class="table-wrapper" role="region" aria-live="polite">
             <table>
               <thead>
                 <tr>
@@ -182,7 +183,7 @@ const LocationList: Component<LocationListProps> = (props) => {
             </table>
           </div>
 
-          <div class="pagination-controls">
+            <div class="pagination-controls">
             <div class="page-info">
               <Show when={total() > 0} fallback={<span>No matching locations</span>}>
                 <span>
@@ -198,9 +199,10 @@ const LocationList: Component<LocationListProps> = (props) => {
                 Next
               </button>
             </div>
-          </div>
-        </Match>
-      </Switch>
+            </div>
+          </>
+        );
+      })()}
     </section>
   );
 };

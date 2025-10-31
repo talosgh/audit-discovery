@@ -101,6 +101,29 @@ score = open_deficiencies * 4
 The score highlights units with persistent issues or compliance gaps. Tooltips on the chart show
 the exact score per unit.
 
+### Modernization & Vendor Advisory
+
+The advisory module combines multiple signals to deliver actionable guidance:
+
+- **Preventative maintenance cadence** – expected PM visits are derived from
+  `device_count × (months_observed ÷ 3)`. Locations fall into a "needs attention" posture when
+  actual PM coverage drops below 75% or when annual testing (minimum one TST per device per year)
+  is not met. Messaging directs operators to stabilize PM and schedule a site audit before
+  considering capital work.
+- **Modernization ROI** – the environment variable `MODERNIZATION_COST_PER_DEVICE`
+  (default `250000`) sets the modernization baseline. OPEX from the latest 6–12 months is
+  annualised and paired with equipment-failure callbacks (`CB-EF`). A savings factor (15–50%) is
+  scaled by failure intensity; if PM coverage is weak, the factor is heavily discounted. Payback is
+  computed as `(cost_per_device × device_count) / expected_savings`, producing statuses of
+  *insufficient*, *defer*, *monitor*, *consider*, or *plan* (<8 year payback or ≥3 failures per
+  device annually).
+- **Vendor posture** – proposal outcomes contribute denied, negotiated, and challenged rates, and
+  audit closure velocity supplies a service-quality check. >20% denied, >15% challenged, or
+  deficiency closure <65% triggers a "needs review" posture; negotiated rates above 40% prompt a
+  "monitor" recommendation for potential overbilling.
+- Advisory JSON includes ratios, expected vs. actual counts, annualised spend, and synthesized
+  messaging so the dashboard can render human-readable guidance backed by consistent math.
+
 ### Coverage Indicators
 
 Location list data dots use backend booleans:
@@ -136,4 +159,3 @@ exists, coverage markers remain "missing" and summary cards render as inactive.
 
 This whitepaper should help stakeholders understand how each visualization is computed and why the
 supporting tooltips and metrics readouts are trustworthy.
-

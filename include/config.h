@@ -13,6 +13,7 @@ extern char *g_report_assets_dir;
 extern char *g_xai_api_key;
 extern char *g_google_api_key;
 extern char *g_google_region_code;
+extern double g_modernization_cost_per_device;
 
 int load_env_file(const char *path);
 

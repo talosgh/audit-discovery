@@ -17,6 +17,7 @@ char *g_report_assets_dir = NULL;
 char *g_xai_api_key = NULL;
 char *g_google_api_key = NULL;
 char *g_google_region_code = NULL;
+double g_modernization_cost_per_device = 250000.0;
 
 static void trim_inplace(char *str) {
     if (!str) {

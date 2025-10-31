@@ -439,6 +439,7 @@ export interface TimelinePoint {
   month: string;
   pm: number;
   cb_emergency: number;
+  cb_equipment?: number;
   cb_env: number;
   cb_other?: number;
   tst: number;
@@ -462,16 +463,56 @@ export interface LocationAnalyticsOverview {
   };
 }
 
+export interface MaintenanceAdvisory {
+  status: string;
+  pm_actual: number;
+  pm_expected: number | null;
+  pm_ratio: number | null;
+  tst_actual: number;
+  tst_expected: number | null;
+  tst_ratio: number | null;
+  window_months: number;
+  message: string;
+}
+
+export interface ModernizationAdvisory {
+  status: string;
+  equipment_callbacks_per_device: number | null;
+  callbacks_per_device_per_year: number | null;
+  callback_events: number;
+  opex_annual: number | null;
+  expected_savings: number | null;
+  payback_years: number | null;
+  modernization_cost: number | null;
+  message: string;
+}
+
+export interface VendorAdvisory {
+  status: string;
+  denied_rate: number | null;
+  negotiated_rate: number | null;
+  challenged_rate: number | null;
+  closure_rate: number | null;
+  message: string;
+}
+
+export interface LocationAdvisory {
+  maintenance: MaintenanceAdvisory;
+  modernization: ModernizationAdvisory;
+  vendor: VendorAdvisory;
+}
+
 export interface LocationAnalytics {
   overview: LocationAnalyticsOverview;
   deficiencies: DeficiencyAnalytics;
   service: ServiceAnalyticsSection;
   financial: FinancialAnalyticsSection;
   timeline?: {
-    data: TimelinePoint[];
-    has_service: boolean;
-    has_financial: boolean;
+  data: TimelinePoint[];
+  has_service: boolean;
+  has_financial: boolean;
   };
+  advisory?: LocationAdvisory;
 }
 
 export interface MetricsSummary {

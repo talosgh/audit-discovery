@@ -266,12 +266,28 @@ typedef struct {
     double previous_savings;
     int savings_points;
     double savings_rate;
+    long denied_records;
+    long negotiated_records;
+    long challenged_records;
+    double negotiated_savings_total;
 } FinancialAnalytics;
 
 typedef struct {
     bool correlation_valid;
     double correlation;
     int sample_count;
+    int months_covered;
+    int months_window;
+    long pm_window_total;
+    long tst_window_total;
+    long rp_window_total;
+    long cb_equipment_window_total;
+    long cb_emergency_window_total;
+    long cb_all_window_total;
+    double spend_opex_window_total;
+    double spend_total_window_total;
+    double spend_bc_window_total;
+    double spend_capex_window_total;
 } TimelineStats;
 
 static bool timeline_json_has_entries(const char *json) {
@@ -296,6 +312,7 @@ typedef struct {
     char *month;
     long pm_count;
     long cb_emergency_count;
+    long cb_equipment_count;
     long cb_env_count;
     long cb_other_count;
     long tst_count;
@@ -6287,6 +6304,8 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         return NULL;
     }
 
+    (void)lookup_address;
+
     if (analytics_out) {
         memset(analytics_out, 0, sizeof(*analytics_out));
     }
@@ -6821,6 +6840,48 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         }
     }
     PQclear(res);
+
+    long denied_count = 0;
+    long negotiated_count = 0;
+    long challenged_count = 0;
+    double negotiated_savings = 0.0;
+    const char *sql_quality =
+        "SELECT "
+        "  SUM(CASE WHEN status ILIKE 'Denied%%' THEN 1 ELSE 0 END)::bigint AS denied_count, "
+        "  SUM(CASE WHEN COALESCE(delta,0) > 0 THEN 1 ELSE 0 END)::bigint AS negotiated_count, "
+        "  SUM(CASE WHEN status ILIKE 'Challenged%%' "
+        "            OR status ILIKE 'Dispute%%' "
+        "            OR analyst_review ILIKE '%%challeng%%' "
+        "            OR analyst_review ILIKE '%%dispute%%' THEN 1 ELSE 0 END)::bigint AS challenged_count, "
+        "  COALESCE(SUM(CASE WHEN COALESCE(delta,0) > 0 THEN COALESCE(delta,0) ELSE 0 END),0)::numeric AS negotiated_savings "
+        "FROM financial_data "
+        "WHERE location_id = COALESCE($1::int, $2::int)";
+    PGresult *quality_res = PQexecParams(conn, sql_quality, 2, NULL, params, NULL, NULL, 0);
+    if (PQresultStatus(quality_res) != PGRES_TUPLES_OK) {
+        if (error_out && !*error_out) {
+            const char *msg = PQresultErrorMessage(quality_res);
+            *error_out = strdup(msg ? msg : "Failed to compute financial quality metrics");
+        }
+        PQclear(quality_res);
+        free(last_statement);
+        return NULL;
+    }
+    if (PQntuples(quality_res) > 0) {
+        if (!PQgetisnull(quality_res, 0, 0)) {
+            denied_count = strtol(PQgetvalue(quality_res, 0, 0), NULL, 10);
+        }
+        if (!PQgetisnull(quality_res, 0, 1)) {
+            negotiated_count = strtol(PQgetvalue(quality_res, 0, 1), NULL, 10);
+        }
+        if (!PQgetisnull(quality_res, 0, 2)) {
+            challenged_count = strtol(PQgetvalue(quality_res, 0, 2), NULL, 10);
+        }
+        if (!PQgetisnull(quality_res, 0, 3)) {
+            negotiated_savings = strtod(PQgetvalue(quality_res, 0, 3), NULL);
+        }
+    }
+    PQclear(quality_res);
+
     double savings_rate = (proposed_spend > 0.0) ? (total_savings / proposed_spend) : 0.0;
     if (analytics_out) {
         analytics_out->has_records = (total_records > 0) || (total_spend > 0.0);
@@ -6831,6 +6892,10 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         analytics_out->total_savings = total_savings;
         analytics_out->proposed_spend = proposed_spend;
         analytics_out->savings_rate = savings_rate;
+        analytics_out->denied_records = denied_count;
+        analytics_out->negotiated_records = negotiated_count;
+        analytics_out->challenged_records = challenged_count;
+        analytics_out->negotiated_savings_total = negotiated_savings;
     }
 
     const char *sql_trend =
@@ -7391,6 +7456,7 @@ static int timeline_ensure_entry(TimelineEntry **entries, size_t *count, size_t 
     }
     entry->pm_count = 0;
     entry->cb_emergency_count = 0;
+    entry->cb_equipment_count = 0;
     entry->cb_env_count = 0;
     entry->cb_other_count = 0;
     entry->tst_count = 0;
@@ -7459,9 +7525,8 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
     if (service_available) *service_available = false;
     if (financial_available) *financial_available = false;
     if (stats) {
+        memset(stats, 0, sizeof(*stats));
         stats->correlation_valid = false;
-        stats->correlation = 0.0;
-        stats->sample_count = 0;
     }
     if (error_out) {
         *error_out = NULL;
@@ -7563,8 +7628,12 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
                     entry->tst_count += 1;
                     break;
                 case SERVICE_ACTIVITY_CALLBACK_EMERGENCY:
+                    entry->cb_emergency_count += 1;
+                    is_callback = true;
+                    break;
                 case SERVICE_ACTIVITY_CALLBACK_EQUIPMENT:
                     entry->cb_emergency_count += 1;
+                    entry->cb_equipment_count += 1;
                     is_callback = true;
                     break;
                 case SERVICE_ACTIVITY_CALLBACK_ENVIRONMENTAL:
@@ -7688,6 +7757,7 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
                     if (source) {
                     expanded[idx].pm_count = source->pm_count;
                         expanded[idx].cb_emergency_count = source->cb_emergency_count;
+                        expanded[idx].cb_equipment_count = source->cb_equipment_count;
                         expanded[idx].cb_env_count = source->cb_env_count;
                         expanded[idx].cb_other_count = source->cb_other_count;
                         expanded[idx].tst_count = source->tst_count;
@@ -7703,6 +7773,7 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
                     } else {
                         expanded[idx].pm_count = 0;
                         expanded[idx].cb_emergency_count = 0;
+                        expanded[idx].cb_equipment_count = 0;
                         expanded[idx].cb_env_count = 0;
                         expanded[idx].cb_other_count = 0;
                         expanded[idx].tst_count = 0;
@@ -7730,6 +7801,34 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
     }
 
     if (stats) {
+        stats->months_covered = (int)entry_count;
+        int window = 0;
+        stats->pm_window_total = 0;
+        stats->tst_window_total = 0;
+        stats->rp_window_total = 0;
+        stats->cb_equipment_window_total = 0;
+        stats->cb_emergency_window_total = 0;
+        stats->cb_all_window_total = 0;
+        stats->spend_opex_window_total = 0.0;
+        stats->spend_total_window_total = 0.0;
+        stats->spend_bc_window_total = 0.0;
+        stats->spend_capex_window_total = 0.0;
+        for (size_t rev = entry_count; rev > 0 && window < 12; --rev) {
+            const TimelineEntry *entry = &entries[rev - 1];
+            stats->pm_window_total += entry->pm_count;
+            stats->tst_window_total += entry->tst_count;
+            stats->rp_window_total += entry->rp_count;
+            stats->cb_equipment_window_total += entry->cb_equipment_count;
+            stats->cb_emergency_window_total += entry->cb_emergency_count;
+            stats->cb_all_window_total += entry->callback_count;
+            stats->spend_opex_window_total += entry->spend_opex;
+            stats->spend_total_window_total += entry->spend_amount;
+            stats->spend_bc_window_total += entry->spend_bc;
+            stats->spend_capex_window_total += entry->spend_capex;
+            window += 1;
+        }
+        stats->months_window = window;
+
         if (!financial_available || !service_available) {
             stats->sample_count = 0;
             stats->correlation = 0.0;
@@ -7787,6 +7886,8 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
         if (!buffer_appendf(&buf, "%ld", entries[i].pm_count)) goto timeline_oom;
         if (!buffer_append_cstr(&buf, ",\"cb_emergency\":")) goto timeline_oom;
         if (!buffer_appendf(&buf, "%ld", entries[i].cb_emergency_count)) goto timeline_oom;
+        if (!buffer_append_cstr(&buf, ",\"cb_equipment\":")) goto timeline_oom;
+        if (!buffer_appendf(&buf, "%ld", entries[i].cb_equipment_count)) goto timeline_oom;
         if (!buffer_append_cstr(&buf, ",\"cb_env\":")) goto timeline_oom;
         if (!buffer_appendf(&buf, "%ld", entries[i].cb_env_count)) goto timeline_oom;
         if (!buffer_append_cstr(&buf, ",\"cb_other\":")) goto timeline_oom;
@@ -7836,6 +7937,33 @@ static double safe_divide(double numerator, double denominator) {
         return NAN;
     }
     return numerator / denominator;
+}
+
+static double clamp_double(double value, double min_value, double max_value) {
+    if (value < min_value) {
+        return min_value;
+    }
+    if (value > max_value) {
+        return max_value;
+    }
+    return value;
+}
+
+static int buffer_append_double_or_null(Buffer *buf, double value, int precision) {
+    if (!buf) {
+        return 0;
+    }
+    if (!isfinite(value)) {
+        return buffer_append_cstr(buf, "null");
+    }
+    char fmt[16];
+    if (precision < 0) {
+        precision = 0;
+    } else if (precision > 6) {
+        precision = 6;
+    }
+    snprintf(fmt, sizeof(fmt), "%%.%df", precision);
+    return buffer_appendf(buf, fmt, value);
 }
 
 static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats, bool timeline_has_service, bool timeline_has_financial) {
@@ -7945,6 +8073,174 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
         savings_trend = "insufficient";
     }
 
+    int timeline_window_months = (timeline_stats && timeline_stats->months_window > 0) ? timeline_stats->months_window : 0;
+    long pm_actual_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->pm_window_total : 0;
+    long tst_actual_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->tst_window_total : 0;
+    long cb_equipment_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->cb_equipment_window_total : 0;
+    long cb_all_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->cb_all_window_total : 0;
+    double pm_expected = NAN;
+    double tst_expected = NAN;
+    double pm_ratio = NAN;
+    double tst_ratio = NAN;
+    if (timeline_window_months > 0 && device_count > 0) {
+        double window_months_d = (double)timeline_window_months;
+        pm_expected = (double)device_count * (window_months_d / 3.0);
+        tst_expected = (double)device_count * (window_months_d / 12.0);
+        if (pm_expected > 0.0) {
+            pm_ratio = (double)pm_actual_count / pm_expected;
+        }
+        if (tst_expected > 0.0) {
+            tst_ratio = (double)tst_actual_count / tst_expected;
+        }
+    }
+
+    double annual_factor = (timeline_window_months > 0) ? (12.0 / (double)timeline_window_months) : NAN;
+    double opex_annualized = (timeline_stats && isfinite(annual_factor)) ? timeline_stats->spend_opex_window_total * annual_factor : NAN;
+    double equipment_per_device_per_year = NAN;
+    double callbacks_per_device_per_year = NAN;
+    if (isfinite(annual_factor) && device_count > 0) {
+        equipment_per_device_per_year = ((double)cb_equipment_count * annual_factor) / (double)device_count;
+        callbacks_per_device_per_year = ((double)cb_all_count * annual_factor) / (double)device_count;
+    }
+
+    const double modernization_cost_per_device = g_modernization_cost_per_device > 0.0 ? g_modernization_cost_per_device : 0.0;
+    double modernization_total_cost = modernization_cost_per_device * (device_count > 0 ? (double)device_count : 1.0);
+    double modernization_expected_savings = 0.0;
+    double modernization_payback_years = NAN;
+
+    const char *maintenance_status = "insufficient";
+    const char *modernization_status = "insufficient";
+    const char *vendor_status = "insufficient";
+    char maintenance_message[256];
+    char modernization_message[256];
+    char vendor_message[256];
+    maintenance_message[0] = '\0';
+    modernization_message[0] = '\0';
+    vendor_message[0] = '\0';
+
+    bool pm_valid = isfinite(pm_ratio);
+    bool tst_valid = isfinite(tst_ratio);
+    if (timeline_window_months <= 0 || device_count <= 0) {
+        maintenance_status = "insufficient";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Not enough recent service history to evaluate maintenance cadence.");
+    } else if (pm_valid && pm_ratio < 0.75) {
+        maintenance_status = "attention";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Preventative maintenance is at %.0f%% (%ld visits vs. %.1f expected over the last %d months). Increase PM cadence and schedule a site audit.",
+                 pm_ratio * 100.0, pm_actual_count, pm_expected, timeline_window_months);
+    } else if (tst_valid && tst_ratio < 0.75) {
+        maintenance_status = "attention";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Testing cadence is low at %.0f%% (%ld tests vs. %.1f expected). Ensure annual testing is completed for each device.",
+                 tst_ratio * 100.0, tst_actual_count, tst_expected);
+    } else if ((pm_valid && pm_ratio >= 0.95) && (!tst_valid || tst_ratio >= 0.9)) {
+        maintenance_status = "healthy";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Preventative maintenance is strong at %.0f%% and testing is on track. Continue the current maintenance program.",
+                 pm_ratio * 100.0);
+    } else {
+        maintenance_status = "watch";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Maintenance cadence is mostly on target, but continue to monitor PM (%.0f%%) and testing (%.0f%%) coverage.",
+                 pm_valid ? pm_ratio * 100.0 : 100.0, tst_valid ? tst_ratio * 100.0 : 100.0);
+    }
+
+    double reliability_factor = 0.0;
+    if (isfinite(equipment_per_device_per_year)) {
+        reliability_factor = clamp_double((equipment_per_device_per_year - 1.0) / 4.0, 0.0, 1.0);
+    }
+    double savings_factor = 0.0;
+    if (isfinite(reliability_factor)) {
+        savings_factor = 0.15 + 0.35 * reliability_factor;
+    }
+    if (pm_valid && pm_ratio < 0.75) {
+        savings_factor *= 0.2;
+    }
+
+    if (timeline_window_months < 6 || !isfinite(opex_annualized) || opex_annualized <= 0.0 || device_count <= 0) {
+        modernization_status = "insufficient";
+        snprintf(modernization_message, sizeof(modernization_message),
+                 "Modernization ROI cannot be evaluated yet; accumulate at least six months of OPEX and service data.");
+        modernization_expected_savings = NAN;
+        modernization_payback_years = NAN;
+    } else if (pm_valid && pm_ratio < 0.75) {
+        modernization_status = "defer";
+        snprintf(modernization_message, sizeof(modernization_message),
+                 "Address preventative maintenance gaps before pursuing modernization. Current PM coverage is %.0f%%.", pm_ratio * 100.0);
+        modernization_expected_savings = NAN;
+        modernization_payback_years = NAN;
+    } else {
+        modernization_expected_savings = opex_annualized * clamp_double(savings_factor, 0.0, 0.5);
+        if (modernization_expected_savings > 0.0) {
+            modernization_payback_years = modernization_total_cost / modernization_expected_savings;
+        }
+        if (!isfinite(modernization_payback_years) || modernization_payback_years <= 0.0) {
+            modernization_status = "monitor";
+            snprintf(modernization_message, sizeof(modernization_message),
+                     "With annual OPEX of $%.0f, modernization savings are unclear. Monitor equipment health and revisit after trend stabilizes.",
+                     opex_annualized);
+            modernization_expected_savings = NAN;
+            modernization_payback_years = NAN;
+        } else if (modernization_payback_years <= 8.0 || (isfinite(equipment_per_device_per_year) && equipment_per_device_per_year >= 3.0)) {
+            modernization_status = "plan";
+            snprintf(modernization_message, sizeof(modernization_message),
+                     "Modernization could recover costs in approximately %.1f years with estimated savings of $%.0f per year.",
+                     modernization_payback_years, modernization_expected_savings);
+        } else if (modernization_payback_years <= 12.0) {
+            modernization_status = "consider";
+            snprintf(modernization_message, sizeof(modernization_message),
+                     "Modernization payback is roughly %.1f years. Evaluate during capital planning, especially if failures persist (%.1f equipment callbacks/device/year).",
+                     modernization_payback_years,
+                     isfinite(equipment_per_device_per_year) ? equipment_per_device_per_year : 0.0);
+        } else {
+            modernization_status = "monitor";
+            snprintf(modernization_message, sizeof(modernization_message),
+                     "Modernization payback exceeds %.1f years. Continue optimizing maintenance and track OPEX trends before committing.",
+                     modernization_payback_years);
+        }
+        if (modernization_status[0] != 'i' && modernization_status[0] != 'd' && isfinite(closure_rate) && closure_rate < 0.65) {
+            strncat(modernization_message, " Address outstanding deficiencies in parallel.", sizeof(modernization_message) - strlen(modernization_message) - 1);
+        }
+    }
+
+    double denied_rate = NAN;
+    double negotiated_rate = NAN;
+    double challenged_rate = NAN;
+    double closure_percent = isfinite(closure_rate) ? closure_rate * 100.0 : NAN;
+    if (financial_available && financial_stats) {
+        denied_rate = safe_divide((double)financial_stats->denied_records, (double)financial_stats->total_records);
+        negotiated_rate = safe_divide((double)financial_stats->negotiated_records, (double)financial_stats->total_records);
+        challenged_rate = safe_divide((double)financial_stats->challenged_records, (double)financial_stats->total_records);
+    }
+    if (!financial_available || !financial_stats || financial_stats->total_records <= 0) {
+        vendor_status = "insufficient";
+        snprintf(vendor_message, sizeof(vendor_message),
+                 "Financial records are limited; unable to evaluate vendor proposal quality.");
+    } else {
+        bool closure_poor = isfinite(closure_rate) && closure_rate < 0.65;
+        bool denied_high = isfinite(denied_rate) && denied_rate > 0.2;
+        bool challenges_high = isfinite(challenged_rate) && challenged_rate > 0.15;
+        bool negotiated_high = isfinite(negotiated_rate) && negotiated_rate > 0.4;
+        if (denied_high || challenges_high || closure_poor) {
+            vendor_status = "needs_review";
+            snprintf(vendor_message, sizeof(vendor_message),
+                     "Vendor performance warrants review: %.0f%% denied, %.0f%% challenged, deficiency closure at %.0f%%.",
+                     isfinite(denied_rate) ? denied_rate * 100.0 : 0.0,
+                     isfinite(challenged_rate) ? challenged_rate * 100.0 : 0.0,
+                     isfinite(closure_percent) ? closure_percent : 0.0);
+        } else if (negotiated_high) {
+            vendor_status = "monitor";
+            snprintf(vendor_message, sizeof(vendor_message),
+                     "Negotiations are common (%.0f%% of proposals trimmed). Continue monitoring pricing discipline.",
+                     isfinite(negotiated_rate) ? negotiated_rate * 100.0 : 0.0);
+        } else {
+            vendor_status = "stable";
+            snprintf(vendor_message, sizeof(vendor_message),
+                     "Proposal and closure patterns appear healthy. Maintain current vendor cadence.");
+        }
+    }
+
     if (!buffer_append_char(&buf, '{')) goto oom;
 
     if (!buffer_append_cstr(&buf, "\"overview\":{")) goto oom;
@@ -7961,6 +8257,68 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
     if (!buffer_append_cstr(&buf, "\"financial\":")) goto oom;
     if (!buffer_append_json_string(&buf, coverage_status(financial_available_timeline))) goto oom;
     if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+
+    if (!buffer_append_cstr(&buf, ",\"advisory\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"maintenance\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"status\":")) goto oom;
+    if (!buffer_append_json_string(&buf, maintenance_status)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"pm_actual\":")) goto oom;
+    if (!buffer_appendf(&buf, "%ld", pm_actual_count)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"pm_expected\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, pm_expected, 2)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"pm_ratio\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, pm_ratio, 3)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"tst_actual\":")) goto oom;
+    if (!buffer_appendf(&buf, "%ld", tst_actual_count)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"tst_expected\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, tst_expected, 2)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"tst_ratio\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, tst_ratio, 3)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"window_months\":")) goto oom;
+    if (!buffer_appendf(&buf, "%d", timeline_window_months)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"message\":")) goto oom;
+    if (!buffer_append_json_string(&buf, maintenance_message)) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"modernization\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"status\":")) goto oom;
+    if (!buffer_append_json_string(&buf, modernization_status)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"equipment_callbacks_per_device\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, equipment_per_device_per_year, 2)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"callbacks_per_device_per_year\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, callbacks_per_device_per_year, 2)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"callback_events\":")) goto oom;
+    if (!buffer_appendf(&buf, "%ld", cb_equipment_count)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"opex_annual\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, opex_annualized, 0)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"expected_savings\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, modernization_expected_savings, 0)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"payback_years\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, modernization_payback_years, 2)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"modernization_cost\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, modernization_total_cost, 0)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"message\":")) goto oom;
+    if (!buffer_append_json_string(&buf, modernization_message)) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+
+    if (!buffer_append_char(&buf, ',')) goto oom;
+    if (!buffer_append_cstr(&buf, "\"vendor\":{")) goto oom;
+    if (!buffer_append_cstr(&buf, "\"status\":")) goto oom;
+    if (!buffer_append_json_string(&buf, vendor_status)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"denied_rate\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, denied_rate, 3)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"negotiated_rate\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, negotiated_rate, 3)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"challenged_rate\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, challenged_rate, 3)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"closure_rate\":")) goto oom;
+    if (!buffer_append_double_or_null(&buf, closure_rate, 3)) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"message\":")) goto oom;
+    if (!buffer_append_json_string(&buf, vendor_message)) goto oom;
+    if (!buffer_append_char(&buf, '}')) goto oom;
+
     if (!buffer_append_char(&buf, '}')) goto oom;
 
     if (!buffer_append_cstr(&buf, ",\"deficiencies\":{")) goto oom;
@@ -13567,6 +13925,18 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     g_report_assets_dir = assets_dir_trimmed;
+
+    const char *mod_cost_env = getenv("MODERNIZATION_COST_PER_DEVICE");
+    if (mod_cost_env && mod_cost_env[0] != '\0') {
+        errno = 0;
+        char *endptr = NULL;
+        double parsed_cost = strtod(mod_cost_env, &endptr);
+        if (errno == 0 && endptr && endptr != mod_cost_env && parsed_cost > 0.0) {
+            g_modernization_cost_per_device = parsed_cost;
+        } else {
+            log_info("Ignoring invalid MODERNIZATION_COST_PER_DEVICE value: %s", mod_cost_env);
+        }
+    }
 
     RouteHelpers route_helpers = {
         .build_location_detail = build_location_detail_payload,

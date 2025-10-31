@@ -64,6 +64,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const deficiencyAnalytics = createMemo(() => analytics()?.deficiencies);
   const serviceAnalyticsSection = createMemo(() => analytics()?.service);
   const financialAnalyticsSection = createMemo(() => analytics()?.financial);
+  const advisory = createMemo(() => analytics()?.advisory);
+  const maintenanceAdvice = createMemo(() => advisory()?.maintenance);
+  const modernizationAdvice = createMemo(() => advisory()?.modernization);
+  const vendorAdvice = createMemo(() => advisory()?.vendor);
   const deficiencyMetrics = createMemo(() => deficiencyAnalytics()?.metrics);
   const serviceMetrics = createMemo(() => serviceAnalyticsSection()?.metrics);
   const financialMetrics = createMemo(() => financialAnalyticsSection()?.metrics);
@@ -1064,6 +1068,59 @@ const dataCoverage = createMemo(() => {
     return classes.join(' ');
   };
 
+  const advisoryBadgeClass = (status?: string) => {
+    switch (status) {
+      case 'healthy':
+      case 'plan':
+      case 'stable':
+        return 'advisory-status advisory-status--positive';
+      case 'attention':
+      case 'needs_review':
+      case 'defer':
+        return 'advisory-status advisory-status--critical';
+      case 'watch':
+      case 'consider':
+      case 'monitor':
+        return 'advisory-status advisory-status--warning';
+      default:
+        return 'advisory-status advisory-status--muted';
+    }
+  };
+
+  const advisoryPanelClass = (status?: string) => {
+    let tone: 'positive' | 'warning' | 'critical' | 'muted' = 'muted';
+    switch (status) {
+      case 'healthy':
+      case 'plan':
+      case 'stable':
+        tone = 'positive';
+        break;
+      case 'attention':
+      case 'needs_review':
+      case 'defer':
+        tone = 'critical';
+        break;
+      case 'watch':
+      case 'consider':
+      case 'monitor':
+        tone = 'warning';
+        break;
+      default:
+        tone = 'muted';
+    }
+    return `advisory-panel advisory-panel--${tone}`;
+  };
+
+  const formatRatioPercent = (value: number | null | undefined, decimals = 0) => {
+    if (value == null || Number.isNaN(value)) return '—';
+    return `${(value * 100).toFixed(decimals)}%`;
+  };
+
+  const formatOptionalCurrency = (value: number | null | undefined) => {
+    if (value == null || Number.isNaN(value)) return '—';
+    return formatCurrency(value);
+  };
+
   const formatPercent = (value: number | null | undefined) => (value == null || Number.isNaN(value) ? '—' : `${value.toFixed(1)}%`);
   const formatMaybeNumber = (value: number | null | undefined, decimals = 2) => (value == null || Number.isNaN(value) ? '—' : value.toFixed(decimals));
   const describeTrend = (trend?: { direction: string; percent_change: number | null }) => {
@@ -1776,16 +1833,17 @@ const dataCoverage = createMemo(() => {
         </div>
       </div>
 
-      <Switch>
-        <Match when={detail.error}>
-          <ErrorMessage message={(detail.error as Error).message} onRetry={() => refetch()} />
-        </Match>
-        <Match when={detail.loading}>
-          <LoadingIndicator message="Loading location…" />
-        </Match>
-        <Match when={summary()}>
-          <div class="location-dashboard">
-            <section class="profile-card">
+      {(() => {
+        if (detail.error) {
+          return <ErrorMessage message={(detail.error as Error).message} onRetry={() => refetch()} />;
+        }
+        if (detail.loading) {
+          return <LoadingIndicator message="Loading location…" />;
+        }
+        if (summary()) {
+          return (
+            <div class="location-dashboard">
+              <section class="profile-card">
               <h2>Location Overview</h2>
               <div class="profile-grid">
                 <div>
@@ -1859,6 +1917,102 @@ const dataCoverage = createMemo(() => {
                       </article>
                     )}
                   </For>
+                </div>
+              </section>
+            </Show>
+
+            <Show when={advisory()}>
+              <section class="advisory-card" aria-labelledby="advisory-title">
+                <header class="advisory-header">
+                  <h2 id="advisory-title">Operational Advisory</h2>
+                  <p>Combined guidance across maintenance cadence, modernization ROI, and vendor behaviour.</p>
+                </header>
+                <div class="advisory-grid">
+                  <article class={advisoryPanelClass(maintenanceAdvice()?.status)}>
+                    <div class="advisory-panel-header">
+                      <h3>Maintenance</h3>
+                      <span class={advisoryBadgeClass(maintenanceAdvice()?.status)}>{maintenanceAdvice()?.status ?? 'insufficient'}</span>
+                    </div>
+                    <p class="advisory-message">{maintenanceAdvice()?.message ?? 'Monitoring data pending.'}</p>
+                    <dl class="advisory-metrics">
+                      <div>
+                        <dt>PM coverage</dt>
+                        <dd>{formatRatioPercent(maintenanceAdvice()?.pm_ratio)}</dd>
+                      </div>
+                      <div>
+                        <dt>PM expected / actual</dt>
+                        <dd>
+                          {formatMaybeNumber(maintenanceAdvice()?.pm_expected, 1)} /
+                          {' '}
+                          {maintenanceAdvice()?.pm_actual != null ? maintenanceAdvice()?.pm_actual : '—'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Testing coverage</dt>
+                        <dd>{formatRatioPercent(maintenanceAdvice()?.tst_ratio)}</dd>
+                      </div>
+                      <div>
+                        <dt>Observation window</dt>
+                        <dd>{maintenanceAdvice()?.window_months ?? '—'} months</dd>
+                      </div>
+                    </dl>
+                  </article>
+
+                  <article class={advisoryPanelClass(modernizationAdvice()?.status)}>
+                    <div class="advisory-panel-header">
+                      <h3>Modernization</h3>
+                      <span class={advisoryBadgeClass(modernizationAdvice()?.status)}>{modernizationAdvice()?.status ?? 'insufficient'}</span>
+                    </div>
+                    <p class="advisory-message">{modernizationAdvice()?.message ?? 'Waiting for spend and failure trend data.'}</p>
+                    <dl class="advisory-metrics">
+                      <div>
+                        <dt>Failures / device / yr</dt>
+                        <dd>{formatMaybeNumber(modernizationAdvice()?.equipment_callbacks_per_device, 2)}</dd>
+                      </div>
+                      <div>
+                        <dt>Annualised OPEX</dt>
+                        <dd>{formatOptionalCurrency(modernizationAdvice()?.opex_annual)}</dd>
+                      </div>
+                      <div>
+                        <dt>Expected savings</dt>
+                        <dd>{formatOptionalCurrency(modernizationAdvice()?.expected_savings)}</dd>
+                      </div>
+                      <div>
+                        <dt>Payback</dt>
+                        <dd>{formatMaybeNumber(modernizationAdvice()?.payback_years, 1)} yrs</dd>
+                      </div>
+                      <div>
+                        <dt>Modernization cost</dt>
+                        <dd>{formatOptionalCurrency(modernizationAdvice()?.modernization_cost)}</dd>
+                      </div>
+                    </dl>
+                  </article>
+
+                  <article class={advisoryPanelClass(vendorAdvice()?.status)}>
+                    <div class="advisory-panel-header">
+                      <h3>Vendor</h3>
+                      <span class={advisoryBadgeClass(vendorAdvice()?.status)}>{vendorAdvice()?.status ?? 'insufficient'}</span>
+                    </div>
+                    <p class="advisory-message">{vendorAdvice()?.message ?? 'Awaiting proposal history.'}</p>
+                    <dl class="advisory-metrics">
+                      <div>
+                        <dt>Denied rate</dt>
+                        <dd>{formatRatioPercent(vendorAdvice()?.denied_rate)}</dd>
+                      </div>
+                      <div>
+                        <dt>Negotiated rate</dt>
+                        <dd>{formatRatioPercent(vendorAdvice()?.negotiated_rate)}</dd>
+                      </div>
+                      <div>
+                        <dt>Challenged rate</dt>
+                        <dd>{formatRatioPercent(vendorAdvice()?.challenged_rate)}</dd>
+                      </div>
+                      <div>
+                        <dt>Closure rate</dt>
+                        <dd>{formatRatioPercent(vendorAdvice()?.closure_rate)}</dd>
+                      </div>
+                    </dl>
+                  </article>
                 </div>
               </section>
             </Show>
@@ -3144,8 +3298,10 @@ const dataCoverage = createMemo(() => {
               </Show>
             </div>
           </div>
-        </Match>
-      </Switch>
+          );
+        }
+        return <p class="empty-state">Location data not available.</p>;
+      })()}
       <Show when={showReportModal()}>
         <div
           class="report-modal"
