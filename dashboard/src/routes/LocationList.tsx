@@ -1,5 +1,5 @@
 import type { Component } from 'solid-js';
-import { For, Show, createEffect, createMemo, createResource, createSignal } from 'solid-js';
+import { For, Show, createMemo, createResource, createSignal } from 'solid-js';
 import { fetchLocations } from '../api';
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
@@ -15,18 +15,18 @@ const LocationList: Component<LocationListProps> = (props) => {
   const [page, setPage] = createSignal(1);
   const [searchInput, setSearchInput] = createSignal('');
   const [searchTerm, setSearchTerm] = createSignal('');
+  const [sortMode, setSortMode] = createSignal<'alpha' | 'risk'>('alpha');
+  const [riskFilter, setRiskFilter] = createSignal<'all' | 'critical' | 'warning' | 'stable'>('all');
 
   const [locations, { refetch }] = createResource(
-    () => ({ page: page(), pageSize: PAGE_SIZE, search: searchTerm() }),
+    () => ({
+      page: page(),
+      pageSize: PAGE_SIZE,
+      search: searchTerm(),
+      sort: sortMode() === 'risk' ? 'risk_desc' : undefined
+    }),
     fetchLocations
   );
-
-  createEffect(() => {
-    const result = locations();
-    if (result && typeof result.page === 'number' && result.page !== page()) {
-      setPage(result.page);
-    }
-  });
 
   const items = createMemo(() => locations()?.items ?? []);
   const total = createMemo(() => locations()?.total ?? 0);
@@ -36,16 +36,87 @@ const LocationList: Component<LocationListProps> = (props) => {
     return size > 0 ? Math.max(1, Math.ceil(total() / size)) : 1;
   });
 
+  const filteredItems = createMemo(() => {
+    const filter = riskFilter();
+    const list = items();
+    if (filter === 'all') return list;
+    return list.filter((entry) => (entry.risk_level ?? 'stable') === filter);
+  });
+
+  const topRiskLocations = createMemo(() => {
+    const sorted = [...items()].sort((a, b) => {
+      const scoreA = typeof a.risk_score === 'number' ? a.risk_score : Number(a.risk_score ?? 0);
+      const scoreB = typeof b.risk_score === 'number' ? b.risk_score : Number(b.risk_score ?? 0);
+      return scoreB - scoreA;
+    });
+    return sorted.filter((entry) => entry.risk_level === 'critical' || entry.risk_level === 'warning').slice(0, 10);
+  });
+
   const startIndex = createMemo(() => {
     if (total() === 0) return 0;
+    if (filteredItems().length === 0) return 0;
     return (page() - 1) * effectivePageSize() + 1;
   });
 
   const endIndex = createMemo(() => {
     const start = startIndex();
     if (start === 0) return 0;
-    return start + items().length - 1;
+    const visible = filteredItems().length;
+    return start + visible - 1;
   });
+
+  const formatCurrency = (value: number | string | null | undefined) => {
+    if (value == null) return '—';
+    const numeric = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(numeric)) return '—';
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(numeric);
+  };
+
+  const riskBadgeClass = (level?: string | null) => {
+    switch (level) {
+      case 'critical':
+        return 'risk-pill risk-pill--critical';
+      case 'warning':
+        return 'risk-pill risk-pill--warning';
+      case 'stable':
+        return 'risk-pill risk-pill--stable';
+      default:
+        return 'risk-pill risk-pill--muted';
+    }
+  };
+
+  const riskLabel = (level?: string | null) => {
+    switch (level) {
+      case 'critical':
+        return 'Critical';
+      case 'warning':
+        return 'Warning';
+      case 'stable':
+        return 'Stable';
+      default:
+        return 'Unknown';
+    }
+  };
+
+  const riskTooltip = (location: LocationSummary) => {
+    const failures = typeof location.service_failures === 'number' ? location.service_failures : Number(location.service_failures ?? 0);
+    const pm = typeof location.service_pm === 'number' ? location.service_pm : Number(location.service_pm ?? 0);
+    const opex = typeof location.open_spend === 'number' ? location.open_spend : Number(location.open_spend ?? 0);
+    const openPerRaw = typeof location.open_per_device === 'number' ? location.open_per_device : Number(location.open_per_device ?? 0);
+    const openPer = Number.isFinite(openPerRaw) ? openPerRaw : 0;
+    return `Failures (12m): ${failures} • PM Visits: ${pm} • Open spend: ${formatCurrency(opex)} • Deficiencies/device: ${openPer.toFixed(2)}`;
+  };
+
+  const rowRiskClass = (level?: string | null) => {
+    switch (level) {
+      case 'critical':
+        return 'table-row table-row--risk-critical';
+      case 'warning':
+        return 'table-row table-row--risk-warning';
+      default:
+        return 'table-row';
+    }
+  };
 
   const coverageClass = (flag?: boolean) => (flag ? 'data-dot data-dot--available' : 'data-dot data-dot--missing');
 
@@ -54,6 +125,16 @@ const LocationList: Component<LocationListProps> = (props) => {
     setSearchInput(value);
     setSearchTerm(value.trim());
     setPage(1);
+  };
+
+  const handleSortChange = (mode: 'alpha' | 'risk') => {
+    if (sortMode() === mode) return;
+    setSortMode(mode);
+    setPage(1);
+  };
+
+  const handleRiskFilterChange = (value: 'all' | 'critical' | 'warning' | 'stable') => {
+    setRiskFilter(value);
   };
 
   const handlePrev = () => {
@@ -103,102 +184,170 @@ const LocationList: Component<LocationListProps> = (props) => {
         }
         return (
           <>
-            <div class="table-wrapper" role="region" aria-live="polite">
-            <table>
-              <thead>
-                <tr>
-                  <th scope="col">Location</th>
-                  <th scope="col" aria-label="Data availability">Data</th>
-                  <th scope="col">Street</th>
-                  <th scope="col">City</th>
-                  <th scope="col">State</th>
-                  <th scope="col">Owner</th>
-                  <th scope="col">Vendor</th>
-                  <th scope="col">Devices</th>
-                  <th scope="col">Open Deficiencies</th>
-                </tr>
-              </thead>
-              <tbody>
-                <For each={items()}>
-                  {(location) => {
-                    const openCount = location.open_deficiencies ?? 0;
-                    const deviceCount = location.device_count ?? 0;
-                    const detailParts = [location.street, location.city, location.state].filter(Boolean).join(', ');
-                    const displayName = location.site_name ?? location.formatted_address ?? location.address;
-                    const hasAudits = Boolean(location.has_audits);
-                    const hasService = Boolean(location.has_service_records);
-                    const hasFinancial = Boolean(location.has_financial_records);
+            <div class="list-toolbar">
+              <div class="toolbar-group">
+                <span class="toolbar-label">Sort</span>
+                <div class="toolbar-buttons">
+                  <button
+                    type="button"
+                    class={sortMode() === 'alpha' ? 'toolbar-button toolbar-button--active' : 'toolbar-button'}
+                    onClick={() => handleSortChange('alpha')}
+                  >
+                    Alphabetical
+                  </button>
+                  <button
+                    type="button"
+                    class={sortMode() === 'risk' ? 'toolbar-button toolbar-button--active' : 'toolbar-button'}
+                    onClick={() => handleSortChange('risk')}
+                  >
+                    Highest Risk
+                  </button>
+                </div>
+              </div>
+              <div class="toolbar-group">
+                <label class="toolbar-label" for="risk-filter">Risk Filter</label>
+                <select
+                  id="risk-filter"
+                  class="toolbar-select"
+                  value={riskFilter()}
+                  onInput={(event) => handleRiskFilterChange(event.currentTarget.value as 'all' | 'critical' | 'warning' | 'stable')}
+                >
+                  <option value="all">All</option>
+                  <option value="critical">Critical</option>
+                  <option value="warning">Warning</option>
+                  <option value="stable">Stable</option>
+                </select>
+              </div>
+            </div>
 
-                    return (
-                      <tr
-                        class="table-row"
-                        role="link"
-                        tabIndex={0}
-                        aria-label={`View location ${displayName}`}
-                        onClick={() => props.onSelect(location)}
-                        onKeyDown={(event) => {
-                          if (event.key === 'Enter' || event.key === ' ') {
-                            event.preventDefault();
-                            props.onSelect(location);
-                          }
-                        }}
-                      >
-                        <td class={openCount > 0 ? 'location-cell has-open-deficiencies' : 'location-cell'}>
-                          <span class="location-name">{displayName ?? '—'}</span>
-                          <Show when={detailParts}>
-                            <span class="location-subtext">{detailParts}</span>
-                          </Show>
-                          <Show when={location.location_code}>
-                            <span class="location-subtext">ID: {location.location_code}</span>
-                          </Show>
-                          <Show when={openCount > 0}>
-                            <span class="deficiency-chip" role="img" aria-label="Open deficiencies">⚠</span>
-                          </Show>
-                        </td>
-                        <td class="coverage-cell" aria-label="Data coverage">
-                          <span class="sr-only">
-                            Data coverage: audits {hasAudits ? 'available' : 'missing'}, service {hasService ? 'available' : 'missing'}, financial {hasFinancial ? 'available' : 'missing'}
-                          </span>
-                          <span class={coverageClass(hasAudits)} title={hasAudits ? 'Audit data available' : 'Audit data missing'} aria-hidden="true" />
-                          <span class={coverageClass(hasService)} title={hasService ? 'Service data available' : 'Service data missing'} aria-hidden="true" />
-                          <span class={coverageClass(hasFinancial)} title={hasFinancial ? 'Financial data available' : 'Financial data missing'} aria-hidden="true" />
-                        </td>
-                        <td>{location.street ?? '—'}</td>
-                        <td>{location.city ?? '—'}</td>
-                        <td>{location.state ?? '—'}</td>
-                        <td>{location.building_owner ?? '—'}</td>
-                        <td>{location.vendor_name ?? '—'}</td>
-                        <td>{deviceCount}</td>
-                        <td>
-                          <span class="deficiency-count">{openCount}</span>
-                          <Show when={openCount > 0}>
-                            <span class="deficiency-indicator" aria-hidden="true" title="Open deficiencies" />
-                          </Show>
-                        </td>
-                      </tr>
-                    );
-                  }}
-                </For>
-              </tbody>
-            </table>
-          </div>
+            <Show when={filteredItems().length > 0} fallback={<div class="empty-state">No locations match the current risk filter.</div>}>
+              <Show when={topRiskLocations().length > 0}>
+                <aside class="risk-leaderboard" aria-label="Top risk locations">
+                  <h2>Top Risk Locations</h2>
+                  <ol>
+                    <For each={topRiskLocations()}>
+                      {(location) => {
+                        const score = typeof location.risk_score === 'number' ? location.risk_score : Number(location.risk_score ?? 0);
+                        return (
+                          <li>
+                            <span class="risk-rank-name">{location.site_name ?? location.address}</span>
+                            <span class="risk-rank-meta">{riskLabel(location.risk_level)} · Score {score.toFixed(1)}</span>
+                          </li>
+                        );
+                      }}
+                    </For>
+                  </ol>
+                </aside>
+              </Show>
+              <div class="table-wrapper" role="region" aria-live="polite">
+                <table>
+                  <thead>
+                    <tr>
+                      <th scope="col">Location</th>
+                      <th scope="col">Risk</th>
+                      <th scope="col" aria-label="Data availability">Data</th>
+                      <th scope="col">Street</th>
+                      <th scope="col">City</th>
+                      <th scope="col">State</th>
+                      <th scope="col">Owner</th>
+                      <th scope="col">Vendor</th>
+                      <th scope="col">Devices</th>
+                      <th scope="col">Open Deficiencies</th>
+                      <th scope="col">Failures (12m)</th>
+                      <th scope="col">Open Spend</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={filteredItems()}>
+                      {(location) => {
+                        const openCount = location.open_deficiencies ?? 0;
+                        const deviceCount = location.device_count ?? 0;
+                        const detailParts = [location.street, location.city, location.state].filter(Boolean).join(', ');
+                        const displayName = location.site_name ?? location.formatted_address ?? location.address;
+                        const hasAudits = Boolean(location.has_audits);
+                        const hasService = Boolean(location.has_service_records);
+                        const hasFinancial = Boolean(location.has_financial_records);
+                        const failures12m = typeof location.service_failures === 'number' ? location.service_failures : Number(location.service_failures ?? 0);
+                        const openSpendValue = typeof location.open_spend === 'number' ? location.open_spend : Number(location.open_spend ?? 0);
+
+                        return (
+                          <tr
+                            class={rowRiskClass(location.risk_level)}
+                            role="link"
+                            tabIndex={0}
+                            aria-label={`View location ${displayName}`}
+                            onClick={() => props.onSelect(location)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault();
+                                props.onSelect(location);
+                              }
+                            }}
+                          >
+                            <td class={openCount > 0 ? 'location-cell has-open-deficiencies' : 'location-cell'}>
+                              <div class="location-name-row">
+                                <span class="location-name">{displayName ?? '—'}</span>
+                                <Show when={openCount > 0}>
+                                  <span class="deficiency-chip" role="img" aria-label="Open deficiencies">⚠</span>
+                                </Show>
+                              </div>
+                              <Show when={detailParts}>
+                                <span class="location-subtext">{detailParts}</span>
+                              </Show>
+                              <Show when={location.location_code}>
+                                <span class="location-subtext">ID: {location.location_code}</span>
+                              </Show>
+                            </td>
+                            <td>
+                              <span class={riskBadgeClass(location.risk_level)} title={riskTooltip(location)}>{riskLabel(location.risk_level)}</span>
+                            </td>
+                            <td class="coverage-cell" aria-label="Data coverage">
+                              <span class="sr-only">
+                                Data coverage: audits {hasAudits ? 'available' : 'missing'}, service {hasService ? 'available' : 'missing'}, financial {hasFinancial ? 'available' : 'missing'}
+                              </span>
+                              <span class={coverageClass(hasAudits)} title={hasAudits ? 'Audit data available' : 'Audit data missing'} aria-hidden="true" />
+                              <span class={coverageClass(hasService)} title={hasService ? 'Service data available' : 'Service data missing'} aria-hidden="true" />
+                              <span class={coverageClass(hasFinancial)} title={hasFinancial ? 'Financial data available' : 'Financial data missing'} aria-hidden="true" />
+                            </td>
+                            <td>{location.street ?? '—'}</td>
+                            <td>{location.city ?? '—'}</td>
+                            <td>{location.state ?? '—'}</td>
+                            <td>{location.building_owner ?? '—'}</td>
+                            <td>{location.vendor_name ?? '—'}</td>
+                            <td>{deviceCount}</td>
+                            <td>
+                              <span class="deficiency-count">{openCount}</span>
+                              <Show when={openCount > 0}>
+                                <span class="deficiency-indicator" aria-hidden="true" title="Open deficiencies" />
+                              </Show>
+                            </td>
+                            <td>{failures12m}</td>
+                            <td>{formatCurrency(openSpendValue)}</td>
+                          </tr>
+                        );
+                      }}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
+            </Show>
 
             <div class="pagination-controls">
-            <div class="page-info">
-              <Show when={total() > 0} fallback={<span>No matching locations</span>}>
-                <span>
-                  Showing {startIndex()}–{endIndex()} of {total()} locations
-                </span>
-              </Show>
-            </div>
-            <div class="page-buttons">
-              <button type="button" class="action-button" disabled={page() <= 1 || isLoading()} onClick={handlePrev}>
-                Previous
-              </button>
-              <button type="button" class="action-button" disabled={page() >= totalPages() || isLoading()} onClick={handleNext}>
-                Next
-              </button>
-            </div>
+              <div class="page-info">
+                <Show when={startIndex() > 0} fallback={<span>No matching locations</span>}>
+                  <span>
+                    Showing {startIndex()}–{endIndex()} of {total()} locations
+                  </span>
+                </Show>
+              </div>
+              <div class="page-buttons">
+                <button type="button" class="action-button" disabled={page() <= 1 || isLoading()} onClick={handlePrev}>
+                  Previous
+                </button>
+                <button type="button" class="action-button" disabled={page() >= totalPages() || isLoading()} onClick={handleNext}>
+                  Next
+                </button>
+              </div>
             </div>
           </>
         );

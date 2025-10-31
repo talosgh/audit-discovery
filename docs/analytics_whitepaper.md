@@ -124,6 +124,18 @@ The advisory module combines multiple signals to deliver actionable guidance:
 - Advisory JSON includes ratios, expected vs. actual counts, annualised spend, and synthesized
   messaging so the dashboard can render human-readable guidance backed by consistent math.
 
+### Location List Risk Badges
+
+The locations landing grid reuses the same input metrics to flag "critical" or "warning" properties.
+The risk score ranks locations by:
+
+- Open deficiencies per device (>=1.5 critical, >=0.75 warning).
+- 12-month equipment-failure callbacks (`CB-EF`, `CB-EMG`) [>=6 critical, >=3 warning].
+- Open spend exposure (`financial_data.status ILIKE 'Open%'`) [>=50k critical, >=20k warning].
+- Preventative/testing gaps (less than 4 PMs or 1 test per device/year adds a penalty).
+
+The "Highest Risk" sort orders by this score so dangerous locations bubble to the top of pagination.
+
 ### Coverage Indicators
 
 Location list data dots use backend booleans:

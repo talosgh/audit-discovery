@@ -89,7 +89,7 @@ char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out) {
     return json;
 }
 
-char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *search, char **error_out) {
+char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *search, const char *sort, char **error_out) {
     if (!conn) {
         if (error_out && !*error_out) {
             *error_out = strdup("Database connection unavailable");
@@ -153,67 +153,167 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
     }
     PQclear(count_res);
 
-    static const char *ITEM_SQL =
-        "WITH stats AS ("
-        "    SELECT a.location_id,"
-        "           SUM(CASE WHEN d.resolved_at IS NULL THEN 1 ELSE 0 END) AS open_deficiencies,"
-        "           COUNT(*) > 0 AS has_audits "
-        "    FROM audits a "
-        "    LEFT JOIN audit_deficiencies d ON d.audit_uuid = a.audit_uuid "
-        "    WHERE a.location_id IS NOT NULL "
-        "    GROUP BY a.location_id"
-        "), "
-        "service AS ("
-        "    SELECT sd_location_id AS location_code "
-        "    FROM esa_in_progress "
-        "    WHERE sd_location_id IS NOT NULL "
-        "    GROUP BY sd_location_id"
-        "), "
-        "finance AS ("
-        "    SELECT location_id "
-        "    FROM financial_data "
-        "    WHERE location_id IS NOT NULL "
-        "    GROUP BY location_id"
-        ") "
-        "SELECT "
-        "    l.location_id AS location_code, "
-        "    l.id AS location_row_id, "
-        "    l.site_name, "
-        "    l.street, "
-        "    l.city, "
-        "    l.state, "
-        "    CONCAT_WS(', ', NULLIF(l.street, ''), NULLIF(l.city, ''), NULLIF(l.state, '')) AS formatted_address, "
-        "    l.zip_code, "
-        "    l.owner_name, "
-        "    l.vendor_name, "
-        "    COALESCE(l.units, 0) AS device_count, "
-        "    COALESCE(stats.open_deficiencies, 0) AS open_deficiencies, "
-        "    COALESCE(stats.has_audits, false) AS has_audits, "
-        "    (service.location_code IS NOT NULL) AS has_service_records, "
-        "    (finance.location_id IS NOT NULL) AS has_financial_records "
-        "FROM locations l "
-        "LEFT JOIN stats ON stats.location_id = l.id "
-        "LEFT JOIN service ON service.location_code = l.location_id "
-        "LEFT JOIN finance ON ("
-        "       finance.location_id = l.id "
-        "    OR (l.location_id ~ '^[0-9]+$' AND finance.location_id = l.location_id::int)"
-        "    ) "
-        "WHERE ($3 IS NULL OR "
-        "       l.location_id ILIKE $3 OR "
-        "       l.site_name ILIKE $3 OR "
-        "       l.street ILIKE $3 OR "
-        "       l.city ILIKE $3 OR "
-        "       l.state ILIKE $3 OR "
-        "       l.zip_code ILIKE $3 OR "
-        "       l.owner_name ILIKE $3 OR "
-        "       l.vendor_name ILIKE $3) "
-        "ORDER BY lower(COALESCE(NULLIF(l.site_name, ''), NULLIF(l.street, ''), l.city, l.state, l.location_id)), l.id "
-        "OFFSET GREATEST($1::int - 1, 0) * $2::int "
-        "LIMIT $2::int";
+    static const char *ITEM_SQL_BASE[] = {
+        "WITH stats AS (\n",
+        "    SELECT a.location_id,\n",
+        "           SUM(CASE WHEN d.resolved_at IS NULL THEN 1 ELSE 0 END) AS open_deficiencies,\n",
+        "           COUNT(*) > 0 AS has_audits\n",
+        "    FROM audits a\n",
+        "    LEFT JOIN audit_deficiencies d ON d.audit_uuid = a.audit_uuid\n",
+        "    WHERE a.location_id IS NOT NULL\n",
+        "    GROUP BY a.location_id\n",
+        "),\n",
+        "service AS (\n",
+        "    SELECT sd_location_id AS location_code,\n",
+        "           COUNT(*) AS total_visits,\n",
+        "           COUNT(*) FILTER (WHERE upper(btrim(sd_cw_at)) LIKE 'PM%') AS pm_visits,\n",
+        "           COUNT(*) FILTER (WHERE upper(btrim(sd_cw_at)) LIKE 'TST%') AS tst_visits,\n",
+        "           COUNT(*) FILTER (WHERE upper(btrim(sd_cw_at)) LIKE 'CB-EF%' OR upper(btrim(sd_cw_at)) LIKE 'CB-EMG%') AS cb_failures,\n",
+        "           COUNT(*) FILTER (WHERE upper(btrim(sd_cw_at)) LIKE 'CB%') AS cb_total\n",
+        "    FROM esa_in_progress\n",
+        "    WHERE sd_location_id IS NOT NULL\n",
+        "      AND sd_work_date IS NOT NULL\n",
+        "      AND sd_work_date >= CURRENT_DATE - INTERVAL '12 months'\n",
+        "    GROUP BY sd_location_id\n",
+        "),\n",
+        "finance AS (\n",
+        "    SELECT location_id,\n",
+        "           COUNT(*) AS record_count,\n",
+        "           SUM(COALESCE(new_cost, 0)) AS total_spend,\n",
+        "           SUM(CASE WHEN status ILIKE 'Open%%' THEN COALESCE(new_cost, 0) ELSE 0 END) AS open_spend\n",
+        "    FROM financial_data\n",
+        "    WHERE location_id IS NOT NULL\n",
+        "    GROUP BY location_id\n",
+        ")\n",
+        "SELECT\n",
+        "    l.location_id AS location_code,\n",
+        "    l.id AS location_row_id,\n",
+        "    l.site_name,\n",
+        "    l.street,\n",
+        "    l.city,\n",
+        "    l.state,\n",
+        "    CONCAT_WS(', ', NULLIF(l.street, ''), NULLIF(l.city, ''), NULLIF(l.state, '')) AS formatted_address,\n",
+        "    l.zip_code,\n",
+        "    l.owner_name,\n",
+        "    l.vendor_name,\n",
+        "    COALESCE(l.units, 0) AS device_count,\n",
+        "    COALESCE(stats.open_deficiencies, 0) AS open_deficiencies,\n",
+        "    COALESCE(stats.has_audits, false) AS has_audits,\n",
+        "    (service.location_code IS NOT NULL) AS has_service_records,\n",
+        "    (finance.location_id IS NOT NULL) AS has_financial_records,\n",
+        "    COALESCE(service.total_visits, 0) AS service_total_visits,\n",
+        "    COALESCE(service.cb_failures, 0) AS service_failures,\n",
+        "    COALESCE(service.pm_visits, 0) AS service_pm_visits,\n",
+        "    COALESCE(service.tst_visits, 0) AS service_tst_visits,\n",
+        "    COALESCE(finance.open_spend, 0)::numeric AS open_spend,\n",
+        "    CASE\n",
+        "        WHEN COALESCE(l.units, 0) > 0 THEN COALESCE(stats.open_deficiencies, 0)::numeric / l.units::numeric\n",
+        "        ELSE COALESCE(stats.open_deficiencies, 0)::numeric\n",
+        "    END AS open_per_device,\n",
+        "    (\n",
+        "        CASE\n",
+        "            WHEN COALESCE(l.units, 0) > 0 THEN (COALESCE(stats.open_deficiencies, 0)::numeric / l.units::numeric) * 10.0\n",
+        "            ELSE COALESCE(stats.open_deficiencies, 0)::numeric * 6.0\n",
+        "        END\n",
+        "        + COALESCE(service.cb_failures, 0) * 3.0\n",
+        "        + LEAST(COALESCE(finance.open_spend, 0) / 10000.0, 20.0)\n",
+        "        + CASE WHEN COALESCE(l.units, 0) > 0 AND COALESCE(service.pm_visits, 0) < COALESCE(l.units, 0) * 4 THEN 5 ELSE 0 END\n",
+        "        + CASE WHEN COALESCE(l.units, 0) > 0 AND COALESCE(service.tst_visits, 0) < COALESCE(l.units, 0) THEN 3 ELSE 0 END\n",
+        "    ) AS risk_score,\n",
+        "    CASE\n",
+        "        WHEN (CASE WHEN COALESCE(l.units, 0) > 0 THEN COALESCE(stats.open_deficiencies, 0)::numeric / l.units::numeric ELSE COALESCE(stats.open_deficiencies, 0)::numeric END) >= 1.5\n",
+        "             OR COALESCE(service.cb_failures, 0) >= 6\n",
+        "             OR COALESCE(finance.open_spend, 0) >= 50000\n",
+        "             OR (CASE WHEN COALESCE(l.units, 0) > 0 THEN COALESCE(finance.open_spend, 0) / l.units::numeric ELSE 0 END) >= 15000\n",
+        "            THEN 'critical'\n",
+        "        WHEN (CASE WHEN COALESCE(l.units, 0) > 0 THEN COALESCE(stats.open_deficiencies, 0)::numeric / l.units::numeric ELSE COALESCE(stats.open_deficiencies, 0)::numeric END) >= 0.75\n",
+        "             OR COALESCE(service.cb_failures, 0) >= 3\n",
+        "             OR COALESCE(finance.open_spend, 0) >= 20000\n",
+        "            THEN 'warning'\n",
+        "        ELSE 'stable'\n",
+        "    END AS risk_level\n",
+        "FROM locations l\n",
+        "LEFT JOIN stats ON stats.location_id = l.id\n",
+        "LEFT JOIN service ON service.location_code = l.location_id\n",
+        "LEFT JOIN finance ON (\n",
+        "       finance.location_id = l.id\n",
+        "    OR (l.location_id ~ '^[0-9]+$' AND finance.location_id = l.location_id::int)\n",
+        "    )\n",
+        "WHERE ($3 IS NULL OR\n",
+        "       l.location_id ILIKE $3 OR\n",
+        "       l.site_name ILIKE $3 OR\n",
+        "       l.street ILIKE $3 OR\n",
+        "       l.city ILIKE $3 OR\n",
+        "       l.state ILIKE $3 OR\n",
+        "       l.zip_code ILIKE $3 OR\n",
+        "       l.owner_name ILIKE $3 OR\n",
+        "       l.vendor_name ILIKE $3)\n",
+        NULL
+    };
+
+    static const char *ORDER_ALPHA =
+        "ORDER BY lower(COALESCE(NULLIF(l.site_name, ''), NULLIF(l.street, ''), l.city, l.state, l.location_id)), l.id\n";
+
+    static const char *ORDER_RISK =
+        "ORDER BY CASE risk_level WHEN 'critical' THEN 2 WHEN 'warning' THEN 1 ELSE 0 END DESC, "
+        "risk_score DESC, COALESCE(stats.open_deficiencies, 0) DESC, l.id\n";
+
+    static const char *OFFSET_LIMIT =
+        "OFFSET GREATEST($1::int - 1, 0) * $2::int\nLIMIT $2::int";
+
+    Buffer sql_buf;
+    if (!buffer_init(&sql_buf)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory preparing location query");
+        }
+        free(pattern);
+        return NULL;
+    }
+
+    for (const char **part = ITEM_SQL_BASE; *part; ++part) {
+        if (!buffer_append_cstr(&sql_buf, *part)) {
+            buffer_free(&sql_buf);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory preparing location query");
+            }
+            free(pattern);
+            return NULL;
+        }
+    }
+
+    if (sort && strcmp(sort, "risk_desc") == 0) {
+        if (!buffer_append_cstr(&sql_buf, ORDER_RISK)) {
+            buffer_free(&sql_buf);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory preparing location query");
+            }
+            free(pattern);
+            return NULL;
+        }
+    } else {
+        if (!buffer_append_cstr(&sql_buf, ORDER_ALPHA)) {
+            buffer_free(&sql_buf);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory preparing location query");
+            }
+            free(pattern);
+            return NULL;
+        }
+    }
+
+    if (!buffer_append_cstr(&sql_buf, OFFSET_LIMIT)) {
+        buffer_free(&sql_buf);
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory preparing location query");
+        }
+        free(pattern);
+        return NULL;
+    }
 
     const char *item_params[3] = { page_buf, limit_buf, pattern };
     const Oid item_types[3] = { INT4OID, INT4OID, TEXTOID };
-    PGresult *res = PQexecParams(conn, ITEM_SQL, 3, item_types, item_params, NULL, NULL, 0);
+    PGresult *res = PQexecParams(conn, sql_buf.data, 3, item_types, item_params, NULL, NULL, 0);
+    buffer_free(&sql_buf);
     free(pattern);
     if (!res || PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
@@ -260,6 +360,14 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         const char *has_audits = PQgetisnull(res, row, 12) ? "f" : PQgetvalue(res, row, 12);
         const char *has_service = PQgetisnull(res, row, 13) ? "f" : PQgetvalue(res, row, 13);
         const char *has_financial = PQgetisnull(res, row, 14) ? "f" : PQgetvalue(res, row, 14);
+        const char *service_total = PQgetisnull(res, row, 15) ? "0" : PQgetvalue(res, row, 15);
+        const char *service_failures = PQgetisnull(res, row, 16) ? "0" : PQgetvalue(res, row, 16);
+        const char *service_pm = PQgetisnull(res, row, 17) ? "0" : PQgetvalue(res, row, 17);
+        const char *service_tst = PQgetisnull(res, row, 18) ? "0" : PQgetvalue(res, row, 18);
+        const char *open_spend = PQgetisnull(res, row, 19) ? "0" : PQgetvalue(res, row, 19);
+        const char *open_per_device = PQgetisnull(res, row, 20) ? "0" : PQgetvalue(res, row, 20);
+        const char *risk_score = PQgetisnull(res, row, 21) ? "0" : PQgetvalue(res, row, 21);
+        const char *risk_level = PQgetisnull(res, row, 22) ? NULL : PQgetvalue(res, row, 22);
 
         if (!first) {
             if (!buffer_append_char(&buf, ',')) goto oom;
@@ -306,6 +414,22 @@ char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *
         if (!buffer_append_cstr(&buf, (has_service && (has_service[0] == 't' || has_service[0] == '1')) ? "true" : "false")) goto oom;
         if (!buffer_append_cstr(&buf, ",\"has_financial_records\":")) goto oom;
         if (!buffer_append_cstr(&buf, (has_financial && (has_financial[0] == 't' || has_financial[0] == '1')) ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"service_visits\":")) goto oom;
+        if (!buffer_append_cstr(&buf, service_total)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"service_failures\":")) goto oom;
+        if (!buffer_append_cstr(&buf, service_failures)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"service_pm\":")) goto oom;
+        if (!buffer_append_cstr(&buf, service_pm)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"service_tst\":")) goto oom;
+        if (!buffer_append_cstr(&buf, service_tst)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"open_spend\":")) goto oom;
+        if (!buffer_append_cstr(&buf, open_spend)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"open_per_device\":")) goto oom;
+        if (!buffer_append_cstr(&buf, open_per_device)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"risk_score\":")) goto oom;
+        if (!buffer_append_cstr(&buf, risk_score)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"risk_level\":")) goto oom;
+        if (!buffer_append_json_string(&buf, risk_level)) goto oom;
         if (!buffer_append_char(&buf, '}')) goto oom;
     }
 

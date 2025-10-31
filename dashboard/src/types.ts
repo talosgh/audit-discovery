@@ -139,12 +139,21 @@ export interface LocationSummary {
   has_audits?: boolean;
   has_service_records?: boolean;
   has_financial_records?: boolean;
+  service_visits?: number;
+  service_failures?: number;
+  service_pm?: number;
+  service_tst?: number;
+  open_spend?: number;
+  open_per_device?: number;
+  risk_score?: number;
+  risk_level?: string | null;
 }
 
 export interface LocationListParams {
   page?: number;
   pageSize?: number;
   search?: string;
+  sort?: 'risk_desc' | 'risk_asc';
 }
 
 export interface LocationListResponse {

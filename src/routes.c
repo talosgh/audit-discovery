@@ -203,6 +203,7 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
         char *page_value = http_extract_query_param(query_string, "page");
         char *page_size_value = http_extract_query_param(query_string, "page_size");
         char *search_value = http_extract_query_param(query_string, "search");
+        char *sort_value = http_extract_query_param(query_string, "sort");
 
         int page = 1;
         if (page_value && page_value[0]) {
@@ -223,10 +224,11 @@ void routes_handle_get(int client_fd, PGconn *conn, const char *path, const char
         }
 
         char *error = NULL;
-        char *json = db_fetch_location_list(conn, page, page_size, search_value, &error);
+        char *json = db_fetch_location_list(conn, page, page_size, search_value, sort_value, &error);
         free(page_value);
         free(page_size_value);
         free(search_value);
+        free(sort_value);
         if (!json) {
             char *body = build_error_response(error ? error : "Failed to fetch locations");
             send_http_json(client_fd, 500, "Internal Server Error", body);

@@ -9,7 +9,7 @@ bool db_update_deficiency_status(PGconn *conn, const char *uuid, long deficiency
 bool db_fetch_deficiency_status(PGconn *conn, const char *uuid, long deficiency_id, bool *resolved_out, char **error_out);
 char *db_fetch_audit_list(PGconn *conn, char **error_out);
 char *db_fetch_audit_detail(PGconn *conn, const char *uuid, char **error_out);
-char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *search, char **error_out);
+char *db_fetch_location_list(PGconn *conn, int page, int page_size, const char *search, const char *sort, char **error_out);
 char *db_fetch_metrics_summary(PGconn *conn, char **error_out);
 
 #endif /* DB_HELPERS_H */

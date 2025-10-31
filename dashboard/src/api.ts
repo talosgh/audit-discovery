@@ -67,6 +67,9 @@ export function fetchLocations(params: LocationListParams = {}): Promise<Locatio
   if (params.search && params.search.trim().length > 0) {
     search.set('search', params.search.trim());
   }
+  if (params.sort && params.sort.length > 0) {
+    search.set('sort', params.sort);
+  }
   const query = search.toString();
   return fetchJSON<LocationListResponse>(query ? `/locations?${query}` : '/locations');
 }
