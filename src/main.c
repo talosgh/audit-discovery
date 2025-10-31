@@ -13400,16 +13400,12 @@ static int build_location_overview_tex(const ReportJob *job,
         for (int cat = 0; cat <= SERVICE_ACTIVITY_UNKNOWN; ++cat) {
             long tickets = service_stats->category_tickets[cat];
             double hours = service_stats->category_hours[cat];
-            if (!isfinite(hours)) {
-                hours = 0.0;
-            }
             if (tickets == 0 && hours == 0.0) {
                 continue;
             }
+            double hours_clamped = isfinite(hours) ? hours : 0.0;
             double share = (double)tickets / (double)total_activity_tickets;
-            if (!isfinite(share)) {
-                share = 0.0;
-            }
+            share = isfinite(share) ? share : 0.0;
             const char *label = service_activity_category_name((ServiceActivityCategory)cat);
             snprintf(stage_details, sizeof(stage_details), "writing service activity row (%s)", label ? label : "Unknown");
             fail_stage = stage_details;
@@ -13422,7 +13418,7 @@ static int build_location_overview_tex(const ReportJob *job,
                 goto cleanup;
             }
             free(label_tex);
-            if (!buffer_appendf(&buf, "%.2f", hours)) goto cleanup;
+            if (!buffer_appendf(&buf, "%.2f", hours_clamped)) goto cleanup;
             if (!buffer_append_cstr(&buf, " & ")) goto cleanup;
             if (!buffer_append_percent(&buf, share, 1)) goto cleanup;
             if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
