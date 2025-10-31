@@ -2508,32 +2508,16 @@ tbody tr:hover {
   margin: 1.5rem 0;
 }
 
+
 .coverage-cell {
   display: flex;
   align-items: center;
-  gap: 0.4rem;
+  gap: 0.5rem;
 }
 
-.data-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--border);
-  box-shadow: inset 0 0 0 1px rgba(31, 61, 77, 0.15);
-}
-
-.data-dot--available {
-  background: var(--accent);
-  box-shadow: 0 0 0 1px rgba(31, 61, 77, 0.05);
-}
-
-.data-dot--missing {
-  background: rgba(212, 221, 227, 0.7);
-}
-
-.data-dot--partial {
-  background: linear-gradient(135deg, var(--accent) 0%, rgba(212, 221, 227, 0.9) 100%);
-  box-shadow: inset 0 0 0 1px rgba(31, 61, 77, 0.12);
+.coverage-icon {
+  font-size: 1.2rem;
+  line-height: 1;
 }
 
 .action-group {

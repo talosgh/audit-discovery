@@ -49,7 +49,9 @@ const LocationList: Component<LocationListProps> = (props) => {
       const scoreB = typeof b.risk_score === 'number' ? b.risk_score : Number(b.risk_score ?? 0);
       return scoreB - scoreA;
     });
-    return sorted.filter((entry) => entry.risk_level === 'critical' || entry.risk_level === 'warning').slice(0, 10);
+    return sorted
+      .filter((entry) => entry.risk_level === 'critical' || entry.risk_level === 'warning')
+      .slice(0, 5);
   });
 
   const startIndex = createMemo(() => {
@@ -118,7 +120,19 @@ const LocationList: Component<LocationListProps> = (props) => {
     }
   };
 
-  const coverageClass = (flag?: boolean) => (flag ? 'data-dot data-dot--available' : 'data-dot data-dot--missing');
+  const coverageIcon = (type: 'audits' | 'service' | 'financial', available: boolean) => {
+    if (!available) return '◻';
+    switch (type) {
+      case 'audits':
+        return '🔍';
+      case 'service':
+        return '📄';
+      case 'financial':
+        return '💰';
+      default:
+        return '◻';
+    }
+  };
 
   const handleSearchInput = (event: InputEvent & { currentTarget: HTMLInputElement }) => {
     const value = event.currentTarget.value;
@@ -228,9 +242,20 @@ const LocationList: Component<LocationListProps> = (props) => {
                     <For each={topRiskLocations()}>
                       {(location) => {
                         const score = typeof location.risk_score === 'number' ? location.risk_score : Number(location.risk_score ?? 0);
+                        const label = location.site_name ?? location.address;
                         return (
-                          <li>
-                            <span class="risk-rank-name">{location.site_name ?? location.address}</span>
+                          <li
+                            role="link"
+                            tabIndex={0}
+                            onClick={() => props.onSelect(location)}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter' || event.key === ' ') {
+                                event.preventDefault();
+                                props.onSelect(location);
+                              }
+                            }}
+                          >
+                            <span class="risk-rank-name">{label}</span>
                             <span class="risk-rank-meta">{riskLabel(location.risk_level)} · Score {score.toFixed(1)}</span>
                           </li>
                         );
@@ -252,7 +277,6 @@ const LocationList: Component<LocationListProps> = (props) => {
                       <th scope="col">Owner</th>
                       <th scope="col">Vendor</th>
                       <th scope="col">Devices</th>
-                      <th scope="col">Open Deficiencies</th>
                       <th scope="col">Failures (12m)</th>
                       <th scope="col">Open Spend</th>
                     </tr>
@@ -260,12 +284,11 @@ const LocationList: Component<LocationListProps> = (props) => {
                   <tbody>
                     <For each={filteredItems()}>
                       {(location) => {
-                        const openCount = location.open_deficiencies ?? 0;
-                        const deviceCount = location.device_count ?? 0;
-                        const detailParts = [location.street, location.city, location.state].filter(Boolean).join(', ');
-                        const displayName = location.site_name ?? location.formatted_address ?? location.address;
-                        const hasAudits = Boolean(location.has_audits);
-                        const hasService = Boolean(location.has_service_records);
+                    const deviceCount = location.device_count ?? 0;
+                    const detailParts = [location.street, location.city, location.state].filter(Boolean).join(', ');
+                    const displayName = location.site_name ?? location.formatted_address ?? location.address;
+                    const hasAudits = Boolean(location.has_audits);
+                    const hasService = Boolean(location.has_service_records);
                         const hasFinancial = Boolean(location.has_financial_records);
                         const failures12m = typeof location.service_failures === 'number' ? location.service_failures : Number(location.service_failures ?? 0);
                         const openSpendValue = typeof location.open_spend === 'number' ? location.open_spend : Number(location.open_spend ?? 0);
@@ -284,13 +307,10 @@ const LocationList: Component<LocationListProps> = (props) => {
                               }
                             }}
                           >
-                            <td class={openCount > 0 ? 'location-cell has-open-deficiencies' : 'location-cell'}>
-                              <div class="location-name-row">
-                                <span class="location-name">{displayName ?? '—'}</span>
-                                <Show when={openCount > 0}>
-                                  <span class="deficiency-chip" role="img" aria-label="Open deficiencies">⚠</span>
-                                </Show>
-                              </div>
+                        <td class="location-cell">
+                          <div class="location-name-row">
+                            <span class="location-name">{displayName ?? '—'}</span>
+                          </div>
                               <Show when={detailParts}>
                                 <span class="location-subtext">{detailParts}</span>
                               </Show>
@@ -301,26 +321,26 @@ const LocationList: Component<LocationListProps> = (props) => {
                             <td>
                               <span class={riskBadgeClass(location.risk_level)} title={riskTooltip(location)}>{riskLabel(location.risk_level)}</span>
                             </td>
-                            <td class="coverage-cell" aria-label="Data coverage">
-                              <span class="sr-only">
-                                Data coverage: audits {hasAudits ? 'available' : 'missing'}, service {hasService ? 'available' : 'missing'}, financial {hasFinancial ? 'available' : 'missing'}
-                              </span>
-                              <span class={coverageClass(hasAudits)} title={hasAudits ? 'Audit data available' : 'Audit data missing'} aria-hidden="true" />
-                              <span class={coverageClass(hasService)} title={hasService ? 'Service data available' : 'Service data missing'} aria-hidden="true" />
-                              <span class={coverageClass(hasFinancial)} title={hasFinancial ? 'Financial data available' : 'Financial data missing'} aria-hidden="true" />
-                            </td>
+                        <td class="coverage-cell" aria-label="Data coverage">
+                          <span class="sr-only">
+                            Data coverage: audits {hasAudits ? 'available' : 'missing'}, service {hasService ? 'available' : 'missing'}, financial {hasFinancial ? 'available' : 'missing'}
+                          </span>
+                          <span class="coverage-icon" title={hasAudits ? 'Audit data available' : 'Audit data missing'} aria-hidden="true">
+                            {coverageIcon('audits', hasAudits)}
+                          </span>
+                          <span class="coverage-icon" title={hasService ? 'Service data available' : 'Service data missing'} aria-hidden="true">
+                            {coverageIcon('service', hasService)}
+                          </span>
+                          <span class="coverage-icon" title={hasFinancial ? 'Financial data available' : 'Financial data missing'} aria-hidden="true">
+                            {coverageIcon('financial', hasFinancial)}
+                          </span>
+                        </td>
                             <td>{location.street ?? '—'}</td>
                             <td>{location.city ?? '—'}</td>
                             <td>{location.state ?? '—'}</td>
                             <td>{location.building_owner ?? '—'}</td>
                             <td>{location.vendor_name ?? '—'}</td>
                             <td>{deviceCount}</td>
-                            <td>
-                              <span class="deficiency-count">{openCount}</span>
-                              <Show when={openCount > 0}>
-                                <span class="deficiency-indicator" aria-hidden="true" title="Open deficiencies" />
-                              </Show>
-                            </td>
                             <td>{failures12m}</td>
                             <td>{formatCurrency(openSpendValue)}</td>
                           </tr>
