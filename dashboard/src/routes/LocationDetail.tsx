@@ -74,6 +74,9 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const deficiencyStatus = createMemo<CoverageStatus>(() => deficiencyAnalytics()?.status ?? 'missing');
   const serviceStatus = createMemo<CoverageStatus>(() => serviceAnalyticsSection()?.status ?? 'missing');
   const financialStatus = createMemo<CoverageStatus>(() => financialAnalyticsSection()?.status ?? 'missing');
+  const deficiencyAvailable = createMemo(() => deficiencyStatus() !== 'missing');
+  const serviceAvailable = createMemo(() => serviceStatus() !== 'missing');
+  const financialAvailable = createMemo(() => financialStatus() !== 'missing');
   const serviceActivitySummary = createMemo(() => serviceSummary()?.activity_summary ?? []);
   const serviceActivityBreakdown = createMemo(() => serviceSummary()?.activity_breakdown ?? []);
   const financialSavingsTrend = createMemo(() => financialSummary()?.monthly_savings ?? []);
@@ -90,6 +93,10 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   });
   const totalSavings = createMemo(() => financialSummary()?.total_savings ?? 0);
   const savingsRatePercent = createMemo(() => (financialSummary()?.savings_rate ?? 0) * 100);
+  const savingsRateDecimal = createMemo(() => {
+    const rate = financialSummary()?.savings_rate;
+    return rate != null ? rate : null;
+  });
   const savingsPerDevice = createMemo(() => {
     const metrics = financialMetrics();
     return metrics?.savings_per_device ?? null;
@@ -98,6 +105,34 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     const summary = serviceActivitySummary();
     const preventative = summary.find((item) => item.category?.toLowerCase().includes('preventative'));
     return preventative ? preventative.share * 100 : null;
+  });
+  const dataCoverage = createMemo(() => {
+    return [
+      {
+        key: 'audits',
+        label: 'Audit',
+        available: deficiencyAvailable(),
+        status: deficiencyStatus()
+      },
+      {
+        key: 'service',
+        label: 'Service',
+        available: serviceAvailable(),
+        status: serviceStatus()
+      },
+      {
+        key: 'financial',
+        label: 'Financial',
+        available: financialAvailable(),
+        status: financialStatus()
+      },
+      {
+        key: 'timeline',
+        label: 'History',
+        available: timelineData().length > 0,
+        status: timelineData().length > 0 ? 'complete' : 'missing'
+      }
+    ];
   });
   const [timelineAutoScrolled, setTimelineAutoScrolled] = createSignal(false);
   const [timelineHintVisible, setTimelineHintVisible] = createSignal(false);
@@ -1050,6 +1085,67 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
     if (!Number.isFinite(ratio)) return '—';
     return `${ratio.toFixed(1)}%`;
   };
+  const metricSeverity = (key: string, raw: number | null | undefined) => {
+    if (raw == null || Number.isNaN(raw)) return 'info';
+    switch (key) {
+      case 'open-def':
+        if (raw >= 1.5) return 'alert';
+        if (raw >= 1) return 'warning';
+        if (raw <= 0.5) return 'positive';
+        return 'info';
+      case 'closure-rate': {
+        if (raw >= 0.9) return 'positive';
+        if (raw < 0.6) return 'alert';
+        if (raw < 0.8) return 'warning';
+        return 'info';
+      }
+      case 'tickets-device':
+        if (raw >= 4) return 'alert';
+        if (raw >= 2.5) return 'warning';
+        if (raw <= 1) return 'positive';
+        return 'info';
+      case 'preventative-share': {
+        if (raw >= 0.65) return 'positive';
+        if (raw < 0.35) return 'alert';
+        if (raw < 0.5) return 'warning';
+        return 'info';
+      }
+      case 'savings-device':
+        if (raw > 0) return 'positive';
+        if (raw === 0) return 'warning';
+        return 'info';
+      case 'savings-rate':
+        if (raw >= 0.2) return 'positive';
+        if (raw < 0.05) return 'alert';
+        if (raw < 0.1) return 'warning';
+        return 'info';
+      case 'callbacks-spend-corr':
+        if (raw >= 0.6) return 'alert';
+        if (raw >= 0.4) return 'warning';
+        if (raw <= -0.3) return 'positive';
+        return 'info';
+      default:
+        return 'info';
+    }
+  };
+  const calloutIcons: Record<'alert' | 'warning' | 'info' | 'positive', string> = {
+    alert: '⛔',
+    warning: '⚠',
+    info: 'ℹ',
+    positive: '✔'
+  };
+  const formatSeverityLabel = (severity: string) => {
+    switch (severity) {
+      case 'alert':
+        return 'Action recommended';
+      case 'warning':
+        return 'Watch closely';
+      case 'positive':
+        return 'Trending well';
+      default:
+        return 'Status';
+    }
+  };
 
   const analyticsMetrics = createMemo(() => {
     const devicesCount = Math.max(totalDevices(), 1);
@@ -1061,29 +1157,48 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
     const preventativeShare = preventativeSharePercent();
     const correlation = serviceCorrelation();
 
+    const openPerDevice = deficiencyMetrics?.open_per_device ?? null;
+    const closureRateRaw = deficiencyMetrics?.closure_rate ?? null;
+    const closureRatePercent = closureRateRaw != null ? closureRateRaw * 100 : null;
+    const ticketsPerDevice = serviceMetrics?.per_device ?? (serviceTickets() / devicesCount);
+    const preventativeRaw = preventativeShare != null ? preventativeShare / 100 : null;
+    const perDeviceSpend = financialMetrics?.per_device ?? (financialTotals().total / devicesCount);
+    const savingsPerDeviceRaw = savingsPerDeviceValue ?? null;
+    const savingsRateRaw = savingsRateDecimal();
+    const savingsRatePct = savingsRatePercent();
+
     const items = [
       {
         key: 'open-def',
         label: 'Open deficiencies per device',
         tooltip: 'Average open deficiencies divided by the total devices assigned to this location.',
-        value: deficiencyMetrics?.open_per_device ?? 0,
-        formatted: deficiencyMetrics?.open_per_device != null ? deficiencyMetrics.open_per_device.toFixed(2) : '—',
-        hasValue: deficiencyMetrics?.open_per_device != null
+        value: openPerDevice ?? 0,
+        raw: openPerDevice,
+        formatted: openPerDevice != null ? openPerDevice.toFixed(2) : '—',
+        context: 'Goal < 1.0',
+        severity: metricSeverity('open-def', openPerDevice),
+        hasValue: openPerDevice != null
       },
       {
         key: 'closure-rate',
         label: 'Deficiency closure rate',
         tooltip: 'Percentage of recorded deficiencies that have been resolved.',
-        value: deficiencyMetrics?.closure_rate != null ? deficiencyMetrics.closure_rate * 100 : 0,
-        formatted: deficiencyMetrics?.closure_rate != null ? `${(deficiencyMetrics.closure_rate * 100).toFixed(1)}%` : '—',
-        hasValue: deficiencyMetrics?.closure_rate != null
+        value: closureRatePercent ?? 0,
+        raw: closureRateRaw,
+        formatted: closureRatePercent != null ? `${closureRatePercent.toFixed(1)}%` : '—',
+        context: 'Goal > 90%',
+        severity: metricSeverity('closure-rate', closureRateRaw),
+        hasValue: closureRatePercent != null
       },
       {
         key: 'tickets-device',
         label: 'Service tickets per device',
         tooltip: 'Average number of service tickets logged per device (ticket volume ÷ devices).',
-        value: serviceMetrics?.per_device ?? (serviceTickets() / devicesCount),
-        formatted: serviceMetrics?.per_device != null ? serviceMetrics.per_device.toFixed(2) : '—',
+        value: ticketsPerDevice ?? 0,
+        raw: ticketsPerDevice ?? null,
+        formatted: ticketsPerDevice != null && Number.isFinite(ticketsPerDevice) ? ticketsPerDevice.toFixed(2) : '—',
+        context: 'Watch for sustained increases',
+        severity: metricSeverity('tickets-device', ticketsPerDevice ?? null),
         hasValue: serviceMetrics?.per_device != null
       },
       {
@@ -1091,32 +1206,44 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
         label: 'Preventative maintenance share',
         tooltip: 'Percentage of service tickets classified as preventative maintenance (PM).',
         value: preventativeShare ?? 0,
+        raw: preventativeRaw,
         formatted: preventativeShare != null ? `${preventativeShare.toFixed(1)}%` : '—',
+        context: 'Healthy range 50% – 65%',
+        severity: metricSeverity('preventative-share', preventativeRaw),
         hasValue: preventativeShare != null
       },
       {
         key: 'spend-device',
         label: 'Annual spend per device',
         tooltip: 'Total approved spend divided by devices under management.',
-        value: financialMetrics?.per_device ?? (financialTotals().total / devicesCount),
-        formatted: financialMetrics?.per_device != null ? formatCurrency(financialMetrics.per_device) : '—',
+        value: perDeviceSpend ?? 0,
+        raw: perDeviceSpend ?? null,
+        formatted: perDeviceSpend != null && Number.isFinite(perDeviceSpend) ? formatCurrency(perDeviceSpend) : '—',
+        context: 'Budget benchmark varies by contract',
+        severity: 'info',
         hasValue: financialMetrics?.per_device != null
       },
       {
         key: 'savings-device',
         label: 'Savings per device',
         tooltip: 'Negotiated savings (delta) divided by devices at this location.',
-        value: savingsPerDeviceValue ?? 0,
-        formatted: savingsPerDeviceValue != null ? formatCurrency(savingsPerDeviceValue) : '—',
-        hasValue: savingsPerDeviceValue != null
+        value: savingsPerDeviceRaw ?? 0,
+        raw: savingsPerDeviceRaw,
+        formatted: savingsPerDeviceRaw != null ? formatCurrency(savingsPerDeviceRaw) : '—',
+        context: 'Positive values indicate captured savings',
+        severity: metricSeverity('savings-device', savingsPerDeviceRaw),
+        hasValue: savingsPerDeviceRaw != null
       },
       {
         key: 'savings-rate',
         label: 'Savings rate',
         tooltip: 'Percentage of proposed spend reduced through negotiation or dismissal.',
-        value: savingsRate ?? 0,
-        formatted: savingsRate != null ? `${(savingsRate).toFixed(1)}%` : '—',
-        hasValue: savingsRate != null
+        value: savingsRatePct ?? 0,
+        raw: savingsRateRaw,
+        formatted: savingsRatePct != null ? `${(savingsRatePct).toFixed(1)}%` : '—',
+        context: 'Target ≥ 20%',
+        severity: metricSeverity('savings-rate', savingsRateRaw),
+        hasValue: savingsRatePct != null
       }
     ];
 
@@ -1130,7 +1257,10 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
           ? `Months with recorded service activity in the timeline (${rangeLabel}).`
           : 'Months with recorded service activity in the timeline.',
         value: serviceTimeline.count,
+        raw: serviceTimeline.count,
         formatted: `${serviceTimeline.count}`,
+        context: serviceTimeline.count < 6 ? 'Limited history' : undefined,
+        severity: 'info',
         hasValue: true
       });
     }
@@ -1145,7 +1275,10 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
           ? `Months with recorded spend in the timeline (${rangeLabel}).`
           : 'Months with recorded spend in the timeline.',
         value: financeTimeline.count,
+        raw: financeTimeline.count,
         formatted: `${financeTimeline.count}`,
+        context: financeTimeline.count < 6 ? 'Limited history' : undefined,
+        severity: 'info',
         hasValue: true
       });
     }
@@ -1157,6 +1290,9 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
         tooltip: 'Pearson correlation between monthly callback volume and spend (−1 to 1).',
         value: correlation.coefficient,
         formatted: correlation.coefficient.toFixed(2),
+        raw: correlation.coefficient,
+        context: correlation.coefficient >= 0.4 ? 'Callbacks are driving spend' : correlation.coefficient <= -0.3 ? 'Inverse relationship detected' : undefined,
+        severity: metricSeverity('callbacks-spend-corr', correlation.coefficient),
         hasValue: true
       });
     }
@@ -1171,6 +1307,398 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
     }
     const max = Math.max(...values);
     return max > 0 ? max : 1;
+  });
+  const serviceMonthlyTotals = createMemo(() => {
+    return timelineData()
+      .map((point) => {
+        const total =
+          (point.pm ?? 0) +
+          (point.cb_emergency ?? 0) +
+          (point.cb_env ?? 0) +
+          (point.cb_other ?? 0) +
+          (point.tst ?? 0) +
+          (point.rp ?? 0) +
+          (point.misc ?? 0);
+        const callbacks = (point.cb_emergency ?? 0) + (point.cb_env ?? 0) + (point.cb_other ?? 0);
+        return { month: point.month, total, callbacks };
+      })
+      .filter((entry) => entry.total > 0);
+  });
+  const financialMonthlyTotals = createMemo(() => {
+    return timelineData()
+      .map((point) => {
+        const opex = Math.max(point.opex ?? 0, 0);
+        const capex = Math.max(point.capex ?? 0, 0);
+        const other = Math.max(point.other ?? 0, 0);
+        const nonBase = opex + capex + other;
+        const spend = Math.max(point.bc ?? 0, 0) + nonBase;
+        return { month: point.month, spend, nonBase, opex, capex, other };
+      })
+      .filter((entry) => entry.spend > 0 || entry.nonBase > 0);
+  });
+  const callbackShareAggregate = createMemo(() => {
+    const summary = serviceActivitySummary();
+    if (!summary.length) return null;
+    const share = summary
+      .filter((item) => item.category?.startsWith('Callback'))
+      .reduce((sum, item) => sum + (item.share ?? 0), 0);
+    return Number.isFinite(share) ? share : null;
+  });
+  const preventativeShareAggregate = createMemo(() => {
+    const summary = serviceActivitySummary();
+    if (!summary.length) return null;
+    const pm = summary.find((item) => item.category?.toLowerCase().includes('preventative'));
+    return pm && pm.share != null ? pm.share : null;
+  });
+  const repairShareAggregate = createMemo(() => {
+    const summary = serviceActivitySummary();
+    if (!summary.length) return null;
+    const repair = summary.find((item) => item.category?.toLowerCase().includes('repair'));
+    return repair && repair.share != null ? repair.share : null;
+  });
+  const testingShareAggregate = createMemo(() => {
+    const summary = serviceActivitySummary();
+    if (!summary.length) return null;
+    const testing = summary.find((item) => item.category?.toLowerCase().includes('test'));
+    return testing && testing.share != null ? testing.share : null;
+  });
+  const financeTypeShares = createMemo(() => {
+    const types = financialTypes();
+    const total = types.reduce((sum, item) => sum + (item.spend ?? 0), 0);
+    if (total <= 0) {
+      return { capex: null, opex: null, other: null };
+    }
+    const capexSpend = types.filter((item) => item.type?.toLowerCase().includes('capex')).reduce((sum, item) => sum + (item.spend ?? 0), 0);
+    const opexSpend = types.filter((item) => item.type?.toLowerCase().includes('opex')).reduce((sum, item) => sum + (item.spend ?? 0), 0);
+    const otherSpend = Math.max(total - capexSpend - opexSpend, 0);
+    return {
+      capex: capexSpend / total,
+      opex: opexSpend / total,
+      other: otherSpend / total
+    };
+  });
+  const severityRank: Record<'alert' | 'warning' | 'info' | 'positive', number> = {
+    alert: 0,
+    warning: 1,
+    info: 2,
+    positive: 3
+  };
+  const controllerAges = createMemo(() => {
+    const ages = devices()
+      .map((device) => device.controller_age)
+      .filter((age): age is number => typeof age === 'number' && Number.isFinite(age));
+    return ages;
+  });
+  const averageControllerAge = createMemo(() => {
+    const ages = controllerAges();
+    if (!ages.length) return null;
+    const sum = ages.reduce((total, age) => total + age, 0);
+    return sum / ages.length;
+  });
+  const maxControllerAge = createMemo(() => {
+    const ages = controllerAges();
+    if (!ages.length) return null;
+    return Math.max(...ages);
+  });
+  const modernizationIndex = createMemo(() => {
+    const repairShare = repairShareAggregate();
+    const age = averageControllerAge();
+    if (repairShare == null && age == null) return null;
+    const normalizedRepair = repairShare != null ? repairShare : 0;
+    const normalizedAge = age != null ? Math.min(age / 30, 1) : 0;
+    const callbacks = callbackShareAggregate();
+    const normalizedCallback = callbacks != null ? Math.min(callbacks, 1) : 0;
+    const score = normalizedRepair * 0.5 + normalizedAge * 0.35 + normalizedCallback * 0.15;
+    return { score, repairShare: normalizedRepair, averageAge: age, callbackShare: callbacks };
+  });
+  const insightCallouts = createMemo(() => {
+    const callouts: Array<{ key: string; severity: 'alert' | 'warning' | 'info' | 'positive'; title: string; detail: string }> = [];
+    const deficiency = deficiencyAnalytics()?.metrics;
+    const serviceTrend = serviceTrendInfo();
+    const financialTrend = financialTrendInfo();
+    const savingsTrend = financialSavingsTrendInfo();
+    const savingsRateRaw = savingsRateDecimal();
+    const serviceTotals = serviceMonthlyTotals();
+    const financeTotals = financialMonthlyTotals();
+    const serviceAvail = serviceAvailable();
+    const financialAvail = financialAvailable();
+    const deficiencyAvail = deficiencyAvailable();
+    const preventativeShare = preventativeShareAggregate();
+    const testingShare = testingShareAggregate();
+    const repairShare = repairShareAggregate();
+    const callbackShare = callbackShareAggregate();
+    const typeShares = financeTypeShares();
+    const modernization = modernizationIndex();
+    const avgControllerAgeValue = averageControllerAge();
+    const maxControllerAgeValue = maxControllerAge();
+    const calloutLimit = 8;
+
+    if (!deficiencyAvail && (serviceAvail || financialAvail)) {
+      callouts.push({
+        key: 'audit-gap',
+        severity: 'info',
+        title: 'Audit history missing',
+        detail: 'No audit data yet—consider scheduling a field audit to baseline deficiencies.'
+      });
+    }
+    if (deficiencyAvail && !serviceAvail && totalDeficiencies() > 0) {
+      callouts.push({
+        key: 'service-gap',
+        severity: 'warning',
+        title: 'No service telemetry',
+        detail: 'Deficiencies are logged but service dispatch data is absent. Confirm maintenance vendor reporting.'
+      });
+    }
+    if (!financialAvail && (serviceAvail || deficiencyAvail)) {
+      callouts.push({
+        key: 'financial-gap',
+        severity: 'info',
+        title: 'Financial data unavailable',
+        detail: 'Spend history is missing for this property. Ensure invoicing is flowing to the portal.'
+      });
+    }
+
+    if (deficiency?.open_per_device != null) {
+      if (deficiency.open_per_device >= 1.5) {
+        callouts.push({
+          key: 'open-def-high',
+          severity: 'alert',
+          title: 'High deficiency load',
+          detail: `${deficiency.open_per_device.toFixed(2)} open issues per device; prioritize remediation.`
+        });
+      } else if (deficiency.open_per_device <= 0.4) {
+        callouts.push({
+          key: 'open-def-low',
+          severity: 'positive',
+          title: 'Deficiencies under control',
+          detail: `${deficiency.open_per_device.toFixed(2)} open issues per device, well below the 1.0 target.`
+        });
+      }
+    }
+    if (deficiency?.closure_rate != null) {
+      if (deficiency.closure_rate < 0.6) {
+        callouts.push({
+          key: 'closure-low',
+          severity: 'alert',
+          title: 'Closure rate slipping',
+          detail: `Only ${(deficiency.closure_rate * 100).toFixed(1)}% of deficiencies are closed.`
+        });
+      } else if (deficiency.closure_rate >= 0.92) {
+        callouts.push({
+          key: 'closure-strong',
+          severity: 'positive',
+          title: 'Strong remediation cadence',
+          detail: `${(deficiency.closure_rate * 100).toFixed(1)}% of deficiencies are resolved.`
+        });
+      }
+    }
+
+    if (serviceTrend?.direction === 'up' && serviceTrend.percent_change != null && serviceTrend.percent_change >= 5) {
+      callouts.push({
+        key: 'service-trend-up',
+        severity: serviceTrend.percent_change >= 15 ? 'alert' : 'warning',
+        title: 'Service workload rising',
+        detail: `Tickets increased ~${serviceTrend.percent_change.toFixed(1)}% compared with the prior period.`
+      });
+    } else if (serviceTrend?.direction === 'down' && serviceTrend.percent_change != null && serviceTrend.percent_change >= 5) {
+      callouts.push({
+        key: 'service-trend-down',
+        severity: 'positive',
+        title: 'Service workload easing',
+        detail: `Tickets decreased ~${serviceTrend.percent_change.toFixed(1)}% compared with the prior period.`
+      });
+    }
+
+    if (serviceTotals.length >= 3) {
+      const totals = serviceTotals.map((entry) => entry.total);
+      const avg = totals.reduce((sum, value) => sum + value, 0) / totals.length;
+      const spike = [...serviceTotals].sort((a, b) => b.total - a.total)[0];
+      if (spike && avg > 0 && spike.total >= avg * 1.6 && spike.total - avg >= 2) {
+        const delta = ((spike.total - avg) / avg) * 100;
+        callouts.push({
+          key: `service-spike-${spike.month}`,
+          severity: 'warning',
+          title: 'Service spike detected',
+          detail: `${formatMonthLabel(spike.month)} logged ${spike.total} tickets (~${delta.toFixed(0)}% above average).`
+        });
+      }
+    }
+
+    if (preventativeShare != null) {
+      const percent = (preventativeShare * 100).toFixed(1);
+      if (preventativeShare < 0.35) {
+        callouts.push({
+          key: 'pm-low',
+          severity: 'warning',
+          title: 'Preventative work lagging',
+          detail: `Only ${percent}% of tickets are preventative maintenance. Increase scheduled PM to stabilize reliability.`
+        });
+      } else if (preventativeShare >= 0.7) {
+        callouts.push({
+          key: 'pm-strong',
+          severity: 'positive',
+          title: 'Healthy preventative cadence',
+          detail: `${percent}% of activity is preventative maintenance.`
+        });
+      }
+    }
+
+    if (testingShare != null && testingShare < 0.05) {
+      callouts.push({
+        key: 'testing-low',
+        severity: 'warning',
+        title: 'Testing activity minimal',
+        detail: 'Testing tickets are rarely recorded. Confirm mandated inspection cadence with the vendor.'
+      });
+    }
+
+    if (callbackShare != null) {
+      if (callbackShare >= 0.45) {
+        callouts.push({
+          key: 'callbacks-high',
+          severity: 'alert',
+          title: 'Callback-heavy workload',
+          detail: `${(callbackShare * 100).toFixed(1)}% of service tickets are callbacks. Investigate root causes.`
+        });
+      } else if (callbackShare <= 0.2) {
+        callouts.push({
+          key: 'callbacks-low',
+          severity: 'positive',
+          title: 'Callbacks contained',
+          detail: `Callbacks represent just ${(callbackShare * 100).toFixed(1)}% of total service activity.`
+        });
+      }
+    }
+
+    const complianceIssues = devices().filter(
+      (device) => device.cat1_tag_current === false || device.cat5_tag_current === false || device.dlm_compliant === false
+    );
+    if (complianceIssues.length > 0) {
+      const cat1Late = complianceIssues.filter((device) => device.cat1_tag_current === false).length;
+      const cat5Late = complianceIssues.filter((device) => device.cat5_tag_current === false).length;
+      const dlmLate = complianceIssues.filter((device) => device.dlm_compliant === false).length;
+      const parts: string[] = [];
+      if (cat1Late > 0) parts.push(`${cat1Late} Cat1 tag${cat1Late > 1 ? 's' : ''}`);
+      if (cat5Late > 0) parts.push(`${cat5Late} Cat5 tag${cat5Late > 1 ? 's' : ''}`);
+      if (dlmLate > 0) parts.push(`${dlmLate} DLM issue${dlmLate > 1 ? 's' : ''}`);
+      callouts.push({
+        key: 'compliance',
+        severity: 'alert',
+        title: 'Compliance gaps detected',
+        detail: `${parts.join(', ')} require attention.`
+      });
+    }
+
+    if (modernization && modernization.averageAge != null) {
+      const severity = modernization.score >= 0.65 || modernization.averageAge >= 22 ? 'alert' : 'warning';
+      const repairPct = (modernization.repairShare ?? 0) * 100;
+      callouts.push({
+        key: 'modernization-index',
+        severity,
+        title: 'Modernization pressure building',
+        detail: `Average controller age ${modernization.averageAge.toFixed(1)} years with ${repairPct.toFixed(0)}% of tickets tied to repairs. Evaluate modernization plan.`
+      });
+    } else if (maxControllerAgeValue != null && maxControllerAgeValue >= 25) {
+      callouts.push({
+        key: 'controller-age',
+        severity: 'warning',
+        title: 'Controller modernization candidates',
+        detail: `At least one unit has a controller ≥${maxControllerAgeValue.toFixed(0)} years old.`
+      });
+    }
+
+    if (financialTrend?.direction === 'up' && financialTrend.percent_change != null && financialTrend.percent_change >= 5) {
+      callouts.push({
+        key: 'spend-trend-up',
+        severity: financialTrend.percent_change >= 15 ? 'alert' : 'warning',
+        title: 'Spend trending upward',
+        detail: `Monthly spend increased ~${financialTrend.percent_change.toFixed(1)}% period-over-period.`
+      });
+    } else if (financialTrend?.direction === 'down' && financialTrend.percent_change != null && financialTrend.percent_change >= 5) {
+      callouts.push({
+        key: 'spend-trend-down',
+        severity: 'positive',
+        title: 'Spend trending downward',
+        detail: `Spend decreased ~${financialTrend.percent_change.toFixed(1)}% compared with the prior period.`
+      });
+    }
+
+    if (financeTotals.length >= 3) {
+      const totals = financeTotals.map((entry) => entry.nonBase);
+      const avg = totals.reduce((sum, value) => sum + value, 0) / totals.length || 0;
+      const spike = [...financeTotals].sort((a, b) => b.nonBase - a.nonBase)[0];
+      if (spike && avg > 0 && spike.nonBase >= avg * 1.7 && spike.nonBase - avg >= 1000) {
+        const delta = ((spike.nonBase - avg) / avg) * 100;
+        callouts.push({
+          key: `fin-spike-${spike.month}`,
+          severity: 'warning',
+          title: 'Spend surge outside base contract',
+          detail: `${formatMonthLabel(spike.month)} recorded ${formatCurrency(spike.nonBase)} in non-BC spend (~${delta.toFixed(0)}% above average).`
+        });
+      }
+    }
+
+    if (typeShares.opex != null && typeShares.opex >= 0.5) {
+      callouts.push({
+        key: 'opex-share',
+        severity: 'warning',
+        title: 'Operational expense heavy',
+        detail: `${(typeShares.opex * 100).toFixed(1)}% of categorized spend is OPEX. Investigate chronic issues driving callbacks and repairs.`
+      });
+    }
+    if (typeShares.capex != null && typeShares.capex < 0.1 && repairShare != null && repairShare >= 0.28) {
+      callouts.push({
+        key: 'capex-gap',
+        severity: 'warning',
+        title: 'Capex investment lagging',
+        detail: `Only ${(typeShares.capex * 100).toFixed(1)}% of spend is CAPEX despite high repair activity. Build modernization roadmap.`
+      });
+    }
+    if (typeShares.other != null && typeShares.other >= 0.25) {
+      callouts.push({
+        key: 'uncategorized-spend',
+        severity: 'info',
+        title: 'Uncategorized spend rising',
+        detail: `${(typeShares.other * 100).toFixed(1)}% of spend lacks classification. Tighten coding with the vendor.`
+      });
+    }
+
+    const totalsTable = financialTotals();
+    if (totalsTable.open > totalsTable.total * 0.35 && totalsTable.open > 5000) {
+      callouts.push({
+        key: 'open-spend',
+        severity: 'warning',
+        title: 'Large open spend backlog',
+        detail: `${formatCurrency(totalsTable.open)} in proposals/invoices remain open.`
+      });
+    }
+
+    if (savingsTrend?.direction === 'up' && savingsTrend.percent_change != null && savingsTrend.percent_change >= 5) {
+      callouts.push({
+        key: 'savings-trend-up',
+        severity: 'positive',
+        title: 'Savings velocity improving',
+        detail: `Savings increased ~${savingsTrend.percent_change.toFixed(1)}% against the prior window.`
+      });
+    }
+
+    if (savingsRateRaw != null && savingsRateRaw >= 0.25) {
+      callouts.push({
+        key: 'savings-strong',
+        severity: 'positive',
+        title: 'Savings rate outperforming',
+        detail: `Capturing ${(savingsRateRaw * 100).toFixed(1)}% of proposed spend as savings.`
+      });
+    } else if (savingsRateRaw != null && savingsRateRaw < 0.05) {
+      callouts.push({
+        key: 'savings-low',
+        severity: 'warning',
+        title: 'Limited savings captured',
+        detail: `Savings rate sits at ${(savingsRateRaw * 100).toFixed(1)}%. Review negotiations.`
+      });
+    }
+    callouts.sort((a, b) => severityRank[a.severity] - severityRank[b.severity]);
+    return callouts.slice(0, calloutLimit);
   });
 
   const performanceSeries = createMemo(() => {
@@ -1296,7 +1824,43 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                   <span class="profile-value">{profile()?.vendor.name ?? summary()?.vendor_name ?? '—'}</span>
                 </div>
               </div>
+              <div class="data-coverage-strip" role="list">
+                <For each={dataCoverage()}>
+                  {(chip) => (
+                    <span
+                      role="listitem"
+                      class={`coverage-chip coverage-chip--${chip.available ? chip.status : 'missing'}`}
+                      title={chip.available ? `${chip.label} data available` : `${chip.label} data missing`}
+                    >
+                      <span class="coverage-dot" aria-hidden="true" />
+                      {chip.label}
+                    </span>
+                  )}
+                </For>
+              </div>
             </section>
+
+            <Show when={insightCallouts().length > 0}>
+              <section class="insights-card" aria-labelledby="insights-title">
+                <header class="insights-header">
+                  <h2 id="insights-title">Analyst Highlights</h2>
+                  <p>Automated scans for trends, anomalies, and emerging risks across the data we have for this site.</p>
+                </header>
+                <div class="insight-callouts">
+                  <For each={insightCallouts()}>
+                    {(callout) => (
+                      <article class={`insight-callout insight-callout--${callout.severity}`} role="note">
+                        <div class="callout-icon" aria-hidden="true">{calloutIcons[callout.severity]}</div>
+                        <div class="callout-body">
+                          <h3>{callout.title}</h3>
+                          <p>{callout.detail}</p>
+                        </div>
+                      </article>
+                    )}
+                  </For>
+                </div>
+              </section>
+            </Show>
 
             <Show when={showService() || showFinance()}>
               <section class="timeline-card" aria-labelledby="timeline-title">
@@ -1527,6 +2091,9 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                     <dd title="Most recent audit visit completion timestamp.">{visits().length > 0 ? formatDateTime(visits()[0]?.completed_at ?? visits()[0]?.started_at) : '—'}</dd>
                   </div>
                 </dl>
+                <Show when={!deficiencyAvailable()}>
+                  <p class="summary-note info">Audit timeline not available yet for this site.</p>
+                </Show>
               </article>
 
               <article
@@ -1564,6 +2131,9 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                     <dd title="Most frequent problem description logged.">{serviceSummary()?.top_problems?.[0]?.problem ?? '—'}</dd>
                   </div>
                 </dl>
+                <Show when={!serviceAvailable()}>
+                  <p class="summary-note info">No service dispatch data has been ingested for this location.</p>
+                </Show>
               </article>
 
               <article
@@ -1612,6 +2182,9 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                 <Show when={savingsDeltaGap() > 1}>
                   <p class="summary-note warning">Note: Recorded savings differ from proposed minus approved by {formatCurrency(savingsDeltaGap())}. Review open invoices for alignment.</p>
                 </Show>
+                <Show when={!financialAvailable()}>
+                  <p class="summary-note info">Financial statements have not been linked for this property.</p>
+                </Show>
               </article>
             </section>
 
@@ -1629,18 +2202,30 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                     <>
                       <div class="analytics-metrics">
                         <For each={metrics}>
-                      {(metric) => {
-                        const width = max > 0 ? Math.max(8, Math.min(100, Math.round((Math.abs(metric.value) / max) * 100))) : 8;
-                        return (
-                              <div
-                                class={`analytics-metric${metric.hasValue ? '' : ' analytics-metric--inactive'}`}
-                                title={metric.tooltip ?? metric.label}
-                              >
-                                <div class="analytics-metric-label">{metric.label}</div>
+                          {(metric) => {
+                            const severity = metric.severity ?? 'info';
+                            const classes = ['analytics-metric'];
+                            if (!metric.hasValue) {
+                              classes.push('analytics-metric--inactive');
+                            } else {
+                              classes.push(`analytics-metric--${severity}`);
+                            }
+                            const width = max > 0 ? Math.max(8, Math.min(100, Math.round((Math.abs(metric.value) / max) * 100))) : 8;
+                            return (
+                              <div class={classes.join(' ')} title={metric.tooltip ?? metric.label}>
+                                <div class="analytics-metric-heading">
+                                  <div class="analytics-metric-label">{metric.label}</div>
+                                  <Show when={metric.hasValue}>
+                                    <span class={`metric-pill metric-pill--${severity}`}>{formatSeverityLabel(severity)}</span>
+                                  </Show>
+                                </div>
                                 <div class="analytics-bar">
-                                  <div class="analytics-bar-fill" style={{ width: `${width}%` }} />
+                                  <div class={`analytics-bar-fill analytics-bar-fill--${severity}`} style={{ width: `${width}%` }} />
                                 </div>
                                 <div class="analytics-metric-value">{metric.formatted}</div>
+                                <Show when={metric.context}>
+                                  <div class="analytics-metric-context">{metric.context}</div>
+                                </Show>
                               </div>
                             );
                           }}
@@ -1651,11 +2236,12 @@ const showFinance = createMemo(() => timelineHasFinancial() || hasFinanceData())
                           <For each={ranking.ranked}>
                             {(item) => {
                               const width = ranking.maxScore > 0 ? Math.max(8, Math.min(100, (item.score / ranking.maxScore) * 100)) : 8;
+                              const severity = width >= 85 ? 'alert' : width >= 60 ? 'warning' : 'info';
                               return (
                                 <div class="analytics-chart-row" title={`Unit ${item.device.device_id ?? '—'} risk score ${item.score.toFixed(1)}`}>
                                   <span class="chart-label">{item.device.device_id ?? '—'}</span>
                                   <div class="chart-bar">
-                                    <div class="chart-bar-fill" style={{ width: `${width}%` }} />
+                                    <div class={`chart-bar-fill chart-bar-fill--${severity}`} style={{ width: `${width}%` }} />
                                   </div>
                                   <span class="chart-score">{item.score.toFixed(1)}</span>
                                 </div>
