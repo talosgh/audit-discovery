@@ -13402,20 +13402,19 @@ static int build_location_overview_tex(const ReportJob *job,
             }
             double share = (double)tickets / (double)total_activity_tickets;
             const char *label = service_activity_category_name((ServiceActivityCategory)cat);
-        char *label_clean = sanitize_ascii(label ? label : "Unknown");
-        char *label_tex = latex_escape(label_clean ? label_clean : (label ? label : "Unknown"));
-        free(label_clean);
-        if (!label_tex) goto cleanup;
-        if (!buffer_appendf(&buf, "%s & %ld & %.2f & ", label_tex, tickets, hours)) {
+            char *label_clean = sanitize_ascii(label ? label : "Unknown");
+            char *label_tex = latex_escape(label_clean ? label_clean : (label ? label : "Unknown"));
+            free(label_clean);
+            if (!label_tex) goto cleanup;
+            if (!buffer_appendf(&buf, "%s & %ld & %.2f & ", label_tex, tickets, hours)) {
+                free(label_tex);
+                goto cleanup;
+            }
             free(label_tex);
-            goto cleanup;
+            if (!buffer_append_percent(&buf, share, 1)) goto cleanup;
+            if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
         }
-        free(label_tex);
-        if (!buffer_append_percent(&buf, share, 1)) goto cleanup;
-        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
-    }
-    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
 
         if (service_json) {
             char *service_parse_error = NULL;
