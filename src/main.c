@@ -13726,7 +13726,7 @@ static int build_location_overview_tex(const ReportJob *job,
                     goto cleanup;
                 }
             }
-            if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{longtable}\\\\par\n")) {
+            if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{longtable}\n")) {
                 json_free(timeline_root);
                 free(timeline_parse_error);
                 goto cleanup;
