@@ -818,8 +818,9 @@ static int buffer_append_percent(Buffer *buf, double ratio, int precision) {
     if (precision < 0) precision = 1;
     if (precision > 3) precision = 3;
     char fmt[16];
-    snprintf(fmt, sizeof(fmt), "%%.%df%%%%", precision);
-    return buffer_appendf(buf, fmt, ratio * 100.0);
+    snprintf(fmt, sizeof(fmt), "%%.%df", precision);
+    return buffer_appendf(buf, fmt, ratio * 100.0) &&
+           buffer_append_cstr(buf, "\\\\%");
 }
 static void report_data_init(ReportData *data);
 static void report_data_clear(ReportData *data);
