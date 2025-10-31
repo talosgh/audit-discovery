@@ -6762,7 +6762,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         "GROUP BY bucket "
         "ORDER BY bucket DESC "
         "LIMIT 12";
-    PGresult *trend_res = PQexecParams(conn, sql_trend, 5, param_types, params, NULL, NULL, 0);
+    PGresult *trend_res = PQexecParams(conn, sql_trend, 7, param_types, params, NULL, NULL, 0);
     if (PQresultStatus(trend_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(trend_res);
