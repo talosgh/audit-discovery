@@ -11288,6 +11288,37 @@ static int create_report_archive(PGconn *conn, const ReportJob *job, const Repor
     return 1;
 }
 
+static int ensure_report_job_schema(PGconn *conn) {
+    if (!conn) {
+        return 0;
+    }
+
+    const char *statements[] = {
+        "ALTER TABLE report_jobs ADD COLUMN IF NOT EXISTS job_type TEXT",
+        "ALTER TABLE report_jobs ADD COLUMN IF NOT EXISTS range_start DATE",
+        "ALTER TABLE report_jobs ADD COLUMN IF NOT EXISTS range_end DATE",
+        "ALTER TABLE report_jobs ADD COLUMN IF NOT EXISTS range_preset TEXT",
+        "ALTER TABLE report_jobs ALTER COLUMN job_type SET DEFAULT 'audit'",
+        "UPDATE report_jobs SET job_type = 'audit' WHERE job_type IS NULL",
+        "ALTER TABLE report_jobs ALTER COLUMN job_type SET NOT NULL"
+    };
+
+    for (size_t i = 0; i < sizeof(statements) / sizeof(statements[0]); ++i) {
+        PGresult *res = PQexec(conn, statements[i]);
+        if (!res || (PQresultStatus(res) != PGRES_COMMAND_OK && PQresultStatus(res) != PGRES_TUPLES_OK)) {
+            const char *msg = res ? PQresultErrorMessage(res) : NULL;
+            log_error("Failed to ensure report_jobs schema: %s", msg ? msg : "unknown error");
+            if (res) {
+                PQclear(res);
+            }
+            return 0;
+        }
+        PQclear(res);
+    }
+
+    return 1;
+}
+
 static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownloadArtifact *artifact, char **error_out) {
     if (artifact) {
         artifact->path = NULL;
@@ -15297,6 +15328,10 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     log_info("Connected to Postgres");
+
+    if (!ensure_report_job_schema(conn)) {
+        goto cleanup;
+    }
 
     if (pthread_create(&g_report_thread, NULL, report_worker_main, NULL) != 0) {
         log_error("Failed to start report worker thread");
