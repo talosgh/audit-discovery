@@ -4,7 +4,15 @@ import { fetchLocationDetail, downloadReport, createReportJob, fetchReportJob, u
 import LoadingIndicator from '../components/LoadingIndicator';
 import ErrorMessage from '../components/ErrorMessage';
 import { formatCurrency, formatDateTime, formatFileSize, slugify } from '../utils';
-import type { CoverageStatus, LocationAnalytics, LocationDetail as LocationDetailType, LocationDevice, ReportJobStatus, ReportVersion } from '../types';
+import type {
+  CoverageStatus,
+  LocationAnalytics,
+  LocationDetail as LocationDetailType,
+  LocationDevice,
+  ReportJobCreateRequest,
+  ReportJobStatus,
+  ReportVersion
+} from '../types';
 
 interface LocationSelection {
   address: string;
@@ -19,6 +27,83 @@ interface LocationDetailProps {
   onSelectAudit(id: string): void;
 }
 
+type RangePresetOption = 'rolling_12_months' | 'last_quarter' | 'last_month' | 'ytd' | 'last_fiscal' | 'custom';
+
+const RANGE_PRESET_OPTIONS: Array<{ value: RangePresetOption; label: string }> = [
+  { value: 'rolling_12_months', label: 'Last 12 months' },
+  { value: 'last_quarter', label: 'Last quarter' },
+  { value: 'last_month', label: 'Last month' },
+  { value: 'ytd', label: 'Year to date' },
+  { value: 'last_fiscal', label: 'Previous fiscal year' },
+  { value: 'custom', label: 'Custom range' }
+];
+
+const ISO_DATE_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ISO_DATE_FORMATTER = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
+
+const presetLabelForValue = (value: string | null | undefined): string => {
+  if (!value) return 'Custom range';
+  const option = RANGE_PRESET_OPTIONS.find((entry) => entry.value === value);
+  if (option) return option.label;
+  return value.replace(/_/g, ' ');
+};
+
+const formatIsoDate = (value?: string | null): string => {
+  if (!value) return '—';
+  const match = ISO_DATE_REGEX.exec(value);
+  if (!match) return value;
+  const year = Number(match[1]);
+  const month = Number(match[2]) - 1;
+  const day = Number(match[3]);
+  const date = new Date(year, month, day);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return ISO_DATE_FORMATTER.format(date);
+};
+
+const describeOverviewRange = (
+  start?: string | null,
+  end?: string | null,
+  preset?: string | null
+): string => {
+  if (start && end) {
+    const startLabel = formatIsoDate(start);
+    const endLabel = formatIsoDate(end);
+    return start === end ? startLabel : `${startLabel} – ${endLabel}`;
+  }
+  if (preset && preset !== 'custom') {
+    return presetLabelForValue(preset);
+  }
+  if (preset === 'custom') {
+    return 'Custom range';
+  }
+  return 'Selected range';
+};
+
+const isValidIsoDate = (value: string | null | undefined): value is string => {
+  if (!value) return false;
+  if (!ISO_DATE_REGEX.test(value)) return false;
+  const match = ISO_DATE_REGEX.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]) - 1;
+  const day = Number(match[3]);
+  const date = new Date(year, month, day);
+  return !Number.isNaN(date.getTime());
+};
+
+const compareIsoDates = (start: string, end: string): number => {
+  const startMatch = ISO_DATE_REGEX.exec(start);
+  const endMatch = ISO_DATE_REGEX.exec(end);
+  if (!startMatch || !endMatch) {
+    return 0;
+  }
+  const startDate = new Date(Number(startMatch[1]), Number(startMatch[2]) - 1, Number(startMatch[3]));
+  const endDate = new Date(Number(endMatch[1]), Number(endMatch[2]) - 1, Number(endMatch[3]));
+  return startDate.getTime() - endDate.getTime();
+};
+
 const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [message, setMessage] = createSignal<string | null>(null);
   const [errorMessage, setErrorMessage] = createSignal<string | null>(null);
@@ -27,7 +112,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [jobStatus, setJobStatus] = createSignal<ReportJobStatus | null>(null);
   const [statusMessage, setStatusMessage] = createSignal<string | null>(null);
   const [lastDownload, setLastDownload] = createSignal<{ jobId: string; filename: string; label: string } | null>(null);
-  const [reportMode, setReportMode] = createSignal<'full' | 'deficiency'>('full');
+  const [reportMode, setReportMode] = createSignal<'full' | 'deficiency' | 'overview'>('full');
   const [showReportModal, setShowReportModal] = createSignal(false);
   const [coverOwner, setCoverOwner] = createSignal('');
   const [coverStreet, setCoverStreet] = createSignal('');
@@ -41,6 +126,9 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [formError, setFormError] = createSignal<string | null>(null);
   const [includeAllVisits, setIncludeAllVisits] = createSignal(true);
   const [selectedVisitIds, setSelectedVisitIds] = createSignal<Set<string>>(new Set());
+  const [rangePreset, setRangePreset] = createSignal<RangePresetOption>('rolling_12_months');
+  const [customRangeStart, setCustomRangeStart] = createSignal('');
+  const [customRangeEnd, setCustomRangeEnd] = createSignal('');
   const [activePanel, setActivePanel] = createSignal<'overview' | 'deficiencies' | 'service' | 'financial'>('overview');
   const [detail, { refetch }] = createResource<LocationDetailType, LocationQuery>(
     () => ({ address: props.location.address, locationId: props.location.locationRowId ?? null }),
@@ -53,7 +141,12 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
   const summary = createMemo(() => detail()?.summary);
   const devices = createMemo(() => detail()?.devices ?? []);
-  const auditReports = createMemo<ReportVersion[]>(() => detail()?.reports ?? []);
+  const auditReports = createMemo<ReportVersion[]>(() =>
+    (detail()?.reports ?? []).filter((report) => (report.job_type ?? 'audit') !== 'overview')
+  );
+  const overviewReports = createMemo<ReportVersion[]>(() =>
+    (detail()?.reports ?? []).filter((report) => (report.job_type ?? 'audit') === 'overview')
+  );
   const deficiencyReports = createMemo<ReportVersion[]>(() => detail()?.deficiency_reports ?? []);
   const profile = createMemo(() => detail()?.profile);
   const serviceSummary = createMemo(() => detail()?.service);
@@ -143,6 +236,55 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setSelectedVisitIds(() => new Set(visitIds));
   };
 
+  const resolveJobLabel = (jobType?: string | null, deficiency?: boolean): string => {
+    const normalized = jobType?.toLowerCase();
+    if (normalized === 'overview') {
+      return 'Overview report';
+    }
+    return deficiency ? 'Deficiency list' : 'Report';
+  };
+
+  const describeStatusSelection = (status: ReportJobStatus): string => {
+    const normalized = status.job_type?.toLowerCase();
+    if (normalized === 'overview') {
+      return describeOverviewRange(status.range_start ?? undefined, status.range_end ?? undefined, status.range_preset ?? undefined);
+    }
+    return status.include_all ? 'entire history' : `${status.selected_audit_count ?? 0} audits`;
+  };
+
+  const reportModalTitle = () => {
+    switch (reportMode()) {
+      case 'overview':
+        return 'Generate Overview Report';
+      case 'deficiency':
+        return 'Generate Deficiency Report';
+      default:
+        return 'Generate Report';
+    }
+  };
+
+  const reportModalDescription = () => {
+    switch (reportMode()) {
+      case 'overview':
+        return 'Summarize service and financial performance for a specific time window.';
+      case 'deficiency':
+        return 'Provide the cover information used for the deficiency summary.';
+      default:
+        return "Provide the cover page information for this location's report.";
+    }
+  };
+
+  const submitButtonText = () => {
+    switch (reportMode()) {
+      case 'overview':
+        return 'Queue Overview Report';
+      case 'deficiency':
+        return 'Queue Deficiency List';
+      default:
+        return 'Queue Report';
+    }
+  };
+
   const selectLatestVisit = () => {
     const latest = visits()[0]?.visit_id;
     if (!latest) return;
@@ -167,9 +309,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
   const updateStatusFromPoll = (status: ReportJobStatus) => {
     setJobStatus(status);
-    const isDeficiency = Boolean(status.deficiency_only);
-    const label = isDeficiency ? 'Deficiency list' : 'Report';
-    const selectionDescriptor = status.include_all ? 'entire history' : `${status.selected_audit_count ?? 0} audits`;
+    const label = resolveJobLabel(status.job_type, status.deficiency_only);
+    const selectionDescriptor = describeStatusSelection(status);
     if (status.status === 'failed') {
       setStatusMessage(null);
       setErrorMessage(status.error ?? `${label} generation failed`);
@@ -316,11 +457,17 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     });
   });
 
-  const openReportModal = (mode: 'full' | 'deficiency') => {
+  const openReportModal = (mode: 'full' | 'deficiency' | 'overview') => {
     if (isGenerating()) {
       return;
     }
     setReportMode(mode);
+    if (mode === 'overview') {
+      setIncludeAllVisits(true);
+      setRangePreset('rolling_12_months');
+      setCustomRangeStart('');
+      setCustomRangeEnd('');
+    }
     setMessage(null);
     setErrorMessage(null);
     setFormError(null);
@@ -364,7 +511,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
 
     const mode = reportMode();
     const isDeficiency = mode === 'deficiency';
-    const label = isDeficiency ? 'Deficiency list' : 'Report';
+    const isOverview = mode === 'overview';
+    const label = isDeficiency ? 'Deficiency list' : isOverview ? 'Overview report' : 'Report';
 
     const owner = coverOwner().trim();
     const street = coverStreet().trim();
@@ -387,10 +535,32 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       return;
     }
 
-    const visitSelection = includeAllVisits() ? [] : selectedVisitList();
-    if (!includeAllVisits() && visitSelection.length === 0) {
+    const visitSelection = !isOverview && !includeAllVisits() ? selectedVisitList() : [];
+    if (!isOverview && !includeAllVisits() && visitSelection.length === 0) {
       setFormError('Select at least one visit to include in this report.');
       return;
+    }
+
+    let rangePresetValue: RangePresetOption | undefined;
+    let rangeStartValue: string | undefined;
+    let rangeEndValue: string | undefined;
+    if (isOverview) {
+      const preset = rangePreset();
+      rangePresetValue = preset;
+      if (preset === 'custom') {
+        const start = customRangeStart().trim();
+        const end = customRangeEnd().trim();
+        if (!isValidIsoDate(start) || !isValidIsoDate(end)) {
+          setFormError('Provide start and end dates in YYYY-MM-DD format.');
+          return;
+        }
+        if (compareIsoDates(start, end) > 0) {
+          setFormError('Range start must be on or before range end.');
+          return;
+        }
+        rangeStartValue = start;
+        rangeEndValue = end;
+      }
     }
 
     setCoverOwner(owner);
@@ -409,13 +579,17 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setJobId(null);
     stopPolling();
 
-    const selectionLabel = includeAllVisits() ? 'entire history' : `${visitSelection.length} visits`;
+    const selectionLabel = isOverview
+      ? describeOverviewRange(rangeStartValue, rangeEndValue, rangePresetValue ?? rangePreset())
+      : includeAllVisits()
+        ? 'entire history'
+        : `${visitSelection.length} visits`;
 
     try {
       setIsGenerating(true);
       setStatusMessage(`${label} queued for generation (${selectionLabel})…`);
       setLastDownload(null);
-      const response = await createReportJob({
+      const requestPayload = {
         address: props.location.address,
         locationRowId: detail()?.summary.location_row_id ?? props.location.locationRowId ?? null,
         coverBuildingOwner: owner,
@@ -426,10 +600,28 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
         coverContactName: contactName,
         coverContactEmail: contactEmail,
         notes: notesSeed,
-        recommendations: recsSeed,
-        deficiencyOnly: isDeficiency,
-        visitIds: includeAllVisits() ? undefined : visitSelection
-      });
+        recommendations: recsSeed
+      } as ReportJobCreateRequest;
+
+      if (isOverview) {
+        requestPayload.reportType = 'overview';
+        if (rangePresetValue && rangePresetValue !== 'custom') {
+          requestPayload.rangePreset = rangePresetValue;
+        }
+        if (rangeStartValue) {
+          requestPayload.rangeStart = rangeStartValue;
+        }
+        if (rangeEndValue) {
+          requestPayload.rangeEnd = rangeEndValue;
+        }
+      } else {
+        requestPayload.deficiencyOnly = isDeficiency;
+        if (!includeAllVisits() && visitSelection.length > 0) {
+          requestPayload.visitIds = visitSelection;
+        }
+      }
+
+      const response = await createReportJob(requestPayload);
       setJobId(response.job_id);
       setShowReportModal(false);
       setFormError(null);
@@ -501,7 +693,13 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
         if (contentType && contentType.includes('pdf')) return 'pdf';
         return 'zip';
       })();
-      const fallbackName = `audit-report-${slugify(props.location.address)}.${inferredExt}`;
+      const labelKey = label.toLowerCase();
+      const baseName = labelKey.includes('deficiency')
+        ? 'deficiency-list'
+        : labelKey.includes('overview')
+          ? 'overview-report'
+          : 'audit-report';
+      const fallbackName = `${baseName}-${slugify(props.location.address)}.${inferredExt}`;
       const filename = serverFilename ?? fallbackName;
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -523,8 +721,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     const id = jobId();
     if (!id) return;
     const status = jobStatus();
-    const isDeficiency = Boolean(status?.deficiency_only);
-    const label = isDeficiency ? 'Deficiency list' : 'Report';
+    const label = resolveJobLabel(status?.job_type, status?.deficiency_only);
     await downloadReportFor(id, label);
   };
 
@@ -1821,6 +2018,14 @@ const dataCoverage = createMemo(() => {
         <div class="section-actions">
           <button
             type="button"
+            class="action-button"
+            disabled={isGenerating()}
+            onClick={() => openReportModal('overview')}
+          >
+            {isGenerating() && reportMode() === 'overview' ? 'Generating…' : 'Generate Overview'}
+          </button>
+          <button
+            type="button"
             class="action-button refresh-button"
             onClick={() => {
               setMessage(null);
@@ -2744,6 +2949,44 @@ const dataCoverage = createMemo(() => {
 
                   <section class="reports-section">
                     <div>
+                      <h2>Overview Reports</h2>
+                      <Show when={overviewReports().length > 0} fallback={<p class="muted">No overview reports generated yet.</p>}>
+                        <ul class="reports-list">
+                          <For each={overviewReports()}>
+                            {(report: ReportVersion, index) => {
+                              const isCurrent = index() === 0;
+                              const versionLabel = report.version != null ? `Overview v${report.version}` : 'Overview';
+                              const rangeLabel = describeOverviewRange(
+                                report.range_start ?? undefined,
+                                report.range_end ?? undefined,
+                                report.range_preset ?? undefined
+                              );
+                              return (
+                                <li class={`report-item${isCurrent ? ' report-item--current' : ''}`}>
+                                  <div class="report-meta">
+                                    <span class="report-title">
+                                      {versionLabel}
+                                      <Show when={isCurrent}>
+                                        <span class="report-badge">Current</span>
+                                      </Show>
+                                    </span>
+                                    <span class="report-date">{formatDateTime(report.completed_at ?? report.created_at)}</span>
+                                    <span class="report-note">{rangeLabel}</span>
+                                  </div>
+                                  <div class="report-actions">
+                                    <span class="report-size">{report.size_bytes != null ? formatFileSize(report.size_bytes) : '—'}</span>
+                                    <button type="button" class="action-button" onClick={() => void handleDownloadExisting(report.job_id, 'Overview report')}>
+                                      Download
+                                    </button>
+                                  </div>
+                                </li>
+                              );
+                            }}
+                          </For>
+                        </ul>
+                      </Show>
+                    </div>
+                    <div>
                       <h2>Audit Reports</h2>
                       <Show when={auditReports().length > 0} fallback={<p class="muted">No audit reports generated yet.</p>}>
                         <ul class="reports-list">
@@ -3312,8 +3555,8 @@ const dataCoverage = createMemo(() => {
         >
           <div class="report-modal-content" role="document" onClick={(event) => event.stopPropagation()}>
             <header class="report-modal-header">
-              <h2 id="report-modal-title">Generate Report</h2>
-              <p>Provide the cover page information for this location&apos;s report.</p>
+              <h2 id="report-modal-title">{reportModalTitle()}</h2>
+              <p>{reportModalDescription()}</p>
             </header>
             <form class="report-modal-form" noValidate onSubmit={handleSubmitReportForm}>
               <div class="report-modal-grid">
@@ -3388,8 +3631,52 @@ const dataCoverage = createMemo(() => {
                     autoComplete="email"
                     required
                   />
-                </label>
-              </div>
+              </label>
+            </div>
+              <Show when={reportMode() === 'overview'}>
+                <fieldset class="modal-field modal-field--full">
+                  <legend>Reporting Window</legend>
+                  <label class="modal-field">
+                    <span>Preset</span>
+                    <select value={rangePreset()} onInput={(event) => setRangePreset(event.currentTarget.value as RangePresetOption)}>
+                      <For each={RANGE_PRESET_OPTIONS}>
+                        {(option) => (
+                          <option value={option.value}>{option.label}</option>
+                        )}
+                      </For>
+                    </select>
+                  </label>
+                  <Show when={rangePreset() === 'custom'}>
+                    <div class="modal-field-grid">
+                      <label class="modal-field">
+                        <span>Start date</span>
+                        <input
+                          type="date"
+                          value={customRangeStart()}
+                          onInput={(event) => setCustomRangeStart(event.currentTarget.value)}
+                          required
+                        />
+                      </label>
+                      <label class="modal-field">
+                        <span>End date</span>
+                        <input
+                          type="date"
+                          value={customRangeEnd()}
+                          onInput={(event) => setCustomRangeEnd(event.currentTarget.value)}
+                          required
+                        />
+                      </label>
+                    </div>
+                  </Show>
+                  <p class="modal-hint">
+                    {describeOverviewRange(
+                      rangePreset() === 'custom' ? customRangeStart().trim() || undefined : undefined,
+                      rangePreset() === 'custom' ? customRangeEnd().trim() || undefined : undefined,
+                      rangePreset()
+                    )}
+                  </p>
+                </fieldset>
+              </Show>
               <label class="modal-field modal-field--full">
                 <span>Narrative Seed</span>
                 <textarea
@@ -3416,7 +3703,7 @@ const dataCoverage = createMemo(() => {
                   Cancel
                 </button>
                 <button type="submit" class="action-button" disabled={isGenerating()}>
-                  {isGenerating() ? 'Submitting…' : 'Queue Report'}
+                  {isGenerating() ? 'Submitting…' : submitButtonText()}
                 </button>
               </div>
             </form>

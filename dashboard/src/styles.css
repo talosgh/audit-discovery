@@ -437,6 +437,63 @@ tbody tr:hover {
   color: var(--text-subtle);
 }
 
+.pagination-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 1.5rem;
+  gap: 1rem;
+}
+
+.pagination-nav .page-info {
+  color: var(--text-subtle);
+  font-size: 0.9rem;
+}
+
+.page-links {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.pagination-button {
+  min-width: 2.25rem;
+  height: 2.25rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  background: #ffffff;
+  color: #0f172a;
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.pagination-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: 0 6px 12px rgba(70, 166, 180, 0.2);
+}
+
+.pagination-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.pagination-button--active,
+.pagination-button--active:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 8px 18px rgba(70, 166, 180, 0.25);
+}
+
+.pagination-ellipsis {
+  font-size: 1.1rem;
+  color: var(--text-subtle);
+  padding: 0 0.25rem;
+}
+
 .location-name-row {
   display: flex;
   align-items: center;
@@ -1008,6 +1065,32 @@ tbody tr:hover {
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
+fieldset.modal-field {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.75rem 1rem 1rem;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+fieldset.modal-field legend {
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+  padding: 0 0.35rem;
+}
+
+.modal-field select {
+  background: var(--surface-muted);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: #1f2a33;
+  padding: 0.65rem 0.75rem;
+  font-size: 0.95rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
 .modal-field textarea {
   background: var(--surface-muted);
   border: 1px solid var(--border);
@@ -1021,7 +1104,8 @@ tbody tr:hover {
 }
 
 .modal-field input:focus,
-.modal-field textarea:focus {
+.modal-field textarea:focus,
+.modal-field select:focus {
   outline: none;
   border-color: var(--accent);
   box-shadow: 0 0 0 2px rgba(70, 166, 180, 0.25);
@@ -1029,6 +1113,19 @@ tbody tr:hover {
 
 .modal-field input::placeholder,
 .modal-field textarea::placeholder {
+  color: var(--text-subtle);
+}
+
+.modal-field-grid {
+  display: grid;
+  gap: 0.9rem;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  margin-top: 0.6rem;
+}
+
+.modal-hint {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
   color: var(--text-subtle);
 }
 

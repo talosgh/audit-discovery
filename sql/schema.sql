@@ -197,6 +197,10 @@ CREATE TABLE IF NOT EXISTS report_jobs (
     artifact_size BIGINT,
     artifact_version INTEGER,
     deficiency_only BOOLEAN NOT NULL DEFAULT FALSE,
+    job_type TEXT NOT NULL DEFAULT 'audit',
+    range_start DATE,
+    range_end DATE,
+    range_preset TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     started_at TIMESTAMPTZ,
@@ -222,6 +226,10 @@ ALTER TABLE report_jobs
     ADD COLUMN IF NOT EXISTS cover_zip TEXT,
     ADD COLUMN IF NOT EXISTS cover_contact_name TEXT,
     ADD COLUMN IF NOT EXISTS cover_contact_email TEXT,
+    ADD COLUMN IF NOT EXISTS job_type TEXT NOT NULL DEFAULT 'audit',
+    ADD COLUMN IF NOT EXISTS range_start DATE,
+    ADD COLUMN IF NOT EXISTS range_end DATE,
+    ADD COLUMN IF NOT EXISTS range_preset TEXT,
     ADD COLUMN IF NOT EXISTS location_id INTEGER REFERENCES locations(id),
     ADD COLUMN IF NOT EXISTS include_all BOOLEAN NOT NULL DEFAULT TRUE;
 

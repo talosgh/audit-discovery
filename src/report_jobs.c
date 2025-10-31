@@ -4,9 +4,34 @@
 #include "log.h"
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+
+static const char *report_job_type_to_string(ReportJobType type) {
+    switch (type) {
+        case REPORT_JOB_TYPE_LOCATION_OVERVIEW:
+            return "overview";
+        case REPORT_JOB_TYPE_AUDIT:
+        default:
+            return "audit";
+    }
+}
+
+static ReportJobType report_job_type_from_string(const char *value) {
+    if (!value || value[0] == '\0') {
+        return REPORT_JOB_TYPE_AUDIT;
+    }
+    if (strcasecmp(value, "overview") == 0 || strcasecmp(value, "location_overview") == 0) {
+        return REPORT_JOB_TYPE_LOCATION_OVERVIEW;
+    }
+    if (strcasecmp(value, "audit") == 0 || strcasecmp(value, "full") == 0) {
+        return REPORT_JOB_TYPE_AUDIT;
+    }
+    return REPORT_JOB_TYPE_AUDIT;
+}
 
 void report_job_init(ReportJob *job) {
     if (!job) {
@@ -23,10 +48,14 @@ void report_job_init(ReportJob *job) {
     job->cover_zip = NULL;
     job->cover_contact_name = NULL;
     job->cover_contact_email = NULL;
+    job->type = REPORT_JOB_TYPE_AUDIT;
     job->deficiency_only = false;
     job->include_all = true;
     job->has_location_id = false;
     job->location_id = 0;
+    job->range_start = NULL;
+    job->range_end = NULL;
+    job->range_preset = NULL;
     string_array_init(&job->audit_ids);
 }
 
@@ -44,6 +73,9 @@ void report_job_clear(ReportJob *job) {
     free(job->cover_zip);
     free(job->cover_contact_name);
     free(job->cover_contact_email);
+    free(job->range_start);
+    free(job->range_end);
+    free(job->range_preset);
     string_array_clear(&job->audit_ids);
     job->address = NULL;
     job->notes = NULL;
@@ -56,10 +88,14 @@ void report_job_clear(ReportJob *job) {
     job->cover_contact_name = NULL;
     job->cover_contact_email = NULL;
     job->job_id[0] = '\0';
+    job->type = REPORT_JOB_TYPE_AUDIT;
     job->deficiency_only = false;
     job->include_all = true;
     job->has_location_id = false;
     job->location_id = 0;
+    job->range_start = NULL;
+    job->range_end = NULL;
+    job->range_preset = NULL;
 }
 
 static int db_insert_job_audits(PGconn *conn, const char *job_id, const StringArray *audits, char **error_out) {
@@ -108,15 +144,15 @@ int db_insert_report_job(PGconn *conn, const char *job_id, const ReportJob *job,
 
     const char *sql =
         "INSERT INTO report_jobs (job_id, address, notes, recommendations, "
-        "cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email, deficiency_only, location_id, include_all) "
-        "VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)";
+        "cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email, deficiency_only, job_type, range_start, range_end, range_preset, location_id, include_all) "
+        "VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::boolean, $13, $14::date, $15::date, $16, $17::int, $18::boolean)";
     char location_buf[32];
     const char *location_param = NULL;
     if (job->has_location_id) {
         snprintf(location_buf, sizeof(location_buf), "%d", job->location_id);
         location_param = location_buf;
     }
-    const char *params[14] = {
+    const char *params[18] = {
         job_id,
         job->address,
         job->notes,
@@ -129,10 +165,14 @@ int db_insert_report_job(PGconn *conn, const char *job_id, const ReportJob *job,
         job->cover_contact_name,
         job->cover_contact_email,
         job->deficiency_only ? "true" : "false",
+        report_job_type_to_string(job->type),
+        job->range_start,
+        job->range_end,
+        job->range_preset,
         location_param,
         include_all ? "true" : "false"
     };
-    int param_count = location_param ? 14 : 13;
+    int param_count = 18;
     PGresult *res = PQexecParams(conn, sql, param_count, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         if (error_out && !*error_out) {
@@ -175,7 +215,7 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
     const char *sql =
         "WITH job AS ("
         "    SELECT id, job_id::text AS job_id_text, address, notes, recommendations, "
-        "           cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email, deficiency_only, location_id, include_all "
+        "           cover_building_owner, cover_street, cover_city, cover_state, cover_zip, cover_contact_name, cover_contact_email, deficiency_only, job_type, range_start, range_end, range_preset, location_id, include_all "
         "    FROM report_jobs "
         "    WHERE status = 'queued' "
         "    ORDER BY created_at "
@@ -187,7 +227,7 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
         "FROM job "
         "WHERE r.id = job.id "
         "RETURNING job.job_id_text, job.address, job.notes, job.recommendations, "
-        "          job.cover_building_owner, job.cover_street, job.cover_city, job.cover_state, job.cover_zip, job.cover_contact_name, job.cover_contact_email, job.deficiency_only, job.location_id, job.include_all";
+        "          job.cover_building_owner, job.cover_street, job.cover_city, job.cover_state, job.cover_zip, job.cover_contact_name, job.cover_contact_email, job.deficiency_only, job.job_type, job.range_start, job.range_end, job.range_preset, job.location_id, job.include_all";
     PGresult *res = PQexec(conn, sql);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
@@ -316,13 +356,44 @@ int db_claim_next_report_job(PGconn *conn, ReportJob *job, char **error_out) {
         }
     }
     job->deficiency_only = !PQgetisnull(res, 0, 11) && (strcmp(PQgetvalue(res, 0, 11), "t") == 0 || strcmp(PQgetvalue(res, 0, 11), "true") == 0 || strcmp(PQgetvalue(res, 0, 11), "1") == 0);
+    job->type = report_job_type_from_string(PQgetisnull(res, 0, 12) ? NULL : PQgetvalue(res, 0, 12));
+    if (!PQgetisnull(res, 0, 13)) {
+        job->range_start = strdup(PQgetvalue(res, 0, 13));
+        if (!job->range_start) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying range_start");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 14)) {
+        job->range_end = strdup(PQgetvalue(res, 0, 14));
+        if (!job->range_end) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying range_end");
+            }
+            return -1;
+        }
+    }
+    if (!PQgetisnull(res, 0, 15)) {
+        job->range_preset = strdup(PQgetvalue(res, 0, 15));
+        if (!job->range_preset) {
+            PQclear(res);
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory copying range preset");
+            }
+            return -1;
+        }
+    }
     job->has_location_id = false;
     job->location_id = 0;
-    if (!PQgetisnull(res, 0, 12)) {
+    if (!PQgetisnull(res, 0, 16)) {
         job->has_location_id = true;
-        job->location_id = atoi(PQgetvalue(res, 0, 12));
+        job->location_id = atoi(PQgetvalue(res, 0, 16));
     }
-    job->include_all = PQgetisnull(res, 0, 13) || (strcmp(PQgetvalue(res, 0, 13), "t") == 0 || strcmp(PQgetvalue(res, 0, 13), "true") == 0 || strcmp(PQgetvalue(res, 0, 13), "1") == 0);
+    job->include_all = PQgetisnull(res, 0, 17) || (strcmp(PQgetvalue(res, 0, 17), "t") == 0 || strcmp(PQgetvalue(res, 0, 17), "true") == 0 || strcmp(PQgetvalue(res, 0, 17), "1") == 0);
     PQclear(res);
 
     const char *audit_params[1] = { job->job_id };
@@ -409,7 +480,7 @@ int db_complete_report_job(PGconn *conn,
 
     const char *sql =
         "WITH target AS ("
-        "        SELECT id, address, deficiency_only "
+        "        SELECT id, address, deficiency_only, job_type "
         "        FROM report_jobs "
         "        WHERE job_id = $1::uuid"
         "    ), version_calc AS ("
@@ -419,7 +490,8 @@ int db_complete_report_job(PGconn *conn,
         "                        SELECT MAX(artifact_version) "
         "                        FROM report_jobs "
         "                        WHERE address = target.address "
-        "                          AND deficiency_only = target.deficiency_only"
+        "                          AND deficiency_only = target.deficiency_only "
+        "                          AND job_type = target.job_type"
         "                    ), 0) + 1 "
         "               ELSE NULL END AS next_version "
         "        FROM target"
@@ -496,6 +568,10 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
         "       to_char(r.completed_at, 'YYYY-MM-DD" "T" "HH24:MI:SSOF'), "
         "       r.error, "
         "       r.deficiency_only, "
+        "       r.job_type, "
+        "       to_char(r.range_start, 'YYYY-MM-DD'), "
+        "       to_char(r.range_end, 'YYYY-MM-DD'), "
+        "       r.range_preset, "
         "       r.include_all, "
         "       r.location_id, "
         "       r.artifact_size, "
@@ -535,12 +611,16 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
     const char *completed_val = PQgetisnull(res, 0, 5) ? NULL : PQgetvalue(res, 0, 5);
     const char *error_val = PQgetisnull(res, 0, 6) ? NULL : PQgetvalue(res, 0, 6);
     const char *deficiency_only_val = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
-    const char *include_all_val = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
-    const char *location_id_val = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
-    const char *artifact_size_val = PQgetisnull(res, 0, 10) ? NULL : PQgetvalue(res, 0, 10);
-    const char *artifact_filename_val = PQgetisnull(res, 0, 11) ? NULL : PQgetvalue(res, 0, 11);
-    const char *artifact_version_val = PQgetisnull(res, 0, 12) ? NULL : PQgetvalue(res, 0, 12);
-    const char *selection_count_val = PQgetisnull(res, 0, 13) ? NULL : PQgetvalue(res, 0, 13);
+    const char *job_type_val = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
+    const char *range_start_val = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
+    const char *range_end_val = PQgetisnull(res, 0, 10) ? NULL : PQgetvalue(res, 0, 10);
+    const char *range_preset_val = PQgetisnull(res, 0, 11) ? NULL : PQgetvalue(res, 0, 11);
+    const char *include_all_val = PQgetisnull(res, 0, 12) ? NULL : PQgetvalue(res, 0, 12);
+    const char *location_id_val = PQgetisnull(res, 0, 13) ? NULL : PQgetvalue(res, 0, 13);
+    const char *artifact_size_val = PQgetisnull(res, 0, 14) ? NULL : PQgetvalue(res, 0, 14);
+    const char *artifact_filename_val = PQgetisnull(res, 0, 15) ? NULL : PQgetvalue(res, 0, 15);
+    const char *artifact_version_val = PQgetisnull(res, 0, 16) ? NULL : PQgetvalue(res, 0, 16);
+    const char *selection_count_val = PQgetisnull(res, 0, 17) ? NULL : PQgetvalue(res, 0, 17);
     long long artifact_size_num = 0;
     if (artifact_size_val) {
         artifact_size_num = atoll(artifact_size_val);
@@ -605,6 +685,34 @@ char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *p
 
     if (!buffer_append_cstr(&buf, ",\"deficiency_only\":")) goto fail;
     if (!buffer_append_cstr(&buf, deficiency_only_val && (strcmp(deficiency_only_val, "t") == 0 || strcmp(deficiency_only_val, "true") == 0 || strcmp(deficiency_only_val, "1") == 0) ? "true" : "false")) goto fail;
+
+    if (!buffer_append_cstr(&buf, ",\"job_type\":")) goto fail;
+    if (job_type_val && job_type_val[0] != '\0') {
+        if (!buffer_append_json_string(&buf, job_type_val)) goto fail;
+    } else {
+        if (!buffer_append_json_string(&buf, "audit")) goto fail;
+    }
+
+    if (!buffer_append_cstr(&buf, ",\"range_start\":")) goto fail;
+    if (range_start_val && range_start_val[0] != '\0') {
+        if (!buffer_append_json_string(&buf, range_start_val)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+
+    if (!buffer_append_cstr(&buf, ",\"range_end\":")) goto fail;
+    if (range_end_val && range_end_val[0] != '\0') {
+        if (!buffer_append_json_string(&buf, range_end_val)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+
+    if (!buffer_append_cstr(&buf, ",\"range_preset\":")) goto fail;
+    if (range_preset_val && range_preset_val[0] != '\0') {
+        if (!buffer_append_json_string(&buf, range_preset_val)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
 
     if (!buffer_append_cstr(&buf, ",\"include_all\":")) goto fail;
     if (!buffer_append_cstr(&buf, include_all_val && (strcmp(include_all_val, "f") == 0 || strcmp(include_all_val, "false") == 0 || strcmp(include_all_val, "0") == 0) ? "false" : "true")) goto fail;
@@ -673,9 +781,7 @@ fail:
 }
 
 int db_find_existing_report_job(PGconn *conn,
-                                const char *address,
-                                bool deficiency_only,
-                                bool include_all,
+                                const ReportJob *job,
                                 char **job_id_out,
                                 char **status_out,
                                 bool *artifact_ready_out,
@@ -683,24 +789,62 @@ int db_find_existing_report_job(PGconn *conn,
     if (job_id_out) *job_id_out = NULL;
     if (status_out) *status_out = NULL;
     if (artifact_ready_out) *artifact_ready_out = false;
-    if (!conn || !address) {
+    if (!conn || !job) {
         if (error_out && !*error_out) {
-            *error_out = strdup("Address required");
+            *error_out = strdup("Report job context required");
         }
         return -1;
     }
-    if (!include_all) {
+    if (!job->include_all) {
         return 0;
     }
+    if (!job->has_location_id && (!job->address || job->address[0] == '\0')) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Address or location id required");
+        }
+        return -1;
+    }
 
-    const char *params[2] = { address, deficiency_only ? "true" : "false" };
-    const char *active_sql =
-        "SELECT job_id::text, status "
-        "FROM report_jobs "
-        "WHERE address = $1 AND deficiency_only = $2 AND include_all = true AND status IN ('queued','processing') "
-        "ORDER BY created_at DESC "
-        "LIMIT 1";
-    PGresult *res = PQexecParams(conn, active_sql, 2, NULL, params, NULL, NULL, 0);
+    char location_buf[32];
+    const char *location_param = NULL;
+    if (job->has_location_id) {
+        snprintf(location_buf, sizeof(location_buf), "%d", job->location_id);
+        location_param = location_buf;
+    }
+
+    const char *job_type_param = report_job_type_to_string(job->type);
+    const char *def_param = job->deficiency_only ? "true" : "false";
+    const char *address_param = job->address ? job->address : "";
+    const char *range_start_param = job->range_start;
+    const char *range_end_param = job->range_end;
+    const char *range_preset_param = job->range_preset;
+
+    const char *params[7] = {
+        job_type_param,
+        def_param,
+        location_param,
+        address_param,
+        range_start_param,
+        range_end_param,
+        range_preset_param
+    };
+
+    const char *base_where =
+        " job_type = $1 "
+        " AND deficiency_only = $2 "
+        " AND include_all = true "
+        " AND (( $3::int IS NOT NULL AND location_id = $3::int ) "
+        "      OR ($3::int IS NULL AND address = $4)) "
+        " AND COALESCE(range_start::text, '') = COALESCE($5::date::text, '') "
+        " AND COALESCE(range_end::text, '') = COALESCE($6::date::text, '') "
+        " AND COALESCE(range_preset, '') = COALESCE($7, '') ";
+
+    char active_sql[512];
+    snprintf(active_sql, sizeof(active_sql),
+             "SELECT job_id::text, status FROM report_jobs WHERE%s AND status IN ('queued','processing') ORDER BY created_at DESC LIMIT 1",
+             base_where);
+
+    PGresult *res = PQexecParams(conn, active_sql, 7, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(res);
@@ -721,13 +865,11 @@ int db_find_existing_report_job(PGconn *conn,
     }
     PQclear(res);
 
-    const char *completed_sql =
-        "SELECT job_id::text, status, artifact_size "
-        "FROM report_jobs "
-        "WHERE address = $1 AND deficiency_only = $2 AND include_all = true AND status = 'completed' AND artifact_size IS NOT NULL "
-        "ORDER BY completed_at DESC NULLS LAST "
-        "LIMIT 1";
-    res = PQexecParams(conn, completed_sql, 2, NULL, params, NULL, NULL, 0);
+    char completed_sql[512];
+    snprintf(completed_sql, sizeof(completed_sql),
+             "SELECT job_id::text, status, artifact_size FROM report_jobs WHERE%s AND status = 'completed' AND artifact_size IS NOT NULL ORDER BY completed_at DESC NULLS LAST LIMIT 1",
+             base_where);
+    res = PQexecParams(conn, completed_sql, 7, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(res);

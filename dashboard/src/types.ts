@@ -344,6 +344,10 @@ export interface ReportVersion {
   download_url: string | null;
   include_all?: boolean;
   selected_count?: number;
+  job_type?: ReportJobType | string;
+  range_start?: string | null;
+  range_end?: string | null;
+  range_preset?: string | null;
 }
 
 export interface LocationDetail {
@@ -530,6 +534,8 @@ export interface MetricsSummary {
   total_spend: number;
 }
 
+export type ReportJobType = 'audit' | 'overview';
+
 export interface ReportJobCreateRequest {
   address: string;
   locationRowId?: number | null;
@@ -545,6 +551,10 @@ export interface ReportJobCreateRequest {
   deficiencyOnly?: boolean;
   visitIds?: string[];
   auditIds?: string[];
+  reportType?: ReportJobType;
+  rangePreset?: string;
+  rangeStart?: string;
+  rangeEnd?: string;
 }
 
 export interface ReportJobCreateResponse {
@@ -570,4 +580,8 @@ export interface ReportJobStatus {
   version?: number | null;
   download_url?: string | null;
   selected_audit_count?: number;
+  job_type?: ReportJobType | string;
+  range_start?: string | null;
+  range_end?: string | null;
+  range_preset?: string | null;
 }

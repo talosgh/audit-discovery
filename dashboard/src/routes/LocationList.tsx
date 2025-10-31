@@ -67,6 +67,28 @@ const LocationList: Component<LocationListProps> = (props) => {
     return start + visible - 1;
   });
 
+  const paginationRange = createMemo(() => {
+    const current = page();
+    const totalPageCount = totalPages();
+    const range: Array<number | 'ellipsis'> = [];
+    if (totalPageCount <= 7) {
+      for (let i = 1; i <= totalPageCount; i += 1) range.push(i);
+      return range;
+    }
+    const showLeftEllipsis = current > 4;
+    const showRightEllipsis = current < totalPageCount - 3;
+    range.push(1);
+    if (showLeftEllipsis) range.push('ellipsis');
+    const start = Math.max(2, Math.min(current - 1, totalPageCount - 3));
+    const end = Math.min(totalPageCount - 1, start + 2);
+    for (let i = start; i <= end; i += 1) {
+      range.push(i);
+    }
+    if (showRightEllipsis) range.push('ellipsis');
+    range.push(totalPageCount);
+    return range;
+  });
+
   const formatCurrency = (value: number | string | null | undefined) => {
     if (value == null) return '—';
     const numeric = typeof value === 'number' ? value : Number(value);
@@ -352,7 +374,7 @@ const LocationList: Component<LocationListProps> = (props) => {
               </div>
             </Show>
 
-            <div class="pagination-controls">
+            <nav class="pagination-nav" aria-label="Pagination">
               <div class="page-info">
                 <Show when={startIndex() > 0} fallback={<span>No matching locations</span>}>
                   <span>
@@ -360,15 +382,64 @@ const LocationList: Component<LocationListProps> = (props) => {
                   </span>
                 </Show>
               </div>
-              <div class="page-buttons">
-                <button type="button" class="action-button" disabled={page() <= 1 || isLoading()} onClick={handlePrev}>
-                  Previous
+              <div class="page-links">
+                <button
+                  type="button"
+                  class="pagination-button"
+                  disabled={page() === 1 || isLoading()}
+                  onClick={() => setPage(1)}
+                  aria-label="First page"
+                >
+                  «
                 </button>
-                <button type="button" class="action-button" disabled={page() >= totalPages() || isLoading()} onClick={handleNext}>
-                  Next
+                <button
+                  type="button"
+                  class="pagination-button"
+                  disabled={page() === 1 || isLoading()}
+                  onClick={handlePrev}
+                  aria-label="Previous page"
+                >
+                  ‹
+                </button>
+                <For each={paginationRange()}>
+                  {(entry) =>
+                    typeof entry === 'number' ? (
+                      <button
+                        type="button"
+                        class={entry === page() ? 'pagination-button pagination-button--active' : 'pagination-button'}
+                        aria-current={entry === page() ? 'page' : undefined}
+                        disabled={entry === page() || isLoading()}
+                        onClick={() => setPage(entry)}
+                      >
+                        {entry}
+                      </button>
+                    ) : (
+                      <span class="pagination-ellipsis" aria-hidden="true">
+                        …
+                      </span>
+                    )
+                  }
+                </For>
+                <button
+                  type="button"
+                  class="pagination-button"
+                  disabled={page() === totalPages() || isLoading()}
+                  onClick={handleNext}
+                  aria-label="Next page"
+                >
+                  ›
+                </button>
+                <button
+                  type="button"
+                  class="pagination-button"
+                  disabled={page() === totalPages() || isLoading()}
+                  onClick={() => setPage(totalPages())}
+                  aria-label="Last page"
+                >
+                  »
                 </button>
               </div>
-            </div>
+            </nav>
           </>
         );
       })()}

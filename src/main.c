@@ -554,6 +554,273 @@ static OptionalInt parse_optional_int(const char *text);
 static OptionalDouble parse_optional_double(const char *text);
 static OptionalBool parse_optional_bool(const char *text);
 static int assign_string(char **dest, const char *value);
+
+static int g_fiscal_year_start_month = 1;
+static int g_fiscal_year_start_day = 1;
+
+static bool normalize_tm(struct tm *tm_value) {
+    if (!tm_value) {
+        return false;
+    }
+    tm_value->tm_isdst = -1;
+    time_t ts = mktime(tm_value);
+    if (ts == (time_t)-1) {
+        return false;
+    }
+    if (!localtime_r(&ts, tm_value)) {
+        return false;
+    }
+    return true;
+}
+
+static char *format_tm_date(const struct tm *tm_value) {
+    if (!tm_value) {
+        return NULL;
+    }
+    struct tm copy = *tm_value;
+    if (!normalize_tm(&copy)) {
+        return NULL;
+    }
+    char buffer[16];
+    if (strftime(buffer, sizeof(buffer), "%Y-%m-%d", &copy) != 10) {
+        return NULL;
+    }
+    char *result = strdup(buffer);
+    return result;
+}
+
+static bool is_valid_iso_date(const char *text) {
+    if (!text) {
+        return false;
+    }
+    if (strlen(text) != 10) {
+        return false;
+    }
+    for (int i = 0; i < 10; ++i) {
+        char c = text[i];
+        if (i == 4 || i == 7) {
+            if (c != '-') {
+                return false;
+            }
+        } else if (!isdigit((unsigned char)c)) {
+            return false;
+        }
+    }
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    if (sscanf(text, "%4d-%2d-%2d", &year, &month, &day) != 3) {
+        return false;
+    }
+    if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31) {
+        return false;
+    }
+    struct tm check = {
+        .tm_year = year - 1900,
+        .tm_mon = month - 1,
+        .tm_mday = day,
+        .tm_hour = 12,
+        .tm_min = 0,
+        .tm_sec = 0,
+        .tm_isdst = -1
+    };
+    if (!normalize_tm(&check)) {
+        return false;
+    }
+    if (check.tm_year != year - 1900 || check.tm_mon != month - 1 || check.tm_mday != day) {
+        return false;
+    }
+    return true;
+}
+
+static bool compute_preset_range(const char *preset, char **start_out, char **end_out, char **error_out) {
+    if (!start_out || !end_out) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Range output pointers required");
+        }
+        return false;
+    }
+    if (start_out) *start_out = NULL;
+    if (end_out) *end_out = NULL;
+    if (!preset || preset[0] == '\0') {
+        return false;
+    }
+
+    time_t now = time(NULL);
+    struct tm now_tm;
+    if (localtime_r(&now, &now_tm) == NULL) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to resolve current time");
+        }
+        return false;
+    }
+    now_tm.tm_hour = 12;
+    now_tm.tm_min = 0;
+    now_tm.tm_sec = 0;
+    normalize_tm(&now_tm);
+
+    struct tm start_tm = now_tm;
+    struct tm end_tm = now_tm;
+
+    if (strcasecmp(preset, "last_month") == 0) {
+        start_tm.tm_mday = 1;
+        start_tm.tm_mon -= 1;
+        if (!normalize_tm(&start_tm)) goto preset_fail;
+        end_tm = start_tm;
+        end_tm.tm_mon += 1;
+        end_tm.tm_mday = 0;
+        if (!normalize_tm(&end_tm)) goto preset_fail;
+    } else if (strcasecmp(preset, "last_quarter") == 0 || strcasecmp(preset, "previous_quarter") == 0) {
+        int quarter = now_tm.tm_mon / 3;
+        int prev_quarter = quarter - 1;
+        int year = now_tm.tm_year;
+        if (prev_quarter < 0) {
+            prev_quarter = 3;
+            year -= 1;
+        }
+        start_tm.tm_year = year;
+        start_tm.tm_mon = prev_quarter * 3;
+        start_tm.tm_mday = 1;
+        if (!normalize_tm(&start_tm)) goto preset_fail;
+        end_tm = start_tm;
+        end_tm.tm_mon += 3;
+        end_tm.tm_mday = 0;
+        if (!normalize_tm(&end_tm)) goto preset_fail;
+    } else if (strcasecmp(preset, "ytd") == 0 || strcasecmp(preset, "year_to_date") == 0) {
+        start_tm.tm_mon = 0;
+        start_tm.tm_mday = 1;
+        if (!normalize_tm(&start_tm)) goto preset_fail;
+        end_tm = now_tm;
+    } else if (strcasecmp(preset, "rolling_12_months") == 0) {
+        start_tm.tm_mday = 1;
+        start_tm.tm_mon = now_tm.tm_mon - 11;
+        if (!normalize_tm(&start_tm)) goto preset_fail;
+        end_tm = now_tm;
+    } else if (strcasecmp(preset, "last_fiscal") == 0 || strcasecmp(preset, "previous_fiscal") == 0) {
+        struct tm fiscal_start = now_tm;
+        fiscal_start.tm_mon = g_fiscal_year_start_month - 1;
+        fiscal_start.tm_mday = g_fiscal_year_start_day;
+        if (!normalize_tm(&fiscal_start)) goto preset_fail;
+        time_t fiscal_start_ts = mktime(&fiscal_start);
+        if (difftime(now, fiscal_start_ts) < 0) {
+            fiscal_start.tm_year -= 1;
+            if (!normalize_tm(&fiscal_start)) goto preset_fail;
+        }
+        struct tm prev_fiscal_start = fiscal_start;
+        prev_fiscal_start.tm_year -= 1;
+        if (!normalize_tm(&prev_fiscal_start)) goto preset_fail;
+        struct tm prev_fiscal_end = fiscal_start;
+        prev_fiscal_end.tm_mday -= 1;
+        if (!normalize_tm(&prev_fiscal_end)) goto preset_fail;
+        start_tm = prev_fiscal_start;
+        end_tm = prev_fiscal_end;
+    } else {
+        if (error_out && !*error_out) {
+            char message[128];
+            snprintf(message, sizeof(message), "Unknown range preset '%s'", preset);
+            *error_out = strdup(message);
+        }
+        return false;
+    }
+
+    char *start_str = format_tm_date(&start_tm);
+    char *end_str = format_tm_date(&end_tm);
+    if (!start_str || !end_str) {
+        free(start_str);
+        free(end_str);
+        goto preset_fail;
+    }
+    *start_out = start_str;
+    *end_out = end_str;
+    return true;
+
+preset_fail:
+    if (error_out && !*error_out) {
+        *error_out = strdup("Failed to compute preset range");
+    }
+    return false;
+}
+
+static char *format_pretty_date(const char *iso_date) {
+    if (!iso_date || !is_valid_iso_date(iso_date)) {
+        return NULL;
+    }
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    if (sscanf(iso_date, "%4d-%2d-%2d", &year, &month, &day) != 3) {
+        return NULL;
+    }
+    struct tm tm_date = {
+        .tm_year = year - 1900,
+        .tm_mon = month - 1,
+        .tm_mday = day,
+        .tm_hour = 12,
+        .tm_min = 0,
+        .tm_sec = 0,
+        .tm_isdst = -1
+    };
+    if (!normalize_tm(&tm_date)) {
+        return NULL;
+    }
+    char buffer[64];
+    if (strftime(buffer, sizeof(buffer), "%B %d, %Y", &tm_date) == 0) {
+        return NULL;
+    }
+    char *result = strdup(buffer);
+    return result;
+}
+
+static char *format_range_label(const char *start, const char *end) {
+    char *start_pretty = format_pretty_date(start);
+    char *end_pretty = format_pretty_date(end);
+    if (!start_pretty && !end_pretty) {
+        free(start_pretty);
+        free(end_pretty);
+        return NULL;
+    }
+    if (!start_pretty) {
+        start_pretty = strdup("(unknown)");
+    }
+    if (!end_pretty) {
+        end_pretty = strdup("(unknown)");
+    }
+    size_t len = strlen(start_pretty) + strlen(end_pretty) + 5;
+    char *range = malloc(len);
+    if (!range) {
+        free(start_pretty);
+        free(end_pretty);
+        return NULL;
+    }
+    snprintf(range, len, "%s -- %s", start_pretty, end_pretty);
+    free(start_pretty);
+    free(end_pretty);
+    return range;
+}
+
+static int buffer_append_currency(Buffer *buf, double amount) {
+    if (!buf) {
+        return 0;
+    }
+    if (!isfinite(amount)) {
+        amount = 0.0;
+    }
+    return buffer_appendf(buf, "\\$%.2f", amount);
+}
+
+static int buffer_append_percent(Buffer *buf, double ratio, int precision) {
+    if (!buf) {
+        return 0;
+    }
+    if (!isfinite(ratio)) {
+        return buffer_append_cstr(buf, "N/A");
+    }
+    if (precision < 0) precision = 1;
+    if (precision > 3) precision = 3;
+    char fmt[16];
+    snprintf(fmt, sizeof(fmt), "%%.%df\\%%", precision);
+    return buffer_appendf(buf, fmt, ratio * 100.0);
+}
 static void report_data_init(ReportData *data);
 static void report_data_clear(ReportData *data);
 static void report_device_init(ReportDevice *device);
@@ -567,15 +834,16 @@ static void location_profile_init(LocationProfile *profile);
 static void location_profile_clear(LocationProfile *profile);
 static int resolve_location_profile(PGconn *conn, const LocationDetailRequest *request, LocationProfile *profile, char **lookup_address_out, char **error_out);
 static char *build_location_profile_json(const LocationProfile *profile);
-static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, ServiceAnalytics *analytics_out, char **error_out);
-static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, FinancialAnalytics *analytics_out, char **error_out);
+static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, const char *range_start, const char *range_end, ServiceAnalytics *analytics_out, char **error_out);
+static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, const char *range_start, const char *range_end, FinancialAnalytics *analytics_out, char **error_out);
 static char *build_visit_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, char **error_out);
 static char *build_report_version_list(PGconn *conn, const char *address, bool deficiency_only, char **error_out);
 static const char *determine_trend_direction(double latest, double previous, double tolerance_percent, double *percent_change_out);
 static double forecast_next_value(double latest, double previous);
 static bool string_is_integer(const char *text);
-static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out);
+static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, const char *range_start, const char *range_end, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out);
 static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats, bool timeline_has_service, bool timeline_has_financial);
+static int build_location_overview_tex(const ReportJob *job, const LocationProfile *profile, const ReportData *report, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const TimelineStats *timeline_stats, const char *service_json, const char *financial_json, const char *timeline_json, bool timeline_has_service, bool timeline_has_financial, const char *output_path, char **error_out);
 static TimelineEntry *timeline_find_entry(TimelineEntry *entries, size_t count, const char *month);
 static int timeline_ensure_entry(TimelineEntry **entries, size_t *count, size_t *capacity, const char *month, TimelineEntry **out_entry);
 static void timeline_free_entries(TimelineEntry *entries, size_t count);
@@ -682,10 +950,10 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     char *profile_json = build_location_profile_json(&profile);
     ServiceAnalytics service_stats;
     memset(&service_stats, 0, sizeof(service_stats));
-    char *service_json = build_service_summary_json(conn, &profile, lookup_address, &service_stats, error_out);
+    char *service_json = build_service_summary_json(conn, &profile, lookup_address, NULL, NULL, &service_stats, error_out);
     FinancialAnalytics financial_stats;
     memset(&financial_stats, 0, sizeof(financial_stats));
-    char *financial_json = build_financial_summary_json(conn, &profile, &financial_stats, error_out);
+    char *financial_json = build_financial_summary_json(conn, &profile, NULL, NULL, &financial_stats, error_out);
     if (!financial_json) {
         const char *log_code = (profile.location_code && profile.location_code[0]) ? profile.location_code : "(unknown)";
         char id_buf[32];
@@ -725,7 +993,7 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
     bool timeline_service = false;
     bool timeline_financial = false;
     if (service_json || financial_json) {
-        timeline_json = build_service_financial_timeline_json(conn, &profile, lookup_address, &timeline_stats, &timeline_service, &timeline_financial, error_out);
+        timeline_json = build_service_financial_timeline_json(conn, &profile, lookup_address, NULL, NULL, &timeline_stats, &timeline_service, &timeline_financial, error_out);
         if (!timeline_json && error_out && *error_out) {
             free(summary_json);
             free(profile_json);
@@ -989,7 +1257,7 @@ static char *build_report_json_payload(PGconn *conn, const LocationDetailRequest
 }
 
 static char *build_download_url(const char *job_id);
-static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url, bool deficiency_only);
+static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const ReportJob *job, const char *download_url);
 static int generate_uuid_v4(char out[37]);
 static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char **pdf_bytes_out, size_t *pdf_size_out, char **error_out);
 static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownloadArtifact *artifact, char **error_out);
@@ -2433,7 +2701,11 @@ static char *build_report_version_list(PGconn *conn, const char *address, bool d
           "       r.artifact_size, "
           "       r.artifact_version, "
           "       r.include_all, "
-          "       COALESCE((SELECT COUNT(*) FROM report_job_audits WHERE job_id = r.job_id), 0) AS selected_count "
+          "       COALESCE((SELECT COUNT(*) FROM report_job_audits WHERE job_id = r.job_id), 0) AS selected_count, "
+          "       r.job_type, "
+          "       to_char(r.range_start, 'YYYY-MM-DD'), "
+          "       to_char(r.range_end, 'YYYY-MM-DD'), "
+          "       r.range_preset "
           "FROM report_jobs r "
           "WHERE r.address = $1 AND r.deficiency_only = true AND r.status = 'completed' AND r.artifact_size IS NOT NULL "
           "ORDER BY r.completed_at DESC NULLS LAST, r.created_at DESC"
@@ -2444,7 +2716,11 @@ static char *build_report_version_list(PGconn *conn, const char *address, bool d
           "       r.artifact_size, "
           "       r.artifact_version, "
           "       r.include_all, "
-          "       COALESCE((SELECT COUNT(*) FROM report_job_audits WHERE job_id = r.job_id), 0) AS selected_count "
+          "       COALESCE((SELECT COUNT(*) FROM report_job_audits WHERE job_id = r.job_id), 0) AS selected_count, "
+          "       r.job_type, "
+          "       to_char(r.range_start, 'YYYY-MM-DD'), "
+          "       to_char(r.range_end, 'YYYY-MM-DD'), "
+          "       r.range_preset "
           "FROM report_jobs r "
           "WHERE r.address = $1 AND r.deficiency_only = false AND r.status = 'completed' AND r.artifact_size IS NOT NULL "
           "ORDER BY r.completed_at DESC NULLS LAST, r.created_at DESC";
@@ -2483,6 +2759,10 @@ static char *build_report_version_list(PGconn *conn, const char *address, bool d
         const char *version_val = PQgetisnull(res, row, 5) ? NULL : PQgetvalue(res, row, 5);
         const char *include_all_val = PQgetisnull(res, row, 6) ? NULL : PQgetvalue(res, row, 6);
         const char *selected_count_val = PQgetisnull(res, row, 7) ? NULL : PQgetvalue(res, row, 7);
+        const char *job_type_val = PQgetisnull(res, row, 8) ? NULL : PQgetvalue(res, row, 8);
+        const char *range_start_val = PQgetisnull(res, row, 9) ? NULL : PQgetvalue(res, row, 9);
+        const char *range_end_val = PQgetisnull(res, row, 10) ? NULL : PQgetvalue(res, row, 10);
+        const char *range_preset_val = PQgetisnull(res, row, 11) ? NULL : PQgetvalue(res, row, 11);
         char *download_url = job_id_val ? build_download_url(job_id_val) : NULL;
 
         ok = ok && buffer_append_cstr(&buf, "{\"job_id\":");
@@ -2531,6 +2811,34 @@ static char *build_report_version_list(PGconn *conn, const char *address, bool d
             ok = ok && buffer_append_cstr(&buf, selected_count_val);
         } else {
             ok = ok && buffer_append_cstr(&buf, "0");
+        }
+
+        ok = ok && buffer_append_cstr(&buf, ",\"job_type\":");
+        if (job_type_val && job_type_val[0] != '\0') {
+            ok = ok && buffer_append_json_string(&buf, job_type_val);
+        } else {
+            ok = ok && buffer_append_json_string(&buf, "audit");
+        }
+
+        ok = ok && buffer_append_cstr(&buf, ",\"range_start\":");
+        if (range_start_val && range_start_val[0] != '\0') {
+            ok = ok && buffer_append_json_string(&buf, range_start_val);
+        } else {
+            ok = ok && buffer_append_cstr(&buf, "null");
+        }
+
+        ok = ok && buffer_append_cstr(&buf, ",\"range_end\":");
+        if (range_end_val && range_end_val[0] != '\0') {
+            ok = ok && buffer_append_json_string(&buf, range_end_val);
+        } else {
+            ok = ok && buffer_append_cstr(&buf, "null");
+        }
+
+        ok = ok && buffer_append_cstr(&buf, ",\"range_preset\":");
+        if (range_preset_val && range_preset_val[0] != '\0') {
+            ok = ok && buffer_append_json_string(&buf, range_preset_val);
+        } else {
+            ok = ok && buffer_append_cstr(&buf, "null");
         }
 
         ok = ok && buffer_append_cstr(&buf, ",\"download_url\":");
@@ -2599,7 +2907,9 @@ static char *build_download_url(const char *job_id) {
     "    AND sd_normalized_city ILIKE ('%' || $3 || '%') " \
     "    AND sd_normalized_state ILIKE ('%' || $4 || '%')" \
     "  )" \
-    ")"
+    ")" \
+    " AND ($6::date IS NULL OR sd_work_date >= $6::date) " \
+    " AND ($7::date IS NULL OR sd_work_date <= $7::date)"
 
 static int append_service_summary_section(Buffer *buf, PGconn *conn, const ReportJob *job, const LocationProfile *profile, char **error_out) {
     if (!buf || !conn || !job) {
@@ -2640,13 +2950,16 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
         return 1;
     }
 
+    const char *range_start_value = (job && job->range_start && job->range_start[0]) ? job->range_start : NULL;
+    const char *range_end_value = (job && job->range_end && job->range_end[0]) ? job->range_end : NULL;
+
     char row_id_buf[32];
-    const char *params[5] = { location_code, street_trim, city_trim, state_trim, NULL };
+    const char *params[7] = { location_code, street_trim, city_trim, state_trim, NULL, range_start_value, range_end_value };
     if (profile && profile->row_id.has_value) {
         snprintf(row_id_buf, sizeof(row_id_buf), "%d", profile->row_id.value);
         params[4] = row_id_buf;
     }
-    const Oid param_types[5] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
+    const Oid param_types[7] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
     const char *sql_summary =
         "SELECT COUNT(*)::bigint AS total_tickets, "
         "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS total_hours, "
@@ -2686,7 +2999,7 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
         "ORDER BY COUNT(*) DESC "
         "LIMIT 5";
 
-    PGresult *summary_res = PQexecParams(conn, sql_summary, 5, param_types, params, NULL, NULL, 0);
+    PGresult *summary_res = PQexecParams(conn, sql_summary, 7, param_types, params, NULL, NULL, 0);
     if (!summary_res || PQresultStatus(summary_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = summary_res ? PQresultErrorMessage(summary_res) : PQerrorMessage(conn);
@@ -2699,7 +3012,7 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
         goto cleanup;
     }
 
-    PGresult *problem_res = PQexecParams(conn, sql_top_problems, 5, param_types, params, NULL, NULL, 0);
+    PGresult *problem_res = PQexecParams(conn, sql_top_problems, 7, param_types, params, NULL, NULL, 0);
     if (!problem_res || PQresultStatus(problem_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = problem_res ? PQresultErrorMessage(problem_res) : PQerrorMessage(conn);
@@ -2712,7 +3025,7 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
         goto cleanup_summary;
     }
 
-    PGresult *trend_res = PQexecParams(conn, sql_trend, 5, param_types, params, NULL, NULL, 0);
+    PGresult *trend_res = PQexecParams(conn, sql_trend, 7, param_types, params, NULL, NULL, 0);
     if (!trend_res || PQresultStatus(trend_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = trend_res ? PQresultErrorMessage(trend_res) : PQerrorMessage(conn);
@@ -2725,7 +3038,7 @@ static int append_service_summary_section(Buffer *buf, PGconn *conn, const Repor
         goto cleanup_problem;
     }
 
-    PGresult *vendor_res = PQexecParams(conn, sql_vendor, 5, param_types, params, NULL, NULL, 0);
+    PGresult *vendor_res = PQexecParams(conn, sql_vendor, 7, param_types, params, NULL, NULL, 0);
     if (!vendor_res || PQresultStatus(vendor_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = vendor_res ? PQresultErrorMessage(vendor_res) : PQerrorMessage(conn);
@@ -3297,7 +3610,7 @@ fin_cleanup:
     return 0;
 }
 
-static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const char *address_value, const char *download_url, bool deficiency_only) {
+static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const ReportJob *job, const char *download_url) {
     Buffer buf;
     if (!buffer_init(&buf)) {
         char *body = build_error_response("Out of memory");
@@ -3305,6 +3618,24 @@ static void send_report_job_response(int client_fd, int http_status, const char 
         free(body);
         return;
     }
+
+    const char *address_value = (job && job->address && job->address[0]) ? job->address : NULL;
+    bool deficiency_only = job && job->deficiency_only;
+    const char *job_type_value = "audit";
+    if (job) {
+        switch (job->type) {
+            case REPORT_JOB_TYPE_LOCATION_OVERVIEW:
+                job_type_value = "overview";
+                break;
+            case REPORT_JOB_TYPE_AUDIT:
+            default:
+                job_type_value = "audit";
+                break;
+        }
+    }
+    const char *range_start_value = (job && job->range_start && job->range_start[0]) ? job->range_start : NULL;
+    const char *range_end_value = (job && job->range_end && job->range_end[0]) ? job->range_end : NULL;
+    const char *range_preset_value = (job && job->range_preset && job->range_preset[0]) ? job->range_preset : NULL;
 
     if (!buffer_append_cstr(&buf, "{")) goto fail;
     if (!buffer_append_cstr(&buf, "\"status\":")) goto fail;
@@ -3325,6 +3656,26 @@ static void send_report_job_response(int client_fd, int http_status, const char 
     }
     if (!buffer_append_cstr(&buf, ",\"deficiency_only\":")) goto fail;
     if (!buffer_append_cstr(&buf, deficiency_only ? "true" : "false")) goto fail;
+    if (!buffer_append_cstr(&buf, ",\"job_type\":")) goto fail;
+    if (!buffer_append_json_string(&buf, job_type_value)) goto fail;
+    if (!buffer_append_cstr(&buf, ",\"range_start\":")) goto fail;
+    if (range_start_value) {
+        if (!buffer_append_json_string(&buf, range_start_value)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+    if (!buffer_append_cstr(&buf, ",\"range_end\":")) goto fail;
+    if (range_end_value) {
+        if (!buffer_append_json_string(&buf, range_end_value)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
+    if (!buffer_append_cstr(&buf, ",\"range_preset\":")) goto fail;
+    if (range_preset_value) {
+        if (!buffer_append_json_string(&buf, range_preset_value)) goto fail;
+    } else {
+        if (!buffer_append_cstr(&buf, "null")) goto fail;
+    }
     if (!buffer_append_cstr(&buf, "}")) goto fail;
 
     {
@@ -6296,7 +6647,7 @@ oom:
     return NULL;
 }
 
-static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, ServiceAnalytics *analytics_out, char **error_out) {
+static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, const char *range_start, const char *range_end, ServiceAnalytics *analytics_out, char **error_out) {
     if (!conn) {
         if (analytics_out) {
             memset(analytics_out, 0, sizeof(*analytics_out));
@@ -6316,12 +6667,12 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
     char *state_trim = (profile && profile->state) ? trim_copy(profile->state) : NULL;
 
     char row_id_buf_service[32];
-    const char *params[5] = { location_code, street_trim, city_trim, state_trim, NULL };
+    const char *params[7] = { location_code, street_trim, city_trim, state_trim, NULL, range_start, range_end };
     if (profile && profile->row_id.has_value) {
         snprintf(row_id_buf_service, sizeof(row_id_buf_service), "%d", profile->row_id.value);
         params[4] = row_id_buf_service;
     }
-    const Oid param_types[5] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
+    const Oid param_types[7] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
     const char *sql_summary =
         "SELECT COUNT(*)::bigint AS total_tickets, "
         "       COALESCE(SUM(COALESCE(sd_hours,0)),0)::numeric AS total_hours, "
@@ -6329,7 +6680,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         "FROM esa_in_progress "
         "WHERE " SERVICE_FILTER;
 
-    PGresult *res = PQexecParams(conn, sql_summary, 5, param_types, params, NULL, NULL, 0);
+    PGresult *res = PQexecParams(conn, sql_summary, 7, param_types, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(res);
@@ -6372,7 +6723,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         "GROUP BY sd_problem_desc "
         "ORDER BY COUNT(*) DESC "
         "LIMIT 5";
-    PGresult *problem_res = PQexecParams(conn, sql_top_problems, 5, param_types, params, NULL, NULL, 0);
+    PGresult *problem_res = PQexecParams(conn, sql_top_problems, 7, param_types, params, NULL, NULL, 0);
     if (PQresultStatus(problem_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(problem_res);
@@ -6434,7 +6785,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         "GROUP BY vendor "
         "ORDER BY COUNT(*) DESC "
         "LIMIT 5";
-    PGresult *vendor_res = PQexecParams(conn, sql_vendor_breakdown, 5, param_types, params, NULL, NULL, 0);
+    PGresult *vendor_res = PQexecParams(conn, sql_vendor_breakdown, 7, param_types, params, NULL, NULL, 0);
     if (PQresultStatus(vendor_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(vendor_res);
@@ -6458,7 +6809,7 @@ static char *build_service_summary_json(PGconn *conn, const LocationProfile *pro
         "WHERE " SERVICE_FILTER " "
         "GROUP BY activity_code "
         "ORDER BY tickets DESC";
-    PGresult *activity_res = PQexecParams(conn, sql_activity, 5, param_types, params, NULL, NULL, 0);
+    PGresult *activity_res = PQexecParams(conn, sql_activity, 7, param_types, params, NULL, NULL, 0);
     if (PQresultStatus(activity_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(activity_res);
@@ -6739,7 +7090,7 @@ oom:
     return NULL;
 }
 
-static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, FinancialAnalytics *analytics_out, char **error_out) {
+static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, const char *range_start, const char *range_end, FinancialAnalytics *analytics_out, char **error_out) {
     if (!conn) {
         if (analytics_out) {
             memset(analytics_out, 0, sizeof(*analytics_out));
@@ -6753,7 +7104,9 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
 
     char codebuf[32];
     char rowbuf[32];
-    const char *params[2] = { NULL, NULL };
+    const char *range_start_value = (range_start && range_start[0]) ? range_start : NULL;
+    const char *range_end_value = (range_end && range_end[0]) ? range_end : NULL;
+    const char *params[4] = { NULL, NULL, range_start_value, range_end_value };
 
     if (profile && profile->location_code && profile->location_code[0]) {
         const char *code_src = profile->location_code;
@@ -6798,8 +7151,10 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "       COALESCE(SUM(COALESCE(delta,0)),0)::numeric AS total_savings, "
         "       MAX(statement_creation_date) AS last_statement "
         "FROM financial_data "
-        "WHERE location_id = COALESCE($1::int, $2::int)";
-    PGresult *res = PQexecParams(conn, sql_summary, 2, NULL, params, NULL, NULL, 0);
+        "WHERE location_id = COALESCE($1::int, $2::int) "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date)";
+    PGresult *res = PQexecParams(conn, sql_summary, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(res);
@@ -6855,8 +7210,10 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "            OR analyst_review ILIKE '%%dispute%%' THEN 1 ELSE 0 END)::bigint AS challenged_count, "
         "  COALESCE(SUM(CASE WHEN COALESCE(delta,0) > 0 THEN COALESCE(delta,0) ELSE 0 END),0)::numeric AS negotiated_savings "
         "FROM financial_data "
-        "WHERE location_id = COALESCE($1::int, $2::int)";
-    PGresult *quality_res = PQexecParams(conn, sql_quality, 2, NULL, params, NULL, NULL, 0);
+        "WHERE location_id = COALESCE($1::int, $2::int) "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date)";
+    PGresult *quality_res = PQexecParams(conn, sql_quality, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(quality_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(quality_res);
@@ -6908,10 +7265,12 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "       COALESCE(SUM(CASE WHEN upper(btrim(COALESCE(classification,''))) = 'CAPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_capex "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date) "
         "GROUP BY bucket "
         "ORDER BY bucket DESC "
         "LIMIT 12";
-    PGresult *trend_res = PQexecParams(conn, sql_trend, 2, NULL, params, NULL, NULL, 0);
+    PGresult *trend_res = PQexecParams(conn, sql_trend, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(trend_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(trend_res);
@@ -6927,10 +7286,12 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date) "
         "GROUP BY 1 "
         "ORDER BY spend DESC "
         "LIMIT 6";
-    PGresult *category_res = PQexecParams(conn, sql_category, 2, NULL, params, NULL, NULL, 0);
+    PGresult *category_res = PQexecParams(conn, sql_category, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(category_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(category_res);
@@ -6947,9 +7308,11 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date) "
         "GROUP BY state "
         "ORDER BY spend DESC";
-    PGresult *status_res = PQexecParams(conn, sql_status, 2, NULL, params, NULL, NULL, 0);
+    PGresult *status_res = PQexecParams(conn, sql_status, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(status_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(status_res);
@@ -6967,10 +7330,12 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "       COALESCE(SUM(COALESCE(delta,0)),0)::numeric AS savings "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) AND statement_creation_date IS NOT NULL "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date) "
         "GROUP BY bucket "
         "ORDER BY bucket DESC "
         "LIMIT 12";
-    PGresult *savings_res = PQexecParams(conn, sql_savings, 2, NULL, params, NULL, NULL, 0);
+    PGresult *savings_res = PQexecParams(conn, sql_savings, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(savings_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(savings_res);
@@ -6989,10 +7354,12 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date) "
         "GROUP BY classification "
         "ORDER BY spend DESC "
         "LIMIT 6";
-    PGresult *classification_res = PQexecParams(conn, sql_classification, 2, NULL, params, NULL, NULL, 0);
+    PGresult *classification_res = PQexecParams(conn, sql_classification, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(classification_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(classification_res);
@@ -7012,10 +7379,12 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "       COALESCE(SUM(COALESCE(new_cost,0)),0)::numeric AS spend "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date) "
         "GROUP BY record_type "
         "ORDER BY spend DESC "
         "LIMIT 6";
-    PGresult *type_res = PQexecParams(conn, sql_type, 2, NULL, params, NULL, NULL, 0);
+    PGresult *type_res = PQexecParams(conn, sql_type, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(type_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(type_res);
@@ -7038,10 +7407,12 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "FROM financial_data fd "
         "LEFT JOIN vendors v ON (v.vendor_id ~ '^[0-9]+$' AND v.vendor_id::int = fd.vendor_id) "
         "WHERE fd.location_id = COALESCE($1::int, $2::int) "
+        "  AND ($3::date IS NULL OR fd.statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR fd.statement_creation_date <= $4::date) "
         "GROUP BY fd.vendor_id, vendor_name "
         "ORDER BY spend DESC "
         "LIMIT 6";
-    PGresult *vendor_res = PQexecParams(conn, sql_vendor, 2, NULL, params, NULL, NULL, 0);
+    PGresult *vendor_res = PQexecParams(conn, sql_vendor, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(vendor_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(vendor_res);
@@ -7064,10 +7435,12 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
         "       COUNT(*)::bigint AS records "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date) "
         "GROUP BY summary "
         "ORDER BY spend DESC "
         "LIMIT 6";
-    PGresult *work_res = PQexecParams(conn, sql_work, 2, NULL, params, NULL, NULL, 0);
+    PGresult *work_res = PQexecParams(conn, sql_work, 4, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(work_res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
             const char *msg = PQresultErrorMessage(work_res);
@@ -7520,7 +7893,7 @@ static int parse_year_month(const char *text, int *year_out, int *month_out) {
     return 1;
 }
 
-static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out) {
+static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, const char *range_start, const char *range_end, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out) {
     (void)lookup_address;
     if (service_available) *service_available = false;
     if (financial_available) *financial_available = false;
@@ -7545,12 +7918,14 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
     char *state_trim = profile->state ? trim_copy(profile->state) : NULL;
 
     char service_row_buf[32];
-    const char *service_params[5] = { location_code, street_trim, city_trim, state_trim, NULL };
+    const char *service_range_start = (range_start && range_start[0]) ? range_start : NULL;
+    const char *service_range_end = (range_end && range_end[0]) ? range_end : NULL;
+    const char *service_params[7] = { location_code, street_trim, city_trim, state_trim, NULL, service_range_start, service_range_end };
     if (profile->row_id.has_value) {
         snprintf(service_row_buf, sizeof(service_row_buf), "%d", profile->row_id.value);
         service_params[4] = service_row_buf;
     }
-    const Oid service_types[5] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
+    const Oid service_types[7] = { TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID, TEXTOID };
     const char *service_sql =
         "SELECT to_char(sd_work_date, 'YYYY-MM') AS bucket, "
         "       sd_cw_at "
@@ -7558,11 +7933,11 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
         "WHERE sd_work_date IS NOT NULL AND " SERVICE_FILTER " "
         "ORDER BY bucket";
 
-    PGresult *service_res = PQexecParams(conn, service_sql, 5, service_types, service_params, NULL, NULL, 0);
+    PGresult *service_res = PQexecParams(conn, service_sql, 7, service_types, service_params, NULL, NULL, 0);
 
     char location_id_buf[32];
     char row_id_buf[32];
-    const char *finance_params[2] = { NULL, NULL };
+    const char *finance_params[4] = { NULL, NULL, service_range_start, service_range_end };
     if (profile->location_code && profile->location_code[0] && string_is_integer(profile->location_code)) {
         snprintf(location_id_buf, sizeof(location_id_buf), "%s", profile->location_code);
         finance_params[0] = location_id_buf;
@@ -7583,11 +7958,13 @@ static char *build_service_financial_timeline_json(PGconn *conn, const LocationP
         "       COALESCE(SUM(CASE WHEN upper(COALESCE(classification,'')) = 'CAPEX' THEN COALESCE(new_cost,0) ELSE 0 END),0)::numeric AS spend_capex "
         "FROM financial_data "
         "WHERE location_id = COALESCE($1::int, $2::int) "
+        "  AND ($3::date IS NULL OR statement_creation_date >= $3::date) "
+        "  AND ($4::date IS NULL OR statement_creation_date <= $4::date) "
         "  AND statement_creation_date IS NOT NULL "
         "GROUP BY bucket "
         "ORDER BY bucket";
     if (finance_params[0] || finance_params[1]) {
-        finance_res = PQexecParams(conn, finance_sql, 2, NULL, finance_params, NULL, NULL, 0);
+        finance_res = PQexecParams(conn, finance_sql, 4, NULL, finance_params, NULL, NULL, 0);
     }
 
     TimelineEntry *entries = NULL;
@@ -10829,7 +11206,10 @@ static int create_report_archive(PGconn *conn, const ReportJob *job, const Repor
         return 0;
     }
 
-    const char *pdf_filename = (job && job->deficiency_only) ? "deficiency_list.pdf" : "audit_report.pdf";
+    bool archive_deficiency = job && job->deficiency_only;
+    bool archive_overview = job && job->type == REPORT_JOB_TYPE_LOCATION_OVERVIEW;
+    const char *pdf_filename = archive_deficiency ? "deficiency_list.pdf" : (archive_overview ? "location_overview.pdf" : "audit_report.pdf");
+    const char *zip_filename = archive_deficiency ? "deficiency_list_package.zip" : (archive_overview ? "location_overview_package.zip" : "audit_report_package.zip");
     char *pdf_copy_path = join_path(package_dir, pdf_filename);
     if (!pdf_copy_path || copy_file_contents(pdf_path, pdf_copy_path) != 0) {
         if (error_out && !*error_out) {
@@ -10858,7 +11238,6 @@ static int create_report_archive(PGconn *conn, const ReportJob *job, const Repor
     }
     free(pdf_copy_path);
 
-    const char *zip_filename = (job && job->deficiency_only) ? "deficiency_list_package.zip" : "audit_report_package.zip";
     char *zip_path = join_path(job_dir, zip_filename);
     if (!zip_path) {
         if (error_out && !*error_out) {
@@ -10939,7 +11318,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
 
     const char *params[1] = { job_id };
     const char *sql =
-        "SELECT address, status, artifact_filename, artifact_mime, artifact_bytes, artifact_size, artifact_version, deficiency_only, include_all, location_id "
+        "SELECT address, status, artifact_filename, artifact_mime, artifact_bytes, artifact_size, artifact_version, deficiency_only, include_all, location_id, job_type "
         "FROM report_jobs "
         "WHERE job_id = $1::uuid";
 
@@ -10966,6 +11345,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
     const char *deficiency_only_val = PQgetisnull(res, 0, 7) ? NULL : PQgetvalue(res, 0, 7);
     const char *include_all_val = PQgetisnull(res, 0, 8) ? NULL : PQgetvalue(res, 0, 8);
     const char *location_id_val = PQgetisnull(res, 0, 9) ? NULL : PQgetvalue(res, 0, 9);
+    const char *job_type_val = PQgetisnull(res, 0, 10) ? NULL : PQgetvalue(res, 0, 10);
 
     if (!status_val || strcmp(status_val, "completed") != 0) {
         if (error_out && !*error_out) {
@@ -10975,6 +11355,14 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
     }
     bool deficiency_only = deficiency_only_val && (strcmp(deficiency_only_val, "t") == 0 || strcmp(deficiency_only_val, "true") == 0 || strcmp(deficiency_only_val, "1") == 0);
     bool include_all = !(include_all_val && (strcmp(include_all_val, "f") == 0 || strcmp(include_all_val, "false") == 0 || strcmp(include_all_val, "0") == 0));
+    bool overview_job = false;
+    if (job_type_val && job_type_val[0]) {
+        if (strcasecmp(job_type_val, "overview") == 0 || strcasecmp(job_type_val, "location_overview") == 0) {
+            overview_job = true;
+        }
+    }
+    const char *pdf_filename = deficiency_only ? "deficiency_list.pdf" : (overview_job ? "location_overview.pdf" : "audit_report.pdf");
+    bool deliver_pdf_only = deficiency_only || overview_job;
 
     OptionalInt job_location_id;
     optional_int_clear(&job_location_id);
@@ -11013,7 +11401,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
         goto cleanup;
     }
 
-    pdf_temp_path = join_path(job_dir, deficiency_only ? "deficiency_list.pdf" : "audit_report.pdf");
+    pdf_temp_path = join_path(job_dir, pdf_filename);
     if (!pdf_temp_path) {
         if (error_out && !*error_out) {
             *error_out = strdup("Out of memory preparing download");
@@ -11045,20 +11433,17 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
 
     int version_number = artifact_version_val ? atoi(artifact_version_val) : 0;
 
-    if (deficiency_only) {
-        const char *filename_src = artifact_filename_val && artifact_filename_val[0]
-                                     ? artifact_filename_val
-                                     : (version_number > 0
-                                           ? "deficiency-list.pdf"
-                                           : "deficiency-list.pdf");
+    if (deliver_pdf_only) {
+        const char *default_basename = deficiency_only ? "deficiency-list" : "overview-report";
         char generated_name[192];
         if (artifact_filename_val && artifact_filename_val[0]) {
             snprintf(generated_name, sizeof(generated_name), "%s", artifact_filename_val);
         } else if (version_number > 0) {
-            snprintf(generated_name, sizeof(generated_name), "deficiency-list-%s-v%d.pdf", job_id, version_number);
+            snprintf(generated_name, sizeof(generated_name), "%s-%s-v%d.pdf", default_basename, job_id, version_number);
         } else {
-            snprintf(generated_name, sizeof(generated_name), "deficiency-list-%s.pdf", job_id);
+            snprintf(generated_name, sizeof(generated_name), "%s-%s.pdf", default_basename, job_id);
         }
+        const char *chosen_name = (artifact_filename_val && artifact_filename_val[0]) ? artifact_filename_val : generated_name;
 
         artifact->path = pdf_temp_path;
         pdf_temp_path = NULL;
@@ -11071,7 +11456,7 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
             }
             goto cleanup;
         }
-        artifact->filename = strdup((artifact_filename_val && artifact_filename_val[0]) ? filename_src : generated_name);
+        artifact->filename = strdup(chosen_name);
         if (!artifact->filename) {
             if (error_out && !*error_out) {
                 *error_out = strdup("Out of memory allocating download name");
@@ -11237,6 +11622,11 @@ static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char 
     }
 
     int success = 0;
+    const bool is_deficiency = job->deficiency_only;
+    const bool is_overview = job->type == REPORT_JOB_TYPE_LOCATION_OVERVIEW;
+    const char *tex_filename = is_deficiency ? "deficiency_list.tex" : (is_overview ? "location_overview.tex" : "audit_report.tex");
+    const char *pdf_filename = is_deficiency ? "deficiency_list.pdf" : (is_overview ? "location_overview.pdf" : "audit_report.pdf");
+
     ReportData report;
     report_data_init(&report);
     LocationProfile profile;
@@ -11346,8 +11736,8 @@ static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char 
         }
     }
 
-    tex_path = join_path(job_dir, "audit_report.tex");
-    pdf_path = join_path(job_dir, "audit_report.pdf");
+    tex_path = join_path(job_dir, tex_filename);
+    pdf_path = join_path(job_dir, pdf_filename);
     if (!tex_path || !pdf_path) {
         if (error_out && !*error_out) {
             *error_out = strdup("Out of memory");
@@ -11355,7 +11745,7 @@ static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char 
         goto cleanup;
     }
 
-    if (!job->deficiency_only) {
+    if (!is_deficiency && !is_overview) {
         report_json = report_data_to_json(&report);
         if (!report_json) {
             if (error_out && !*error_out) {
@@ -11581,18 +11971,88 @@ narrative_join:
 
     char *latex_error = NULL;
     const LocationProfile *profile_ptr = profile_available ? &profile : NULL;
-    if (!build_report_latex(conn, &report, &narratives, job, profile_ptr, tex_path, &latex_error)) {
-        if (error_out && !*error_out) {
-            *error_out = latex_error ? latex_error : strdup("Failed to build LaTeX");
-        } else {
-            free(latex_error);
+
+    if (is_overview) {
+        ServiceAnalytics overview_service_stats;
+        FinancialAnalytics overview_financial_stats;
+        TimelineStats overview_timeline_stats;
+        memset(&overview_service_stats, 0, sizeof(overview_service_stats));
+        memset(&overview_financial_stats, 0, sizeof(overview_financial_stats));
+        memset(&overview_timeline_stats, 0, sizeof(overview_timeline_stats));
+        bool timeline_service_available = false;
+        bool timeline_financial_available = false;
+        char *analytics_error = NULL;
+
+        char *service_json = build_service_summary_json(conn, profile_ptr, job->address, job->range_start, job->range_end, &overview_service_stats, &analytics_error);
+        if (!service_json) {
+            if (error_out && !*error_out) {
+                *error_out = analytics_error ? analytics_error : strdup("Failed to load service analytics");
+            } else {
+                free(analytics_error);
+            }
+            goto cleanup;
         }
-        goto cleanup;
+        free(analytics_error);
+        analytics_error = NULL;
+
+        char *financial_json = build_financial_summary_json(conn, profile_ptr, job->range_start, job->range_end, &overview_financial_stats, &analytics_error);
+        if (!financial_json) {
+            if (error_out && !*error_out) {
+                *error_out = analytics_error ? analytics_error : strdup("Failed to load financial analytics");
+            } else {
+                free(analytics_error);
+            }
+            free(service_json);
+            goto cleanup;
+        }
+        free(analytics_error);
+        analytics_error = NULL;
+
+        char *timeline_json = build_service_financial_timeline_json(conn, profile_ptr, job->address, job->range_start, job->range_end, &overview_timeline_stats, &timeline_service_available, &timeline_financial_available, &analytics_error);
+        if (!timeline_json) {
+            if (error_out && !*error_out) {
+                *error_out = analytics_error ? analytics_error : strdup("Failed to compute timeline analytics");
+            } else {
+                free(analytics_error);
+            }
+            free(service_json);
+            free(financial_json);
+            goto cleanup;
+        }
+        free(analytics_error);
+        analytics_error = NULL;
+
+        if (!build_location_overview_tex(job, profile_ptr, &report, &overview_service_stats, &overview_financial_stats, &overview_timeline_stats, service_json, financial_json, timeline_json, timeline_service_available, timeline_financial_available, tex_path, &latex_error)) {
+            if (error_out && !*error_out) {
+                *error_out = latex_error ? latex_error : strdup("Failed to build overview LaTeX");
+            } else {
+                free(latex_error);
+            }
+            free(service_json);
+            free(financial_json);
+            free(timeline_json);
+            goto cleanup;
+        }
+        free(latex_error);
+        latex_error = NULL;
+        free(service_json);
+        free(financial_json);
+        free(timeline_json);
+    } else {
+        if (!build_report_latex(conn, &report, &narratives, job, profile_ptr, tex_path, &latex_error)) {
+            if (error_out && !*error_out) {
+                *error_out = latex_error ? latex_error : strdup("Failed to build LaTeX");
+            } else {
+                free(latex_error);
+            }
+            goto cleanup;
+        }
+        free(latex_error);
+        latex_error = NULL;
     }
-    free(latex_error);
 
     char *compile_error = NULL;
-    if (!run_pdflatex(job_dir, "audit_report.tex", &compile_error)) {
+    if (!run_pdflatex(job_dir, tex_filename, &compile_error)) {
         if (error_out && !*error_out) {
             *error_out = compile_error ? compile_error : strdup("Failed compiling PDF");
         } else {
@@ -11732,7 +12192,7 @@ static void *report_worker_main(void *arg) {
         int success = process_report_job(conn, &job, &pdf_data, &pdf_size, &process_error);
         char *update_error = NULL;
         if (success) {
-            const char *artifact_name = job.deficiency_only ? "deficiency-list.pdf" : "audit_report.pdf";
+            const char *artifact_name = job.deficiency_only ? "deficiency-list.pdf" : (job.type == REPORT_JOB_TYPE_LOCATION_OVERVIEW ? "location_overview.pdf" : "audit_report.pdf");
             if (!db_complete_report_job(conn,
                                         job.job_id,
                                         "completed",
@@ -12667,6 +13127,583 @@ static int append_narrative_section(Buffer *buf, const char *title, const char *
     return append_narrative_block(buf, content);
 }
 
+static int build_location_overview_tex(const ReportJob *job,
+                                       const LocationProfile *profile,
+                                       const ReportData *report,
+                                       const ServiceAnalytics *service_stats,
+                                       const FinancialAnalytics *financial_stats,
+                                       const TimelineStats *timeline_stats,
+                                       const char *service_json,
+                                       const char *financial_json,
+                                       const char *timeline_json,
+                                       bool timeline_has_service,
+                                       bool timeline_has_financial,
+                                       const char *output_path,
+                                       char **error_out) {
+    if (!job || !report || !service_stats || !financial_stats || !output_path) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid overview report parameters");
+        }
+        return 0;
+    }
+
+    Buffer buf;
+    if (!buffer_init(&buf)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Out of memory");
+        }
+        return 0;
+    }
+
+    int success = 0;
+
+    char *site_tex = NULL;
+    char *address_tex = NULL;
+    char *range_label = NULL;
+    char *range_tex = NULL;
+    char *generated_tex = NULL;
+
+    const char *site_src = NULL;
+    if (profile && profile->site_name && profile->site_name[0]) {
+        site_src = profile->site_name;
+    } else if (profile && profile->address_label && profile->address_label[0]) {
+        site_src = profile->address_label;
+    } else if (job->cover_building_owner && job->cover_building_owner[0]) {
+        site_src = job->cover_building_owner;
+    } else if (job->address && job->address[0]) {
+        site_src = job->address;
+    } else if (report->summary.building_owner && report->summary.building_owner[0]) {
+        site_src = report->summary.building_owner;
+    } else {
+        site_src = "Unknown Site";
+    }
+    char *site_clean = sanitize_ascii(site_src);
+    site_tex = latex_escape(site_clean ? site_clean : site_src);
+    free(site_clean);
+    if (!site_tex) goto cleanup;
+
+    Buffer addr_buf;
+    if (!buffer_init(&addr_buf)) goto cleanup;
+    bool addr_written = false;
+    if (profile && profile->street && profile->street[0]) {
+        addr_written = buffer_append_cstr(&addr_buf, profile->street);
+    }
+    if (profile && profile->city && profile->city[0]) {
+        if (addr_written) addr_written = buffer_append_cstr(&addr_buf, ", ");
+        addr_written = addr_written && buffer_append_cstr(&addr_buf, profile->city);
+    }
+    if (profile && profile->state && profile->state[0]) {
+        if (addr_written) addr_written = buffer_append_cstr(&addr_buf, ", ");
+        addr_written = addr_written && buffer_append_cstr(&addr_buf, profile->state);
+    }
+    if (profile && profile->zip && profile->zip[0]) {
+        if (addr_written) addr_written = buffer_append_cstr(&addr_buf, " ");
+        addr_written = addr_written && buffer_append_cstr(&addr_buf, profile->zip);
+    }
+    if (!addr_written) {
+        buffer_free(&addr_buf);
+        if (!buffer_init(&addr_buf)) goto cleanup;
+        if (job->address && job->address[0]) {
+            addr_written = buffer_append_cstr(&addr_buf, job->address);
+        } else {
+            addr_written = buffer_append_cstr(&addr_buf, "Unknown address");
+        }
+    }
+    if (!addr_written) {
+        buffer_free(&addr_buf);
+        goto cleanup;
+    }
+    char *address_line = addr_buf.data;
+    addr_buf.data = NULL;
+    buffer_free(&addr_buf);
+    char *address_clean = sanitize_ascii(address_line ? address_line : "");
+    address_tex = latex_escape(address_clean ? address_clean : (address_line ? address_line : ""));
+    free(address_clean);
+    free(address_line);
+    if (!address_tex) goto cleanup;
+
+    const char *range_start = NULL;
+    const char *range_end = NULL;
+    if (job->range_start && job->range_start[0]) {
+        range_start = job->range_start;
+    } else if (report->summary.audit_range.start) {
+        range_start = report->summary.audit_range.start;
+    }
+    if (job->range_end && job->range_end[0]) {
+        range_end = job->range_end;
+    } else if (report->summary.audit_range.end) {
+        range_end = report->summary.audit_range.end;
+    }
+    if (range_start || range_end) {
+        range_label = format_range_label(range_start, range_end);
+    }
+    if (!range_label) {
+        range_label = strdup("Full inspection history");
+    }
+    if (!range_label) goto cleanup;
+    char *range_clean = sanitize_ascii(range_label);
+    range_tex = latex_escape(range_clean ? range_clean : range_label);
+    free(range_clean);
+    if (!range_tex) goto cleanup;
+
+    time_t now = time(NULL);
+    struct tm now_tm;
+    if (!localtime_r(&now, &now_tm)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to resolve current time");
+        }
+        goto cleanup;
+    }
+    char generated_buf[64];
+    if (strftime(generated_buf, sizeof(generated_buf), "%B %d, %Y", &now_tm) == 0) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to format timestamp");
+        }
+        goto cleanup;
+    }
+    generated_tex = latex_escape(generated_buf);
+    if (!generated_tex) goto cleanup;
+
+    int open_deficiencies = 0;
+    int closed_deficiencies = 0;
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        const ReportDevice *device = &report->devices.items[i];
+        for (size_t j = 0; j < device->deficiencies.count; ++j) {
+            const ReportDeficiency *def = &device->deficiencies.items[j];
+            bool resolved = def->resolved.has_value && def->resolved.value;
+            if (resolved) {
+                closed_deficiencies++;
+            } else {
+                open_deficiencies++;
+            }
+        }
+    }
+
+    int device_count = report->summary.total_devices;
+    int audit_count = report->summary.audit_count;
+    int total_deficiencies = report->summary.total_deficiencies;
+    double avg_def_per_device = report->summary.average_deficiencies_per_device;
+
+    long total_service_tickets = service_stats->total_tickets;
+    double total_service_hours = service_stats->total_hours;
+    double tickets_per_device = (device_count > 0) ? ((double)total_service_tickets / (double)device_count) : 0.0;
+
+    double total_spend = financial_stats->total_spend;
+    double approved_spend = financial_stats->approved_spend;
+    double open_spend = financial_stats->open_spend;
+    double proposed_spend = financial_stats->proposed_spend;
+    double total_savings = financial_stats->total_savings;
+    double savings_rate = financial_stats->savings_rate;
+
+    if (!buffer_append_cstr(&buf,
+        "\\documentclass[12pt]{article}\n"
+        "\\usepackage{geometry}\n"
+        "\\usepackage{booktabs}\n"
+        "\\usepackage{array}\n"
+        "\\usepackage{longtable}\n"
+        "\\usepackage{xcolor}\n"
+        "\\usepackage{graphicx}\n"
+        "\\usepackage{hyperref}\n"
+        "\\geometry{margin=1in}\n"
+        "\\hypersetup{colorlinks=false}\n"
+        "\\begin{document}\n\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\begin{titlepage}\n\\centering\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\vspace*{1cm}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\includegraphics[width=0.45\\textwidth]{citywide.png}\\\\[1.5cm]\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "{\\Huge \\textbf{Location Audit Overview}}\\\\[1.2cm]\n")) goto cleanup;
+    if (!buffer_appendf(&buf, "{\\Large %s}\\\\[0.6cm]\n", site_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "%s\\\\[0.4cm]\n", address_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "{\\large Reporting Window: %s}\\\\[0.4cm]\n", range_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "{\\large Generated: %s}\\\\[1.0cm]\n", generated_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\vfill\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\end{titlepage}\n\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\setlength{\\parskip}{6pt}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\setlength{\\parindent}{0pt}\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\section*{At-a-Glance}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\renewcommand{\\arraystretch}{1.2}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}p{0.35\\textwidth}}\n\\toprule\n")) goto cleanup;
+    if (!buffer_appendf(&buf, "Location & %s\\\\\n", site_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "Address & %s\\\\\n", address_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "Reporting window & %s\\\\\n", range_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "Devices audited & %d\\\\\n", device_count)) goto cleanup;
+    if (!buffer_appendf(&buf, "Audits on record & %d\\\\\n", audit_count)) goto cleanup;
+    if (!buffer_appendf(&buf, "Total deficiencies & %d\\\\\n", total_deficiencies)) goto cleanup;
+    if (!buffer_appendf(&buf, "Average deficiencies per device & %.2f\\\\\n", avg_def_per_device)) goto cleanup;
+    if (!buffer_appendf(&buf, "Open deficiencies & %d\\\\\n", open_deficiencies)) goto cleanup;
+    if (!buffer_appendf(&buf, "Closed deficiencies & %d\\\\\n", closed_deficiencies)) goto cleanup;
+    if (!buffer_appendf(&buf, "Service tickets (window) & %ld\\\\\n", total_service_tickets)) goto cleanup;
+    if (!buffer_appendf(&buf, "Service hours (window) & %.2f\\\\\n", total_service_hours)) goto cleanup;
+    if (!buffer_appendf(&buf, "Tickets per device & %.2f\\\\\n", tickets_per_device)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\n\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\section*{Service Performance}\n")) goto cleanup;
+    if (!buffer_appendf(&buf,
+            "The reporting window captured %ld service tickets totalling %.2f hours of technician engagement. ",
+            total_service_tickets,
+            total_service_hours)) goto cleanup;
+    if (!buffer_appendf(&buf,
+            "Across %d devices this averages to %.2f tickets per unit.\\\\par\n",
+            device_count > 0 ? device_count : (int)report->devices.count,
+            tickets_per_device)) goto cleanup;
+
+    long total_activity_tickets = service_stats->total_activity_tickets;
+    if (total_activity_tickets == 0) {
+        if (!buffer_append_cstr(&buf, "\\textit{No service activity records were available for this range.}\\\\par\n")) goto cleanup;
+    } else {
+        if (!buffer_append_cstr(&buf, "\\subsection*{Activity Mix}\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\begin{tabular}{lrrr}\n\\toprule\nCategory & Tickets & Hours & Share\\\\\n\\midrule\n")) goto cleanup;
+        for (int cat = 0; cat <= SERVICE_ACTIVITY_UNKNOWN; ++cat) {
+            long tickets = service_stats->category_tickets[cat];
+            double hours = service_stats->category_hours[cat];
+            if (tickets == 0 && hours == 0.0) {
+                continue;
+            }
+            double share = (double)tickets / (double)total_activity_tickets;
+            const char *label = service_activity_category_name((ServiceActivityCategory)cat);
+            if (!buffer_appendf(&buf, "%s & %ld & %.2f & ", label, tickets, hours)) goto cleanup;
+            if (!buffer_append_percent(&buf, share, 1)) goto cleanup;
+            if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+        }
+    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
+
+        if (service_json) {
+            char *service_parse_error = NULL;
+            JsonValue *service_root = json_parse(service_json, &service_parse_error);
+            if (service_root && service_root->type == JSON_OBJECT) {
+                JsonValue *top_problems = json_object_get(service_root, "top_problems");
+                if (top_problems && top_problems->type == JSON_ARRAY && json_array_size(top_problems) > 0) {
+                    size_t count = json_array_size(top_problems);
+                    size_t limit = count > 8 ? 8 : count;
+                    if (!buffer_append_cstr(&buf, "\\subsubsection*{Top Reported Issues}\n")) {
+                        json_free(service_root);
+                        free(service_parse_error);
+                        goto cleanup;
+                    }
+                    if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}r}\n\\toprule\nIssue & Tickets\\\\\n\\midrule\n")) {
+                        json_free(service_root);
+                        free(service_parse_error);
+                        goto cleanup;
+                    }
+                    for (size_t i = 0; i < limit; ++i) {
+                        JsonValue *item = json_array_get(top_problems, i);
+                        if (!item || item->type != JSON_OBJECT) {
+                            continue;
+                        }
+                        const char *problem = json_as_string(json_object_get(item, "problem"));
+                        long tickets = 0;
+                        json_as_long(json_object_get(item, "count"), &tickets);
+                        char *problem_clean = sanitize_ascii(problem ? problem : "Unspecified");
+                        char *problem_tex = latex_escape(problem_clean ? problem_clean : (problem ? problem : "Unspecified"));
+                        free(problem_clean);
+                        if (!problem_tex) {
+                            json_free(service_root);
+                            free(service_parse_error);
+                            goto cleanup;
+                        }
+                        if (!buffer_appendf(&buf, "%s & %ld\\\\\n", problem_tex, tickets)) {
+                            free(problem_tex);
+                            json_free(service_root);
+                            free(service_parse_error);
+                            goto cleanup;
+                        }
+                        free(problem_tex);
+                    }
+                    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) {
+                        json_free(service_root);
+                        free(service_parse_error);
+                        goto cleanup;
+                    }
+                }
+            }
+            json_free(service_root);
+            free(service_parse_error);
+        }
+    }
+
+    if (!buffer_append_cstr(&buf, "\\section*{Financial Overview}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}p{0.35\\textwidth}}\n\\toprule\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "Total proposed spend & ")) goto cleanup;
+    if (!buffer_append_currency(&buf, proposed_spend)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "Approved spend & ")) goto cleanup;
+    if (!buffer_append_currency(&buf, approved_spend)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "Open spend & ")) goto cleanup;
+    if (!buffer_append_currency(&buf, open_spend)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "Total spend & ")) goto cleanup;
+    if (!buffer_append_currency(&buf, total_spend)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "Negotiated savings & ")) goto cleanup;
+    if (!buffer_append_currency(&buf, total_savings)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "Savings rate & ")) goto cleanup;
+    if (!buffer_append_percent(&buf, savings_rate, 1)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
+
+    if (financial_json) {
+        char *financial_parse_error = NULL;
+        JsonValue *financial_root = json_parse(financial_json, &financial_parse_error);
+        if (financial_root && financial_root->type == JSON_OBJECT) {
+            JsonValue *category_breakdown = json_object_get(financial_root, "category_breakdown");
+            if (category_breakdown && category_breakdown->type == JSON_ARRAY && json_array_size(category_breakdown) > 0) {
+                size_t count = json_array_size(category_breakdown);
+                size_t limit = count > 10 ? 10 : count;
+                if (!buffer_append_cstr(&buf, "\\subsubsection*{Spend by Category}\n")) {
+                    json_free(financial_root);
+                    free(financial_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}r}\n\\toprule\nCategory & Spend\\\\\n\\midrule\n")) {
+                    json_free(financial_root);
+                    free(financial_parse_error);
+                    goto cleanup;
+                }
+                for (size_t i = 0; i < limit; ++i) {
+                    JsonValue *item = json_array_get(category_breakdown, i);
+                    if (!item || item->type != JSON_OBJECT) {
+                        continue;
+                    }
+                    const char *category_name = json_as_string(json_object_get(item, "category"));
+                    double spend_value = json_as_double_default(json_object_get(item, "spend"), 0.0);
+                    char *category_clean = sanitize_ascii(category_name ? category_name : "Uncategorized");
+                    char *category_tex = latex_escape(category_clean ? category_clean : (category_name ? category_name : "Uncategorized"));
+                    free(category_clean);
+                    if (!category_tex) {
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                    if (!buffer_appendf(&buf, "%s & ", category_tex)) {
+                        free(category_tex);
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                    free(category_tex);
+                    if (!buffer_append_currency(&buf, spend_value)) {
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                    if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                }
+                if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) {
+                    json_free(financial_root);
+                    free(financial_parse_error);
+                    goto cleanup;
+                }
+            }
+
+            JsonValue *status_breakdown = json_object_get(financial_root, "status_breakdown");
+            if (status_breakdown && status_breakdown->type == JSON_ARRAY && json_array_size(status_breakdown) > 0) {
+                size_t count = json_array_size(status_breakdown);
+                size_t limit = count > 10 ? 10 : count;
+                if (!buffer_append_cstr(&buf, "\\subsubsection*{Status Distribution}\n")) {
+                    json_free(financial_root);
+                    free(financial_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}r}\n\\toprule\nStatus & Spend\\\\\n\\midrule\n")) {
+                    json_free(financial_root);
+                    free(financial_parse_error);
+                    goto cleanup;
+                }
+                for (size_t i = 0; i < limit; ++i) {
+                    JsonValue *item = json_array_get(status_breakdown, i);
+                    if (!item || item->type != JSON_OBJECT) {
+                        continue;
+                    }
+                    const char *status_name = json_as_string(json_object_get(item, "state"));
+                    double spend_value = json_as_double_default(json_object_get(item, "spend"), 0.0);
+                    char *status_clean = sanitize_ascii(status_name ? status_name : "Unspecified");
+                    char *status_tex = latex_escape(status_clean ? status_clean : (status_name ? status_name : "Unspecified"));
+                    free(status_clean);
+                    if (!status_tex) {
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                    if (!buffer_appendf(&buf, "%s & ", status_tex)) {
+                        free(status_tex);
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                    free(status_tex);
+                    if (!buffer_append_currency(&buf, spend_value)) {
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                    if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                }
+                if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) {
+                    json_free(financial_root);
+                    free(financial_parse_error);
+                    goto cleanup;
+                }
+            }
+        }
+        json_free(financial_root);
+        free(financial_parse_error);
+    }
+
+    if (!buffer_append_cstr(&buf, "\\section*{Deficiency Snapshot}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\begin{tabular}{lrr}\n\\toprule\nDevice & Open & Closed\\\\\n\\midrule\n")) goto cleanup;
+    for (size_t i = 0; i < report->devices.count; ++i) {
+        const ReportDevice *device = &report->devices.items[i];
+        const char *id_src = device->device_id ? device->device_id : (device->submission_id ? device->submission_id : device->audit_uuid);
+        char *id_clean = sanitize_ascii(id_src ? id_src : "Device");
+        const char *id_text = id_clean ? id_clean : (id_src ? id_src : "Device");
+        char *id_tex = latex_escape(id_text);
+        free(id_clean);
+        if (!id_tex) goto cleanup;
+        int device_open = 0;
+        int device_closed = 0;
+        for (size_t j = 0; j < device->deficiencies.count; ++j) {
+            const ReportDeficiency *def = &device->deficiencies.items[j];
+            bool resolved = def->resolved.has_value && def->resolved.value;
+            if (resolved) device_closed++; else device_open++;
+        }
+        if (!buffer_appendf(&buf, "%s & %d & %d\\\\\n", id_tex, device_open, device_closed)) {
+            free(id_tex);
+            goto cleanup;
+        }
+        free(id_tex);
+    }
+    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
+
+    if (!buffer_append_cstr(&buf, "\\section*{Timeline Summary}\n")) goto cleanup;
+    if (timeline_json && (timeline_has_service || timeline_has_financial)) {
+        char *timeline_parse_error = NULL;
+        JsonValue *timeline_root = json_parse(timeline_json, &timeline_parse_error);
+        if (timeline_root && timeline_root->type == JSON_ARRAY && json_array_size(timeline_root) > 0) {
+            size_t timeline_rows = json_array_size(timeline_root);
+            size_t max_rows = timeline_rows > 18 ? 18 : timeline_rows;
+            if (!buffer_append_cstr(&buf, "\\begin{longtable}{lrrrrrrrr}\n\\toprule\n")) {
+                json_free(timeline_root);
+                free(timeline_parse_error);
+                goto cleanup;
+            }
+            if (!buffer_append_cstr(&buf, "Month & PM & CB-Emg & CB-Env & CB-Other & TST & RP & Misc & Spend\\\\\n\\midrule\n")) {
+                json_free(timeline_root);
+                free(timeline_parse_error);
+                goto cleanup;
+            }
+            for (size_t i = 0; i < max_rows; ++i) {
+                JsonValue *entry = json_array_get(timeline_root, i);
+                if (!entry || entry->type != JSON_OBJECT) {
+                    continue;
+                }
+                const char *month = json_as_string(json_object_get(entry, "month"));
+                long pm = 0;
+                json_as_long(json_object_get(entry, "pm"), &pm);
+                long cb_emg = 0;
+                json_as_long(json_object_get(entry, "cb_emergency"), &cb_emg);
+                long cb_env = 0;
+                json_as_long(json_object_get(entry, "cb_env"), &cb_env);
+                long cb_other = 0;
+                json_as_long(json_object_get(entry, "cb_other"), &cb_other);
+                long tst = 0;
+                json_as_long(json_object_get(entry, "tst"), &tst);
+                long rp = 0;
+                json_as_long(json_object_get(entry, "rp"), &rp);
+                long misc = 0;
+                json_as_long(json_object_get(entry, "misc"), &misc);
+                double spend_total = json_as_double_default(json_object_get(entry, "spend"), 0.0);
+                char *month_clean = sanitize_ascii(month ? month : "");
+                char *month_tex = latex_escape(month_clean ? month_clean : (month ? month : ""));
+                free(month_clean);
+                if (!month_tex) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_appendf(&buf, "%s & %ld & %ld & %ld & %ld & %ld & %ld & %ld & ", month_tex, pm, cb_emg, cb_env, cb_other, tst, rp, misc)) {
+                    free(month_tex);
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                free(month_tex);
+                if (!buffer_append_currency(&buf, spend_total)) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+            }
+            if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{longtable}\\\\par\n")) {
+                json_free(timeline_root);
+                free(timeline_parse_error);
+                goto cleanup;
+            }
+        } else {
+            if (!buffer_append_cstr(&buf, "Detailed month-by-month charts are available in the digital dashboard for this location.\\\\par\n")) {
+                json_free(timeline_root);
+                free(timeline_parse_error);
+                goto cleanup;
+            }
+        }
+        json_free(timeline_root);
+        free(timeline_parse_error);
+        if (timeline_stats && timeline_stats->months_covered > 0) {
+            if (!buffer_appendf(&buf, "Observed window spans %d months of history. ", timeline_stats->months_covered)) goto cleanup;
+            if (timeline_stats->correlation_valid) {
+                if (!buffer_appendf(&buf, "Service callback-to-spend correlation: %.2f.\\\\par\n", timeline_stats->correlation)) goto cleanup;
+            } else {
+                if (!buffer_append_cstr(&buf, "\\\\par\n")) goto cleanup;
+            }
+        }
+    } else {
+        if (!buffer_append_cstr(&buf, "No timeline records were available for this range.\\\\par\n")) goto cleanup;
+    }
+
+    if (!buffer_append_cstr(&buf, "\\end{document}\n")) goto cleanup;
+
+    if (write_buffer_to_file(output_path, buf.data, buf.length) != 0) {
+        if (error_out && !*error_out) {
+            char *msg = malloc(128);
+            if (msg) {
+                snprintf(msg, 128, "Failed to write %s: %s", output_path, strerror(errno));
+                *error_out = msg;
+            }
+        }
+        goto cleanup;
+    }
+
+    success = 1;
+
+cleanup:
+    free(site_tex);
+    free(address_tex);
+    free(range_label);
+    free(range_tex);
+    free(generated_tex);
+    buffer_free(&buf);
+    if (!success && error_out && !*error_out) {
+        *error_out = strdup("Failed to build overview report");
+    }
+    return success;
+}
+
 static int build_report_latex(PGconn *conn,
                               const ReportData *report,
                               const NarrativeSet *narratives,
@@ -13393,6 +14430,112 @@ static void handle_client(int client_fd, void *ctx) {
                 char *cover_contact_email_value = NULL;
                 bool deficiency_only = json_as_bool_default(json_object_get(root, "deficiency_only"), false);
 
+                ReportJobType job_type = REPORT_JOB_TYPE_AUDIT;
+                char *type_value = NULL;
+                const char *type_raw = json_as_string(json_object_get(root, "report_type"));
+                if (type_raw) {
+                    type_value = trim_copy(type_raw);
+                    if (type_value && type_value[0] != '\0') {
+                        if (strcasecmp(type_value, "overview") == 0 || strcasecmp(type_value, "location_overview") == 0) {
+                            job_type = REPORT_JOB_TYPE_LOCATION_OVERVIEW;
+                        } else if (strcasecmp(type_value, "audit") == 0 || strcasecmp(type_value, "full") == 0) {
+                            job_type = REPORT_JOB_TYPE_AUDIT;
+                        } else {
+                            json_free(root);
+                            free(parse_error);
+                            free(body_json);
+                            free(address_value);
+                            free(notes_value);
+                            free(recs_value);
+                            char *body = build_error_response("Unsupported report_type value");
+                            send_http_json(client_fd, 400, "Bad Request", body);
+                            free(body);
+                            free(type_value);
+                            return;
+                        }
+                    }
+                }
+
+                char *range_start_value = NULL;
+                char *range_end_value = NULL;
+                char *range_preset_value = NULL;
+
+                const char *range_start_raw = json_as_string(json_object_get(root, "range_start"));
+                if (range_start_raw) {
+                    char *trimmed = trim_copy(range_start_raw);
+                    if (trimmed && trimmed[0] != '\0') {
+                        if (!is_valid_iso_date(trimmed)) {
+                            json_free(root);
+                            free(parse_error);
+                            free(body_json);
+                            free(address_value);
+                            free(notes_value);
+                            free(recs_value);
+                            free(type_value);
+                            char *body = build_error_response("range_start must be YYYY-MM-DD");
+                            send_http_json(client_fd, 400, "Bad Request", body);
+                            free(body);
+                            free(trimmed);
+                            return;
+                        }
+                        range_start_value = trimmed;
+                    } else {
+                        free(trimmed);
+                    }
+                }
+
+                const char *range_end_raw = json_as_string(json_object_get(root, "range_end"));
+                if (range_end_raw) {
+                    char *trimmed = trim_copy(range_end_raw);
+                    if (trimmed && trimmed[0] != '\0') {
+                        if (!is_valid_iso_date(trimmed)) {
+                            json_free(root);
+                            free(parse_error);
+                            free(body_json);
+                            free(address_value);
+                            free(notes_value);
+                            free(recs_value);
+                            free(type_value);
+                            free(range_start_value);
+                            char *body = build_error_response("range_end must be YYYY-MM-DD");
+                            send_http_json(client_fd, 400, "Bad Request", body);
+                            free(body);
+                            free(trimmed);
+                            return;
+                        }
+                        range_end_value = trimmed;
+                    } else {
+                        free(trimmed);
+                    }
+                }
+
+                const char *range_preset_raw = json_as_string(json_object_get(root, "range_preset"));
+                if (range_preset_raw) {
+                    char *trimmed = trim_copy(range_preset_raw);
+                    if (trimmed && trimmed[0] != '\0') {
+                        range_preset_value = trimmed;
+                    } else {
+                        free(trimmed);
+                    }
+                }
+
+                if (job_type == REPORT_JOB_TYPE_LOCATION_OVERVIEW && deficiency_only) {
+                    json_free(root);
+                    free(parse_error);
+                    free(body_json);
+                    free(address_value);
+                    free(notes_value);
+                    free(recs_value);
+                    free(type_value);
+                    free(range_start_value);
+                    free(range_end_value);
+                    free(range_preset_value);
+                    char *body = build_error_response("Overview reports cannot be deficiency-only");
+                    send_http_json(client_fd, 400, "Bad Request", body);
+                    free(body);
+                    return;
+                }
+
                 const struct {
                     const char *key;
                     char **target;
@@ -13523,8 +14666,149 @@ static void handle_client(int client_fd, void *ctx) {
                     free(cover_zip_value);
                     free(cover_contact_name_value);
                     free(cover_contact_email_value);
+                    free(type_value);
+                    free(range_start_value);
+                    free(range_end_value);
+                    free(range_preset_value);
                     return;
                 }
+
+                char *preset_error = NULL;
+                if (job_type == REPORT_JOB_TYPE_LOCATION_OVERVIEW) {
+                    if (range_preset_value && range_preset_value[0]) {
+                        char *computed_start = NULL;
+                        char *computed_end = NULL;
+                        if (!compute_preset_range(range_preset_value, &computed_start, &computed_end, &preset_error)) {
+                            json_free(root);
+                            free(parse_error);
+                            free(body_json);
+                            string_array_clear(&visit_ids_list);
+                            string_array_clear(&manual_audit_ids);
+                            char *body = build_error_response(preset_error ? preset_error : "Invalid range preset");
+                            free(preset_error);
+                            send_http_json(client_fd, 400, "Bad Request", body);
+                            free(body);
+                            free(address_value);
+                            free(notes_value);
+                            free(recs_value);
+                            free(cover_owner_value);
+                            free(cover_street_value);
+                            free(cover_city_value);
+                            free(cover_state_value);
+                            free(cover_zip_value);
+                            free(cover_contact_name_value);
+                            free(cover_contact_email_value);
+                            free(type_value);
+                            free(range_start_value);
+                            free(range_end_value);
+                            free(range_preset_value);
+                            return;
+                        }
+                        free(range_start_value);
+                        free(range_end_value);
+                        range_start_value = computed_start;
+                        range_end_value = computed_end;
+                    } else {
+                        if (!range_start_value || !range_end_value) {
+                            json_free(root);
+                            free(parse_error);
+                            free(body_json);
+                            string_array_clear(&visit_ids_list);
+                            string_array_clear(&manual_audit_ids);
+                            char *body = build_error_response("Overview reports require range_start and range_end or range_preset");
+                            send_http_json(client_fd, 400, "Bad Request", body);
+                            free(body);
+                            free(address_value);
+                            free(notes_value);
+                            free(recs_value);
+                            free(cover_owner_value);
+                            free(cover_street_value);
+                            free(cover_city_value);
+                            free(cover_state_value);
+                            free(cover_zip_value);
+                            free(cover_contact_name_value);
+                            free(cover_contact_email_value);
+                            free(type_value);
+                            free(range_start_value);
+                            free(range_end_value);
+                            free(range_preset_value);
+                            return;
+                        }
+                    }
+                } else {
+                    if (range_preset_value && range_preset_value[0] && (!range_start_value || !range_end_value)) {
+                        char *computed_start = NULL;
+                        char *computed_end = NULL;
+                        if (!compute_preset_range(range_preset_value, &computed_start, &computed_end, &preset_error)) {
+                            json_free(root);
+                            free(parse_error);
+                            free(body_json);
+                            string_array_clear(&visit_ids_list);
+                            string_array_clear(&manual_audit_ids);
+                            char *body = build_error_response(preset_error ? preset_error : "Invalid range preset");
+                            free(preset_error);
+                            send_http_json(client_fd, 400, "Bad Request", body);
+                            free(body);
+                            free(address_value);
+                            free(notes_value);
+                            free(recs_value);
+                            free(cover_owner_value);
+                            free(cover_street_value);
+                            free(cover_city_value);
+                            free(cover_state_value);
+                            free(cover_zip_value);
+                            free(cover_contact_name_value);
+                            free(cover_contact_email_value);
+                            free(type_value);
+                            free(range_start_value);
+                            free(range_end_value);
+                            free(range_preset_value);
+                            return;
+                        }
+                        free(range_start_value);
+                        free(range_end_value);
+                        range_start_value = computed_start;
+                        range_end_value = computed_end;
+                    }
+                }
+
+                if (range_start_value && range_end_value) {
+                    int sy = 0, sm = 0, sd = 0;
+                    int ey = 0, em = 0, ed = 0;
+                    sscanf(range_start_value, "%4d-%2d-%2d", &sy, &sm, &sd);
+                    sscanf(range_end_value, "%4d-%2d-%2d", &ey, &em, &ed);
+                    struct tm start_tm = { .tm_year = sy - 1900, .tm_mon = sm - 1, .tm_mday = sd, .tm_hour = 12 };
+                    struct tm end_tm = { .tm_year = ey - 1900, .tm_mon = em - 1, .tm_mday = ed, .tm_hour = 12 };
+                    if (!normalize_tm(&start_tm) || !normalize_tm(&end_tm) || difftime(mktime(&start_tm), mktime(&end_tm)) > 0.0) {
+                        json_free(root);
+                        free(parse_error);
+                        free(body_json);
+                        string_array_clear(&visit_ids_list);
+                        string_array_clear(&manual_audit_ids);
+                        char *body = build_error_response("range_start must be on or before range_end");
+                        send_http_json(client_fd, 400, "Bad Request", body);
+                        free(body);
+                        free(address_value);
+                        free(notes_value);
+                        free(recs_value);
+                        free(cover_owner_value);
+                        free(cover_street_value);
+                        free(cover_city_value);
+                        free(cover_state_value);
+                        free(cover_zip_value);
+                        free(cover_contact_name_value);
+                        free(cover_contact_email_value);
+                        free(type_value);
+                        free(range_start_value);
+                        free(range_end_value);
+                        free(range_preset_value);
+                        return;
+                    }
+                }
+
+                free(preset_error);
+                free(type_value);
+                type_value = NULL;
 
                 json_free(root);
                 free(parse_error);
@@ -13553,6 +14837,13 @@ static void handle_client(int client_fd, void *ctx) {
                 request.cover_contact_email = cover_contact_email_value;
                 cover_contact_email_value = NULL;
                 request.deficiency_only = deficiency_only;
+                request.type = job_type;
+                request.range_start = range_start_value;
+                range_start_value = NULL;
+                request.range_end = range_end_value;
+                range_end_value = NULL;
+                request.range_preset = range_preset_value;
+                range_preset_value = NULL;
 
                 // resolve location profile for canonical address/location id
                 LocationDetailRequest loc_request = {
@@ -13635,7 +14926,7 @@ static void handle_client(int client_fd, void *ctx) {
                 char *existing_status = NULL;
                 bool existing_artifact_ready = false;
                 char *lookup_error = NULL;
-                int existing = db_find_existing_report_job(conn, request.address, request.deficiency_only, request.include_all, &existing_job_id, &existing_status, &existing_artifact_ready, &lookup_error);
+                int existing = db_find_existing_report_job(conn, &request, &existing_job_id, &existing_status, &existing_artifact_ready, &lookup_error);
                 if (existing < 0) {
                     char *body = build_error_response(lookup_error ? lookup_error : "Failed to check existing reports");
                     send_http_json(client_fd, 500, "Internal Server Error", body);
@@ -13667,9 +14958,8 @@ static void handle_client(int client_fd, void *ctx) {
                     send_report_job_response(client_fd, http_status,
                                              existing_status ? existing_status : (artifact_ready ? "completed" : "queued"),
                                              existing_job_id,
-                                             request.address,
-                                             download_url,
-                                             request.deficiency_only);
+                                             &request,
+                                             download_url);
                     free(download_url);
                     free(existing_job_id);
                     free(existing_status);
@@ -13700,7 +14990,7 @@ static void handle_client(int client_fd, void *ctx) {
                 }
                 free(insert_error);
 
-                send_report_job_response(client_fd, 202, "queued", job_id, request.address, NULL, request.deficiency_only);
+                send_report_job_response(client_fd, 202, "queued", job_id, &request, NULL);
                 report_job_clear(&request);
                 signal_report_worker();
                 return;
@@ -13935,6 +15225,26 @@ int main(int argc, char **argv) {
             g_modernization_cost_per_device = parsed_cost;
         } else {
             log_info("Ignoring invalid MODERNIZATION_COST_PER_DEVICE value: %s", mod_cost_env);
+        }
+    }
+
+    const char *fiscal_month_env = getenv("FISCAL_YEAR_START_MONTH");
+    if (fiscal_month_env && fiscal_month_env[0] != '\0') {
+        int month = atoi(fiscal_month_env);
+        if (month >= 1 && month <= 12) {
+            g_fiscal_year_start_month = month;
+        } else {
+            log_info("Ignoring invalid FISCAL_YEAR_START_MONTH value: %s", fiscal_month_env);
+        }
+    }
+
+    const char *fiscal_day_env = getenv("FISCAL_YEAR_START_DAY");
+    if (fiscal_day_env && fiscal_day_env[0] != '\0') {
+        int day = atoi(fiscal_day_env);
+        if (day >= 1 && day <= 31) {
+            g_fiscal_year_start_day = day;
+        } else {
+            log_info("Ignoring invalid FISCAL_YEAR_START_DAY value: %s", fiscal_day_env);
         }
     }
 

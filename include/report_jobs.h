@@ -7,6 +7,11 @@
 
 #include "util.h"
 
+typedef enum {
+    REPORT_JOB_TYPE_AUDIT = 0,
+    REPORT_JOB_TYPE_LOCATION_OVERVIEW
+} ReportJobType;
+
 typedef struct {
     char job_id[37];
     char *address;
@@ -19,10 +24,14 @@ typedef struct {
     char *cover_zip;
     char *cover_contact_name;
     char *cover_contact_email;
+    ReportJobType type;
     bool deficiency_only;
     bool include_all;
     bool has_location_id;
     int location_id;
+    char *range_start;
+    char *range_end;
+    char *range_preset;
     StringArray audit_ids;
 } ReportJob;
 
@@ -42,9 +51,7 @@ int db_complete_report_job(PGconn *conn,
                            char **error_out);
 char *db_fetch_report_job_status(PGconn *conn, const char *job_id, const char *path_prefix, char **error_out);
 int db_find_existing_report_job(PGconn *conn,
-                                const char *address,
-                                bool deficiency_only,
-                                bool include_all,
+                                const ReportJob *job,
                                 char **job_id_out,
                                 char **status_out,
                                 bool *artifact_ready_out,

@@ -164,6 +164,26 @@ export async function createReportJob(request: ReportJobCreateRequest): Promise<
     payload.location_id = request.locationRowId;
   }
 
+  const reportType = request.reportType?.trim();
+  if (reportType) {
+    payload.report_type = reportType;
+  }
+
+  const rangePreset = request.rangePreset?.trim();
+  if (rangePreset) {
+    payload.range_preset = rangePreset;
+  }
+
+  const rangeStart = request.rangeStart?.trim();
+  if (rangeStart) {
+    payload.range_start = rangeStart;
+  }
+
+  const rangeEnd = request.rangeEnd?.trim();
+  if (rangeEnd) {
+    payload.range_end = rangeEnd;
+  }
+
   const response = await fetch(buildUrl('/reports'), {
     method: 'POST',
     headers: {

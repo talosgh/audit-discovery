@@ -1,0 +1,6 @@
+ALTER TABLE report_jobs
+    ADD COLUMN IF NOT EXISTS job_type TEXT NOT NULL DEFAULT 'audit',
+    ADD COLUMN IF NOT EXISTS range_start DATE,
+    ADD COLUMN IF NOT EXISTS range_end DATE,
+    ADD COLUMN IF NOT EXISTS range_preset TEXT;
+
