@@ -13187,6 +13187,7 @@ static int build_location_overview_tex(const ReportJob *job,
     }
 
     int success = 0;
+    const char *fail_stage = "initialization";
 
     char *site_tex = NULL;
     char *address_tex = NULL;
@@ -13194,6 +13195,7 @@ static int build_location_overview_tex(const ReportJob *job,
     char *range_tex = NULL;
     char *generated_tex = NULL;
 
+    fail_stage = "deriving site metadata";
     const char *site_src = NULL;
     if (profile && profile->site_name && profile->site_name[0]) {
         site_src = profile->site_name;
@@ -13213,6 +13215,7 @@ static int build_location_overview_tex(const ReportJob *job,
     free(site_clean);
     if (!site_tex) goto cleanup;
 
+    fail_stage = "assembling address";
     Buffer addr_buf;
     if (!buffer_init(&addr_buf)) goto cleanup;
     bool addr_written = false;
@@ -13266,6 +13269,7 @@ static int build_location_overview_tex(const ReportJob *job,
         range_end = report->summary.audit_range.end;
     }
     if (range_start || range_end) {
+        fail_stage = "formatting range";
         range_label = format_range_label(range_start, range_end);
     }
     if (!range_label) {
@@ -13326,6 +13330,7 @@ static int build_location_overview_tex(const ReportJob *job,
     double total_savings = financial_stats->total_savings;
     double savings_rate = financial_stats->savings_rate;
 
+    fail_stage = "writing cover page";
     if (!buffer_append_cstr(&buf,
         "\\documentclass[12pt]{article}\n"
         "\\usepackage{geometry}\n"
@@ -13353,6 +13358,7 @@ static int build_location_overview_tex(const ReportJob *job,
     if (!buffer_append_cstr(&buf, "\\setlength{\\parskip}{6pt}\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\setlength{\\parindent}{0pt}\n")) goto cleanup;
 
+    fail_stage = "writing at-a-glance";
     if (!buffer_append_cstr(&buf, "\\section*{At-a-Glance}\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\renewcommand{\\arraystretch}{1.2}\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}p{0.35\\textwidth}}\n\\toprule\n")) goto cleanup;
@@ -13370,6 +13376,7 @@ static int build_location_overview_tex(const ReportJob *job,
     if (!buffer_appendf(&buf, "Tickets per device & %.2f\\\\\n", tickets_per_device)) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\n\n")) goto cleanup;
 
+    fail_stage = "writing service performance";
     if (!buffer_append_cstr(&buf, "\\section*{Service Performance}\n")) goto cleanup;
     if (!buffer_appendf(&buf,
             "The reporting window captured %ld service tickets totalling %.2f hours of technician engagement. ",
@@ -13384,6 +13391,7 @@ static int build_location_overview_tex(const ReportJob *job,
     if (total_activity_tickets == 0) {
         if (!buffer_append_cstr(&buf, "\\textit{No service activity records were available for this range.}\\\\par\n")) goto cleanup;
     } else {
+        fail_stage = "writing service activity mix";
         if (!buffer_append_cstr(&buf, "\\subsection*{Activity Mix}\n")) goto cleanup;
         if (!buffer_append_cstr(&buf, "\\begin{tabular}{lrrr}\n\\toprule\nCategory & Tickets & Hours & Share\\\\\n\\midrule\n")) goto cleanup;
         for (int cat = 0; cat <= SERVICE_ACTIVITY_UNKNOWN; ++cat) {
@@ -13408,7 +13416,8 @@ static int build_location_overview_tex(const ReportJob *job,
                 if (top_problems && top_problems->type == JSON_ARRAY && json_array_size(top_problems) > 0) {
                     size_t count = json_array_size(top_problems);
                     size_t limit = count > 8 ? 8 : count;
-                    if (!buffer_append_cstr(&buf, "\\subsubsection*{Top Reported Issues}\n")) {
+            fail_stage = "writing top service issues";
+            if (!buffer_append_cstr(&buf, "\\subsubsection*{Top Reported Issues}\n")) {
                         json_free(service_root);
                         free(service_parse_error);
                         goto cleanup;
@@ -13454,6 +13463,7 @@ static int build_location_overview_tex(const ReportJob *job,
         }
     }
 
+    fail_stage = "writing financial overview";
     if (!buffer_append_cstr(&buf, "\\section*{Financial Overview}\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}p{0.35\\textwidth}}\n\\toprule\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "Total proposed spend & ")) goto cleanup;
@@ -13592,6 +13602,7 @@ static int build_location_overview_tex(const ReportJob *job,
         free(financial_parse_error);
     }
 
+    fail_stage = "writing deficiency snapshot";
     if (!buffer_append_cstr(&buf, "\\section*{Deficiency Snapshot}\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\begin{tabular}{lrr}\n\\toprule\nDevice & Open & Closed\\\\\n\\midrule\n")) goto cleanup;
     for (size_t i = 0; i < report->devices.count; ++i) {
@@ -13617,6 +13628,7 @@ static int build_location_overview_tex(const ReportJob *job,
     }
     if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
 
+    fail_stage = "writing timeline summary";
     if (!buffer_append_cstr(&buf, "\\section*{Timeline Summary}\n")) goto cleanup;
     if (timeline_json && (timeline_has_service || timeline_has_financial)) {
         char *timeline_parse_error = NULL;
@@ -13707,6 +13719,7 @@ static int build_location_overview_tex(const ReportJob *job,
         if (!buffer_append_cstr(&buf, "No timeline records were available for this range.\\\\par\n")) goto cleanup;
     }
 
+    fail_stage = "finalizing document";
     if (!buffer_append_cstr(&buf, "\\end{document}\n")) goto cleanup;
 
     if (write_buffer_to_file(output_path, buf.data, buf.length) != 0) {
@@ -13729,8 +13742,22 @@ cleanup:
     free(range_tex);
     free(generated_tex);
     buffer_free(&buf);
-    if (!success && error_out && !*error_out) {
-        *error_out = strdup("Failed to build overview report");
+    if (!success) {
+        if (error_out && !*error_out) {
+            size_t len = strlen(fail_stage) + 64;
+            char *msg = malloc(len);
+            if (msg) {
+                snprintf(msg, len, "Failed to build overview report (stage: %s)", fail_stage);
+                *error_out = msg;
+            } else {
+                *error_out = strdup("Failed to build overview report");
+            }
+        }
+        if (error_out && *error_out) {
+            log_error("Overview report generation failed at stage '%s': %s", fail_stage, *error_out);
+        } else {
+            log_error("Overview report generation failed at stage '%s'", fail_stage);
+        }
     }
     return success;
 }
