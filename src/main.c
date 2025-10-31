@@ -13387,6 +13387,9 @@ static int build_location_overview_tex(const ReportJob *job,
             device_count > 0 ? device_count : (int)report->devices.count,
             tickets_per_device)) goto cleanup;
 
+    char stage_details[128];
+    stage_details[0] = '\0';
+
     long total_activity_tickets = service_stats->total_activity_tickets;
     if (total_activity_tickets == 0) {
         if (!buffer_append_cstr(&buf, "\\textit{No service activity records were available for this range.}\\\\par\n")) goto cleanup;
@@ -13402,6 +13405,8 @@ static int build_location_overview_tex(const ReportJob *job,
             }
             double share = (double)tickets / (double)total_activity_tickets;
             const char *label = service_activity_category_name((ServiceActivityCategory)cat);
+            snprintf(stage_details, sizeof(stage_details), "writing service activity row (%s)", label ? label : "Unknown");
+            fail_stage = stage_details;
             char *label_clean = sanitize_ascii(label ? label : "Unknown");
             char *label_tex = latex_escape(label_clean ? label_clean : (label ? label : "Unknown"));
             free(label_clean);
@@ -13416,6 +13421,9 @@ static int build_location_overview_tex(const ReportJob *job,
         }
         if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
 
+        fail_stage = "writing service performance narratives";
+
+        fail_stage = "writing top service issues";
         if (service_json) {
             char *service_parse_error = NULL;
             JsonValue *service_root = json_parse(service_json, &service_parse_error);
