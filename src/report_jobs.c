@@ -839,10 +839,20 @@ int db_find_existing_report_job(PGconn *conn,
         " AND COALESCE(range_end::text, '') = COALESCE($6::date::text, '') "
         " AND COALESCE(range_preset, '') = COALESCE($7, '') ";
 
-    char active_sql[512];
-    snprintf(active_sql, sizeof(active_sql),
-             "SELECT job_id::text, status FROM report_jobs WHERE%s AND status IN ('queued','processing') ORDER BY created_at DESC LIMIT 1",
-             base_where);
+    char active_sql[1024];
+    int active_len = snprintf(active_sql, sizeof(active_sql),
+                              "SELECT job_id::text, status "
+                              "FROM report_jobs "
+                              "WHERE%s "
+                              "AND status IN ('queued','processing') "
+                              "ORDER BY created_at DESC NULLS LAST LIMIT 1",
+                              base_where);
+    if (active_len < 0 || (size_t)active_len >= sizeof(active_sql)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to build job lookup query");
+        }
+        return -1;
+    }
 
     PGresult *res = PQexecParams(conn, active_sql, 7, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -865,10 +875,21 @@ int db_find_existing_report_job(PGconn *conn,
     }
     PQclear(res);
 
-    char completed_sql[512];
-    snprintf(completed_sql, sizeof(completed_sql),
-             "SELECT job_id::text, status, artifact_size FROM report_jobs WHERE%s AND status = 'completed' AND artifact_size IS NOT NULL ORDER BY completed_at DESC NULLS LAST LIMIT 1",
-             base_where);
+    char completed_sql[1024];
+    int completed_len = snprintf(completed_sql, sizeof(completed_sql),
+                                 "SELECT job_id::text, status, artifact_size "
+                                 "FROM report_jobs "
+                                 "WHERE%s "
+                                 "AND status = 'completed' "
+                                 "AND artifact_size IS NOT NULL "
+                                 "ORDER BY completed_at DESC NULLS LAST LIMIT 1",
+                                 base_where);
+    if (completed_len < 0 || (size_t)completed_len >= sizeof(completed_sql)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to build job lookup query");
+        }
+        return -1;
+    }
     res = PQexecParams(conn, completed_sql, 7, NULL, params, NULL, NULL, 0);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         if (error_out && !*error_out) {
