@@ -15215,6 +15215,7 @@ static int build_location_overview_tex(const ReportJob *job,
         "\\usepackage{tikz}\n"
         "\\usepackage{pgfplots}\n"
         "\\usepackage{pgfplotstable}\n"
+        "\\usepackage{tabularx}\n"
         "\\usepackage[most]{tcolorbox}\n"
         "\\usepackage{textcomp}\n"
         "\\usepackage{helvet}\n"
