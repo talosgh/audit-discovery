@@ -77,6 +77,10 @@ typedef struct {
     bool value;
 } OptionalBool;
 
+#define ARRAY_LEN(x) (sizeof(x) / sizeof((x)[0]))
+#define MAX_OVERVIEW_CALLOUTS 16
+#define OVERVIEW_CALLOUT_OUTPUT_LIMIT 8
+
 typedef struct {
     int section_counter;
     char *violation_device_id;
@@ -334,6 +338,14 @@ static const char *SERVICE_MIX_BUCKET_LABELS[SERVICE_BUCKET_COUNT] = {
     "Miscellaneous"
 };
 
+typedef struct {
+    char *title;
+    char *detail;
+    const char *severity;
+    int severity_rank;
+    size_t order;
+} HighlightCallout;
+
 static bool timeline_json_has_entries(const char *json) {
     if (!json) {
         return false;
@@ -370,6 +382,45 @@ typedef struct {
     double spend_capex;
     double spend_other;
 } TimelineEntry;
+
+typedef struct {
+    char *status;
+    double pm_actual;
+    double pm_expected;
+    double pm_ratio;
+    double tst_actual;
+    double tst_expected;
+    double tst_ratio;
+    int window_months;
+    char *message;
+} MaintenanceAdvisorySummary;
+
+typedef struct {
+    char *status;
+    double equipment_callbacks_per_device;
+    double callbacks_per_device_per_year;
+    long callback_events;
+    double opex_annual;
+    double expected_savings;
+    double payback_years;
+    double modernization_cost;
+    char *message;
+} ModernizationAdvisorySummary;
+
+typedef struct {
+    char *status;
+    double denied_rate;
+    double negotiated_rate;
+    double challenged_rate;
+    double closure_rate;
+    char *message;
+} VendorAdvisorySummary;
+
+typedef struct {
+    MaintenanceAdvisorySummary maintenance;
+    ModernizationAdvisorySummary modernization;
+    VendorAdvisorySummary vendor;
+} LocationAdvisorySummary;
 
 static const char *REPORT_SUMMARY_DOCSTRING =
     "Contains high-level metrics about the elevator audit.\n"
@@ -994,6 +1045,873 @@ static int buffer_append_percent(Buffer *buf, double ratio, int precision) {
     snprintf(fmt, sizeof(fmt), "%%.%df", precision);
     return buffer_appendf(buf, fmt, ratio * 100.0) &&
            buffer_append_cstr(buf, "\\\\%");
+}
+
+static char *alloc_printf(const char *fmt, ...) {
+    if (!fmt) {
+        return NULL;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    va_list copy;
+    va_copy(copy, ap);
+    int needed = vsnprintf(NULL, 0, fmt, copy);
+    va_end(copy);
+    if (needed < 0) {
+        va_end(ap);
+        return NULL;
+    }
+    size_t size = (size_t)needed + 1;
+    char *buffer = malloc(size);
+    if (!buffer) {
+        va_end(ap);
+        return NULL;
+    }
+    int written = vsnprintf(buffer, size, fmt, ap);
+    va_end(ap);
+    if (written < 0) {
+        free(buffer);
+        return NULL;
+    }
+    return buffer;
+}
+
+static int severity_rank_from_label(const char *severity) {
+    if (!severity) {
+        return 3;
+    }
+    if (strcasecmp(severity, "alert") == 0) return 0;
+    if (strcasecmp(severity, "warning") == 0) return 1;
+    if (strcasecmp(severity, "info") == 0) return 2;
+    return 3;
+}
+
+static void highlight_callout_clear(HighlightCallout *callout) {
+    if (!callout) {
+        return;
+    }
+    free(callout->title);
+    free(callout->detail);
+    callout->title = NULL;
+    callout->detail = NULL;
+    callout->severity = NULL;
+    callout->severity_rank = 0;
+    callout->order = 0;
+}
+
+static void highlight_callout_array_clear(HighlightCallout *callouts, size_t count) {
+    if (!callouts) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        highlight_callout_clear(&callouts[i]);
+    }
+}
+
+static int push_highlight_callout(HighlightCallout *callouts,
+                                  size_t capacity,
+                                  size_t *count,
+                                  size_t *order_counter,
+                                  const char *severity,
+                                  char *title,
+                                  char *detail) {
+    if (!callouts || !count || !order_counter || !title || !detail) {
+        free(title);
+        free(detail);
+        return 0;
+    }
+    if (*count >= capacity) {
+        free(title);
+        free(detail);
+        return 1;
+    }
+    HighlightCallout *slot = &callouts[*count];
+    slot->title = title;
+    slot->detail = detail;
+    slot->severity = severity;
+    slot->severity_rank = severity_rank_from_label(severity);
+    slot->order = *order_counter;
+    *count += 1;
+    *order_counter += 1;
+    return 1;
+}
+
+static int compare_highlight_callouts(const void *a, const void *b) {
+    const HighlightCallout *lhs = (const HighlightCallout *)a;
+    const HighlightCallout *rhs = (const HighlightCallout *)b;
+    if (lhs->severity_rank != rhs->severity_rank) {
+        return lhs->severity_rank - rhs->severity_rank;
+    }
+    if (lhs->order < rhs->order) return -1;
+    if (lhs->order > rhs->order) return 1;
+    return 0;
+}
+
+static int parse_year_month(const char *text, int *year_out, int *month_out);
+
+static char *format_month_label(const char *year_month) {
+    if (!year_month || strlen(year_month) < 7) {
+        return NULL;
+    }
+    int year = 0;
+    int month = 0;
+    if (!parse_year_month(year_month, &year, &month)) {
+        return strdup(year_month);
+    }
+    static const char *MONTH_SHORT_NAMES[12] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    if (month < 1 || month > 12) {
+        return strdup(year_month);
+    }
+    return alloc_printf("%s %d", MONTH_SHORT_NAMES[month - 1], year);
+}
+
+static void maintenance_advisory_init(MaintenanceAdvisorySummary *summary) {
+    if (!summary) return;
+    memset(summary, 0, sizeof(*summary));
+}
+
+static void maintenance_advisory_clear(MaintenanceAdvisorySummary *summary) {
+    if (!summary) return;
+    free(summary->status);
+    free(summary->message);
+    maintenance_advisory_init(summary);
+}
+
+static void modernization_advisory_init(ModernizationAdvisorySummary *summary) {
+    if (!summary) return;
+    memset(summary, 0, sizeof(*summary));
+}
+
+static void modernization_advisory_clear(ModernizationAdvisorySummary *summary) {
+    if (!summary) return;
+    free(summary->status);
+    free(summary->message);
+    modernization_advisory_init(summary);
+}
+
+static void vendor_advisory_init(VendorAdvisorySummary *summary) {
+    if (!summary) return;
+    memset(summary, 0, sizeof(*summary));
+}
+
+static void vendor_advisory_clear(VendorAdvisorySummary *summary) {
+    if (!summary) return;
+    free(summary->status);
+    free(summary->message);
+    vendor_advisory_init(summary);
+}
+
+static void location_advisory_init(LocationAdvisorySummary *summary) {
+    if (!summary) return;
+    maintenance_advisory_init(&summary->maintenance);
+    modernization_advisory_init(&summary->modernization);
+    vendor_advisory_init(&summary->vendor);
+}
+
+static void location_advisory_clear(LocationAdvisorySummary *summary) {
+    if (!summary) return;
+    maintenance_advisory_clear(&summary->maintenance);
+    modernization_advisory_clear(&summary->modernization);
+    vendor_advisory_clear(&summary->vendor);
+}
+
+static double safe_divide(double numerator, double denominator);
+static double clamp_double(double value, double min_value, double max_value);
+static const char *determine_trend_direction(double latest, double previous, double tolerance_percent, double *percent_change_out);
+
+static int compute_location_advisory(const ReportData *report,
+                                     const ServiceAnalytics *service_stats,
+                                     const FinancialAnalytics *financial_stats,
+                                     const TimelineStats *timeline_stats,
+                                     size_t open_deficiencies,
+                                     int device_count,
+                                     bool service_available,
+                                     bool financial_available,
+                                     double closure_rate,
+                                     LocationAdvisorySummary *out) {
+    if (!out) {
+        return 0;
+    }
+    location_advisory_init(out);
+
+    (void)report;
+    (void)service_stats;
+
+    int timeline_window_months = (timeline_stats && timeline_stats->months_window > 0) ? timeline_stats->months_window : 0;
+    long pm_actual_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->pm_window_total : 0;
+    long tst_actual_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->tst_window_total : 0;
+    long cb_equipment_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->cb_equipment_window_total : 0;
+    long cb_all_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->cb_all_window_total : 0;
+
+    double pm_expected = NAN;
+    double pm_ratio = NAN;
+    double tst_expected = NAN;
+    double tst_ratio = NAN;
+    if (timeline_window_months > 0 && device_count > 0) {
+        double window_months_d = (double)timeline_window_months;
+        pm_expected = (double)device_count * (window_months_d / 3.0);
+        tst_expected = (double)device_count * (window_months_d / 12.0);
+        if (pm_expected > 0.0) {
+            pm_ratio = (double)pm_actual_count / pm_expected;
+        }
+        if (tst_expected > 0.0) {
+            tst_ratio = (double)tst_actual_count / tst_expected;
+        }
+    }
+
+    const char *maintenance_status = "insufficient";
+    char maintenance_message[256];
+    maintenance_message[0] = '\0';
+    bool pm_valid = isfinite(pm_ratio);
+    bool tst_valid = isfinite(tst_ratio);
+    if (!service_available || timeline_window_months <= 0 || device_count <= 0) {
+        maintenance_status = "insufficient";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Not enough recent service history to evaluate maintenance cadence.");
+    } else if (pm_valid && pm_ratio < 0.75) {
+        maintenance_status = "attention";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Preventative maintenance is at %.0f%% (%ld visits vs. %.1f expected over the last %d months). Increase PM cadence and schedule a site audit.",
+                 pm_ratio * 100.0, pm_actual_count, isfinite(pm_expected) ? pm_expected : 0.0, timeline_window_months);
+    } else if (tst_valid && tst_ratio < 0.75) {
+        maintenance_status = "attention";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Testing cadence is low at %.0f%% (%ld tests vs. %.1f expected). Ensure annual testing is completed for each device.",
+                 tst_ratio * 100.0, tst_actual_count, isfinite(tst_expected) ? tst_expected : 0.0);
+    } else if ((pm_valid && pm_ratio >= 0.95) && (!tst_valid || tst_ratio >= 0.9)) {
+        maintenance_status = "healthy";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Preventative maintenance is strong at %.0f%% and testing is on track. Continue the current maintenance program.",
+                 pm_ratio * 100.0);
+    } else {
+        maintenance_status = "watch";
+        snprintf(maintenance_message, sizeof(maintenance_message),
+                 "Maintenance cadence is mostly on target, but continue to monitor PM (%.0f%%) and testing (%.0f%%) coverage.",
+                 pm_valid ? pm_ratio * 100.0 : 100.0, tst_valid ? tst_ratio * 100.0 : 100.0);
+    }
+
+    double annual_factor = (timeline_window_months > 0) ? (12.0 / (double)timeline_window_months) : NAN;
+    double opex_annualized = (timeline_stats && isfinite(annual_factor)) ? timeline_stats->spend_opex_window_total * annual_factor : NAN;
+    double equipment_per_device_per_year = NAN;
+    double callbacks_per_device_per_year = NAN;
+    if (isfinite(annual_factor) && device_count > 0) {
+        equipment_per_device_per_year = ((double)cb_equipment_count * annual_factor) / (double)device_count;
+        callbacks_per_device_per_year = ((double)cb_all_count * annual_factor) / (double)device_count;
+    }
+
+    const double modernization_cost_per_device = g_modernization_cost_per_device > 0.0 ? g_modernization_cost_per_device : 0.0;
+    double modernization_total_cost = modernization_cost_per_device * (device_count > 0 ? (double)device_count : 1.0);
+    double modernization_expected_savings = 0.0;
+    double modernization_payback_years = NAN;
+    const char *modernization_status = "insufficient";
+    char modernization_message[256];
+    modernization_message[0] = '\0';
+
+    double reliability_factor = 0.0;
+    if (isfinite(equipment_per_device_per_year)) {
+        reliability_factor = clamp_double((equipment_per_device_per_year - 1.0) / 4.0, 0.0, 1.0);
+    }
+    double savings_factor = 0.0;
+    if (isfinite(reliability_factor)) {
+        savings_factor = 0.15 + 0.35 * reliability_factor;
+    }
+    if (pm_valid && pm_ratio < 0.75) {
+        savings_factor *= 0.2;
+    }
+
+    if (!service_available || timeline_window_months < 6 || !isfinite(opex_annualized) || opex_annualized <= 0.0 || device_count <= 0) {
+        modernization_status = "insufficient";
+        snprintf(modernization_message, sizeof(modernization_message),
+                 "Modernization ROI cannot be evaluated yet; accumulate at least six months of OPEX and service data.");
+        modernization_expected_savings = NAN;
+        modernization_payback_years = NAN;
+    } else if (pm_valid && pm_ratio < 0.75) {
+        modernization_status = "defer";
+        snprintf(modernization_message, sizeof(modernization_message),
+                 "Address preventative maintenance gaps before pursuing modernization. Current PM coverage is %.0f%%.", pm_ratio * 100.0);
+        modernization_expected_savings = NAN;
+        modernization_payback_years = NAN;
+    } else {
+        modernization_expected_savings = opex_annualized * clamp_double(savings_factor, 0.0, 0.5);
+        if (modernization_expected_savings > 0.0) {
+            modernization_payback_years = modernization_total_cost / modernization_expected_savings;
+        }
+        if (!isfinite(modernization_payback_years) || modernization_payback_years <= 0.0) {
+            modernization_status = "monitor";
+            snprintf(modernization_message, sizeof(modernization_message),
+                     "With annual OPEX of $%.0f, modernization savings are unclear. Monitor equipment health and revisit after trend stabilizes.",
+                     opex_annualized);
+            modernization_expected_savings = NAN;
+            modernization_payback_years = NAN;
+        } else if (modernization_payback_years <= 8.0 || (isfinite(equipment_per_device_per_year) && equipment_per_device_per_year >= 3.0)) {
+            modernization_status = "plan";
+            snprintf(modernization_message, sizeof(modernization_message),
+                     "Modernization could recover costs in approximately %.1f years with estimated savings of $%.0f per year.",
+                     modernization_payback_years, modernization_expected_savings);
+        } else if (modernization_payback_years <= 12.0) {
+            modernization_status = "consider";
+            snprintf(modernization_message, sizeof(modernization_message),
+                     "Modernization payback is roughly %.1f years. Evaluate during capital planning, especially if failures persist (%.1f equipment callbacks/device/year).",
+                     modernization_payback_years,
+                     isfinite(equipment_per_device_per_year) ? equipment_per_device_per_year : 0.0);
+        } else {
+            modernization_status = "monitor";
+            snprintf(modernization_message, sizeof(modernization_message),
+                     "Modernization payback exceeds %.1f years. Continue optimizing maintenance and track OPEX trends before committing.",
+                     modernization_payback_years);
+        }
+        if (modernization_status[0] != 'i' && modernization_status[0] != 'd' && isfinite(closure_rate) && closure_rate < 0.65) {
+            strncat(modernization_message, " Address outstanding deficiencies in parallel.", sizeof(modernization_message) - strlen(modernization_message) - 1);
+        }
+    }
+
+    const char *vendor_status = "insufficient";
+    char vendor_message[256];
+    vendor_message[0] = '\0';
+    double denied_rate = NAN;
+    double negotiated_rate = NAN;
+    double challenged_rate = NAN;
+    if (financial_available && financial_stats) {
+        denied_rate = safe_divide((double)financial_stats->denied_records, (double)financial_stats->total_records);
+        negotiated_rate = safe_divide((double)financial_stats->negotiated_records, (double)financial_stats->total_records);
+        challenged_rate = safe_divide((double)financial_stats->challenged_records, (double)financial_stats->total_records);
+    }
+    double closure_percent = isfinite(closure_rate) ? closure_rate * 100.0 : NAN;
+    if (!financial_available || !financial_stats || financial_stats->total_records <= 0) {
+        vendor_status = "insufficient";
+        snprintf(vendor_message, sizeof(vendor_message),
+                 "Financial records are limited; unable to evaluate vendor proposal quality.");
+    } else {
+        bool closure_poor = isfinite(closure_rate) && closure_rate < 0.65;
+        bool denied_high = isfinite(denied_rate) && denied_rate > 0.2;
+        bool challenges_high = isfinite(challenged_rate) && challenged_rate > 0.15;
+        bool negotiated_high = isfinite(negotiated_rate) && negotiated_rate > 0.4;
+        if (denied_high || challenges_high || closure_poor) {
+            vendor_status = "needs_review";
+            snprintf(vendor_message, sizeof(vendor_message),
+                     "Vendor performance warrants review: %.0f%% denied, %.0f%% challenged, deficiency closure at %.0f%%.",
+                     isfinite(denied_rate) ? denied_rate * 100.0 : 0.0,
+                     isfinite(challenged_rate) ? challenged_rate * 100.0 : 0.0,
+                     isfinite(closure_percent) ? closure_percent : 0.0);
+        } else if (negotiated_high) {
+            vendor_status = "monitor";
+            snprintf(vendor_message, sizeof(vendor_message),
+                     "Negotiations are common (%.0f%% of proposals trimmed). Continue monitoring pricing discipline.",
+                     isfinite(negotiated_rate) ? negotiated_rate * 100.0 : 0.0);
+        } else {
+            vendor_status = "stable";
+            snprintf(vendor_message, sizeof(vendor_message),
+                     "Proposal and closure patterns appear healthy. Maintain current vendor cadence.");
+        }
+    }
+
+    out->maintenance.status = strdup(maintenance_status);
+    out->maintenance.message = strdup(maintenance_message[0] ? maintenance_message : "Maintenance data pending.");
+    if (!out->maintenance.status || !out->maintenance.message) {
+        location_advisory_clear(out);
+        return 0;
+    }
+    out->maintenance.pm_actual = (double)pm_actual_count;
+    out->maintenance.pm_expected = pm_expected;
+    out->maintenance.pm_ratio = pm_ratio;
+    out->maintenance.tst_actual = (double)tst_actual_count;
+    out->maintenance.tst_expected = tst_expected;
+    out->maintenance.tst_ratio = tst_ratio;
+    out->maintenance.window_months = timeline_window_months;
+
+    out->modernization.status = strdup(modernization_status);
+    out->modernization.message = strdup(modernization_message[0] ? modernization_message : "Modernization guidance pending additional data.");
+    if (!out->modernization.status || !out->modernization.message) {
+        location_advisory_clear(out);
+        return 0;
+    }
+    out->modernization.equipment_callbacks_per_device = equipment_per_device_per_year;
+    out->modernization.callbacks_per_device_per_year = callbacks_per_device_per_year;
+    out->modernization.callback_events = cb_equipment_count;
+    out->modernization.opex_annual = opex_annualized;
+    out->modernization.expected_savings = modernization_expected_savings;
+    out->modernization.payback_years = modernization_payback_years;
+    out->modernization.modernization_cost = modernization_total_cost;
+
+    out->vendor.status = strdup(vendor_status);
+    out->vendor.message = strdup(vendor_message[0] ? vendor_message : "Vendor analysis pending financial data.");
+    if (!out->vendor.status || !out->vendor.message) {
+        location_advisory_clear(out);
+        return 0;
+    }
+    out->vendor.denied_rate = denied_rate;
+    out->vendor.negotiated_rate = negotiated_rate;
+    out->vendor.challenged_rate = challenged_rate;
+    out->vendor.closure_rate = closure_rate;
+
+    (void)open_deficiencies;
+    return 1;
+}
+
+static int generate_highlight_callouts(const ReportData *report,
+                                       const ServiceAnalytics *service_stats,
+                                       const FinancialAnalytics *financial_stats,
+                                       const JsonValue *financial_root,
+                                       const JsonValue *timeline_root,
+                                       int device_count,
+                                       int total_deficiencies,
+                                       int open_deficiencies,
+                                       double closure_rate,
+                                       bool deficiencies_available,
+                                       bool service_available,
+                                       bool financial_available,
+                                       HighlightCallout *out_callouts,
+                                       size_t capacity,
+                                       size_t *out_count) {
+    if (!out_callouts || !out_count) {
+        return 0;
+    }
+    *out_count = 0;
+    size_t order_counter = 0;
+
+    double open_per_device = NAN;
+    if (device_count > 0) {
+        open_per_device = (double)open_deficiencies / (double)device_count;
+    }
+
+    double service_percent_change = 0.0;
+    const char *service_direction = "insufficient";
+    if (service_stats && service_stats->trend_points >= 2) {
+        service_direction = determine_trend_direction(service_stats->latest_tickets, service_stats->previous_tickets, 5.0, &service_percent_change);
+    }
+    if (!service_available) {
+        service_direction = "insufficient";
+        service_percent_change = 0.0;
+    }
+
+    double financial_percent_change = 0.0;
+    const char *financial_direction = "insufficient";
+    if (financial_stats && financial_stats->trend_points >= 2) {
+        financial_direction = determine_trend_direction(financial_stats->latest_spend, financial_stats->previous_spend, 5.0, &financial_percent_change);
+    }
+    if (!financial_available) {
+        financial_direction = "insufficient";
+        financial_percent_change = 0.0;
+    }
+
+    double savings_percent_change = 0.0;
+    const char *savings_direction = "insufficient";
+    if (financial_stats && financial_stats->savings_points >= 2) {
+        savings_direction = determine_trend_direction(financial_stats->latest_savings, financial_stats->previous_savings, 5.0, &savings_percent_change);
+    }
+    if (!financial_available) {
+        savings_direction = "insufficient";
+        savings_percent_change = 0.0;
+    }
+
+    long preventative_tickets = 0;
+    long testing_tickets = 0;
+    long callback_tickets = 0;
+    long repair_tickets = 0;
+    long total_activity_tickets = service_stats ? service_stats->total_activity_tickets : 0;
+    if (service_stats) {
+        for (int cat = 0; cat <= SERVICE_ACTIVITY_UNKNOWN; ++cat) {
+            long tickets = service_stats->category_tickets[cat];
+            if (tickets <= 0) continue;
+            ServiceActivityCategory cat_enum = (ServiceActivityCategory)cat;
+            switch (cat_enum) {
+                case SERVICE_ACTIVITY_PREVENTATIVE:
+                    preventative_tickets += tickets;
+                    break;
+                case SERVICE_ACTIVITY_TESTING_NO_LOAD:
+                case SERVICE_ACTIVITY_TESTING_FULL_LOAD:
+                    testing_tickets += tickets;
+                    break;
+                case SERVICE_ACTIVITY_CALLBACK_EQUIPMENT:
+                    callback_tickets += tickets;
+                    repair_tickets += 0; /* fall through to keep explicit */
+                    break;
+                case SERVICE_ACTIVITY_CALLBACK_EMERGENCY:
+                case SERVICE_ACTIVITY_CALLBACK_ENVIRONMENTAL:
+                case SERVICE_ACTIVITY_CALLBACK_VANDALISM:
+                case SERVICE_ACTIVITY_CALLBACK_OTHER:
+                case SERVICE_ACTIVITY_CALLBACK_UTILITY:
+                case SERVICE_ACTIVITY_CALLBACK_FIRE_PANEL:
+                    callback_tickets += tickets;
+                    break;
+                case SERVICE_ACTIVITY_REPAIR:
+                    repair_tickets += tickets;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    double preventative_share = NAN;
+    double testing_share = NAN;
+    double callback_share = NAN;
+    double repair_share = NAN;
+    if (total_activity_tickets > 0) {
+        preventative_share = (double)preventative_tickets / (double)total_activity_tickets;
+        testing_share = (double)testing_tickets / (double)total_activity_tickets;
+        callback_share = (double)callback_tickets / (double)total_activity_tickets;
+        repair_share = (double)repair_tickets / (double)total_activity_tickets;
+    }
+
+    double service_sum = 0.0;
+    size_t service_point_count = 0;
+    double service_max_total = 0.0;
+    const char *service_max_month = NULL;
+
+    double finance_sum = 0.0;
+    size_t finance_point_count = 0;
+    double finance_max_nonbase = 0.0;
+    const char *finance_max_month = NULL;
+
+    if (timeline_root && timeline_root->type == JSON_ARRAY) {
+        size_t len = json_array_size(timeline_root);
+        for (size_t i = 0; i < len; ++i) {
+            JsonValue *entry = json_array_get(timeline_root, i);
+            if (!entry || entry->type != JSON_OBJECT) {
+                continue;
+            }
+            const char *month = json_as_string(json_object_get(entry, "month"));
+            double pm = json_as_double_default(json_object_get(entry, "pm"), 0.0);
+            double cb_emg = json_as_double_default(json_object_get(entry, "cb_emergency"), 0.0);
+            double cb_equipment = json_as_double_default(json_object_get(entry, "cb_equipment"), 0.0);
+            double cb_env = json_as_double_default(json_object_get(entry, "cb_env"), 0.0);
+            double cb_other = json_as_double_default(json_object_get(entry, "cb_other"), 0.0);
+            double tst = json_as_double_default(json_object_get(entry, "tst"), 0.0);
+            double rp = json_as_double_default(json_object_get(entry, "rp"), 0.0);
+            double misc = json_as_double_default(json_object_get(entry, "misc"), 0.0);
+            double total = pm + cb_emg + cb_equipment + cb_env + cb_other + tst + rp + misc;
+            if (total > 0.0) {
+                service_sum += total;
+                service_point_count += 1;
+                if (total > service_max_total) {
+                    service_max_total = total;
+                    service_max_month = month;
+                }
+            }
+
+            double opex = json_as_double_default(json_object_get(entry, "opex"), 0.0);
+            double capex = json_as_double_default(json_object_get(entry, "capex"), 0.0);
+            double other = json_as_double_default(json_object_get(entry, "other"), 0.0);
+            double non_base = opex + capex + other;
+            if (non_base > 0.0) {
+                finance_sum += non_base;
+                finance_point_count += 1;
+                if (non_base > finance_max_nonbase) {
+                    finance_max_nonbase = non_base;
+                    finance_max_month = month;
+                }
+            }
+        }
+    }
+
+    double type_spend_total = 0.0;
+    double type_spend_opex = 0.0;
+    double type_spend_capex = 0.0;
+    double type_spend_other = 0.0;
+    if (financial_root && financial_root->type == JSON_OBJECT) {
+        JsonValue *types = json_object_get(financial_root, "type_breakdown");
+        if (types && types->type == JSON_ARRAY) {
+            size_t len = json_array_size(types);
+            for (size_t i = 0; i < len; ++i) {
+                JsonValue *item = json_array_get(types, i);
+                if (!item || item->type != JSON_OBJECT) continue;
+                const char *type_label = json_as_string(json_object_get(item, "type"));
+                double spend = json_as_double_default(json_object_get(item, "spend"), 0.0);
+                type_spend_total += spend;
+                if (!type_label) continue;
+                if (strcasecmp(type_label, "OPEX") == 0) {
+                    type_spend_opex += spend;
+                } else if (strcasecmp(type_label, "CAPEX") == 0) {
+                    type_spend_capex += spend;
+                } else {
+                    type_spend_other += spend;
+                }
+            }
+        }
+    }
+    double type_share_opex = (type_spend_total > 0.0) ? type_spend_opex / type_spend_total : NAN;
+    double type_share_capex = (type_spend_total > 0.0) ? type_spend_capex / type_spend_total : NAN;
+    double type_share_other = (type_spend_total > 0.0) ? type_spend_other / type_spend_total : NAN;
+
+    double average_controller_age = NAN;
+    double max_controller_age = NAN;
+    size_t age_count = 0;
+    if (report) {
+        double age_sum = 0.0;
+        for (size_t i = 0; i < report->devices.count; ++i) {
+            const ReportDevice *device = &report->devices.items[i];
+            if (device->metrics.controller_age.has_value) {
+                double age = (double)device->metrics.controller_age.value;
+                age_sum += age;
+                age_count += 1;
+                if (!isfinite(max_controller_age) || age > max_controller_age) {
+                    max_controller_age = age;
+                }
+            }
+        }
+        if (age_count > 0) {
+            average_controller_age = age_sum / (double)age_count;
+        }
+    }
+
+    size_t cat1_late = 0;
+    size_t cat5_late = 0;
+    size_t dlm_issues = 0;
+    if (report) {
+        for (size_t i = 0; i < report->devices.count; ++i) {
+            const ReportDevice *device = &report->devices.items[i];
+            if (device->metrics.cat1_tag_current.has_value && !device->metrics.cat1_tag_current.value) {
+                cat1_late += 1;
+            }
+            if (device->metrics.cat5_tag_current.has_value && !device->metrics.cat5_tag_current.value) {
+                cat5_late += 1;
+            }
+            if (device->metrics.dlm_compliant.has_value && !device->metrics.dlm_compliant.value) {
+                dlm_issues += 1;
+            }
+        }
+    }
+
+    HighlightCallout *callouts = out_callouts;
+    size_t count = 0;
+
+    if (!deficiencies_available && (service_available || financial_available)) {
+        char *title = strdup("Audit history missing");
+        char *detail = strdup("No audit data yet—consider scheduling a field audit to baseline deficiencies.");
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "info", title, detail)) goto oom;
+    }
+    if (deficiencies_available && !service_available && total_deficiencies > 0) {
+        char *title = strdup("No service telemetry");
+        char *detail = strdup("Deficiencies are logged but service dispatch data is absent. Confirm maintenance vendor reporting.");
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+    }
+    if (!financial_available && (service_available || deficiencies_available)) {
+        char *title = strdup("Financial data unavailable");
+        char *detail = strdup("Spend history is missing for this property. Ensure invoicing is flowing to the portal.");
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "info", title, detail)) goto oom;
+    }
+
+    if (isfinite(open_per_device)) {
+        if (open_per_device >= 1.5) {
+            char *title = strdup("High deficiency load");
+            char *detail = alloc_printf("%.2f open issues per device; prioritize remediation.", open_per_device);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "alert", title, detail)) goto oom;
+        } else if (open_per_device <= 0.4) {
+            char *title = strdup("Deficiencies under control");
+            char *detail = alloc_printf("%.2f open issues per device, well below the 1.0 target.", open_per_device);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "positive", title, detail)) goto oom;
+        }
+    }
+
+    if (isfinite(closure_rate)) {
+        if (closure_rate < 0.6) {
+            char *title = strdup("Closure rate slipping");
+            char *detail = alloc_printf("Only %.1f%% of deficiencies are closed.", closure_rate * 100.0);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "alert", title, detail)) goto oom;
+        } else if (closure_rate >= 0.92) {
+            char *title = strdup("Strong remediation cadence");
+            char *detail = alloc_printf("%.1f%% of deficiencies are resolved.", closure_rate * 100.0);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "positive", title, detail)) goto oom;
+        }
+    }
+
+    if (service_direction && strcmp(service_direction, "up") == 0 && service_percent_change >= 5.0) {
+        const char *severity = (service_percent_change >= 15.0) ? "alert" : "warning";
+        char *title = strdup("Service workload rising");
+        char *detail = alloc_printf("Tickets increased ~%.1f%% compared with the prior period.", service_percent_change);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, severity, title, detail)) goto oom;
+    } else if (service_direction && strcmp(service_direction, "down") == 0 && service_percent_change >= 5.0) {
+        char *title = strdup("Service workload easing");
+        char *detail = alloc_printf("Tickets decreased ~%.1f%% compared with the prior period.", service_percent_change);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "positive", title, detail)) goto oom;
+    }
+
+    if (service_point_count >= 3 && service_max_month) {
+        double avg = service_sum / (double)service_point_count;
+        if (avg > 0.0 && service_max_total >= avg * 1.6 && service_max_total - avg >= 2.0) {
+            double delta = ((service_max_total - avg) / avg) * 100.0;
+            char *month_label = format_month_label(service_max_month);
+            if (!month_label) month_label = strdup(service_max_month);
+            char *title = strdup("Service spike detected");
+            char *detail = alloc_printf("%s logged %.0f tickets (~%.0f%% above average).",
+                                        month_label ? month_label : service_max_month,
+                                        service_max_total,
+                                        delta);
+            free(month_label);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+        }
+    }
+
+    if (isfinite(preventative_share)) {
+        double percent = preventative_share * 100.0;
+        if (preventative_share < 0.35) {
+            char *title = strdup("Preventative work lagging");
+            char *detail = alloc_printf("Only %.1f%% of tickets are preventative maintenance. Increase scheduled PM to stabilize reliability.", percent);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+        } else if (preventative_share >= 0.7) {
+            char *title = strdup("Healthy preventative cadence");
+            char *detail = alloc_printf("%.1f%% of activity is preventative maintenance.", percent);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "positive", title, detail)) goto oom;
+        }
+    }
+
+    if (isfinite(testing_share) && testing_share < 0.05) {
+        char *title = strdup("Testing activity minimal");
+        char *detail = strdup("Testing tickets are rarely recorded. Confirm mandated inspection cadence with the vendor.");
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+    }
+
+    if (isfinite(callback_share)) {
+        double percent = callback_share * 100.0;
+        if (callback_share >= 0.45) {
+            char *title = strdup("Callback-heavy workload");
+            char *detail = alloc_printf("%.1f%% of service tickets are callbacks. Investigate root causes.", percent);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "alert", title, detail)) goto oom;
+        } else if (callback_share <= 0.20) {
+            char *title = strdup("Callbacks contained");
+            char *detail = alloc_printf("Callbacks represent just %.1f%% of total service activity.", percent);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "positive", title, detail)) goto oom;
+        }
+    }
+
+    if (cat1_late + cat5_late + dlm_issues > 0) {
+        Buffer detail;
+        if (!buffer_init(&detail)) goto oom;
+        if (cat1_late > 0) {
+            buffer_appendf(&detail, "%zu Cat1 tag%s", cat1_late, cat1_late > 1 ? "s" : "");
+        }
+        if (cat5_late > 0) {
+            if (detail.length > 0) buffer_append_cstr(&detail, ", ");
+            buffer_appendf(&detail, "%zu Cat5 tag%s", cat5_late, cat5_late > 1 ? "s" : "");
+        }
+        if (dlm_issues > 0) {
+            if (detail.length > 0) buffer_append_cstr(&detail, ", ");
+            buffer_appendf(&detail, "%zu DLM issue%s", dlm_issues, dlm_issues > 1 ? "s" : "");
+        }
+        if (!buffer_append_cstr(&detail, " require attention.")) {
+            buffer_free(&detail);
+            goto oom;
+        }
+        char *title = strdup("Compliance gaps detected");
+        char *detail_str = detail.data;
+        detail.data = NULL;
+        buffer_free(&detail);
+        if (!title || !detail_str || !push_highlight_callout(callouts, capacity, &count, &order_counter, "alert", title, detail_str)) {
+            free(title);
+            free(detail_str);
+            goto oom;
+        }
+    }
+
+    double modernization_score = NAN;
+    if (isfinite(repair_share) || isfinite(average_controller_age) || isfinite(callback_share)) {
+        double normalized_repair = isfinite(repair_share) ? repair_share : 0.0;
+        double normalized_age = isfinite(average_controller_age) ? fmin(average_controller_age / 30.0, 1.0) : 0.0;
+        double normalized_callback = isfinite(callback_share) ? fmin(callback_share, 1.0) : 0.0;
+        modernization_score = normalized_repair * 0.5 + normalized_age * 0.35 + normalized_callback * 0.15;
+        if (isfinite(average_controller_age)) {
+            const char *severity = (modernization_score >= 0.65 || average_controller_age >= 22.0) ? "alert" : "warning";
+            double repair_pct = isfinite(repair_share) ? repair_share * 100.0 : 0.0;
+            char *title = strdup("Modernization pressure building");
+            char *detail = alloc_printf("Average controller age %.1f years with %.0f%% of tickets tied to repairs. Evaluate modernization plan.",
+                                        average_controller_age, repair_pct);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, severity, title, detail)) goto oom;
+        }
+    }
+    if (!isfinite(average_controller_age) && isfinite(max_controller_age) && max_controller_age >= 25.0) {
+        char *title = strdup("Controller modernization candidates");
+        char *detail = alloc_printf("At least one unit has a controller ≥%.0f years old.", max_controller_age);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+    }
+
+    if (financial_direction && strcmp(financial_direction, "up") == 0 && financial_percent_change >= 5.0) {
+        const char *severity = (financial_percent_change >= 15.0) ? "alert" : "warning";
+        char *title = strdup("Spend trending upward");
+        char *detail = alloc_printf("Monthly spend increased ~%.1f%% period-over-period.", financial_percent_change);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, severity, title, detail)) goto oom;
+    } else if (financial_direction && strcmp(financial_direction, "down") == 0 && financial_percent_change >= 5.0) {
+        char *title = strdup("Spend trending downward");
+        char *detail = alloc_printf("Spend decreased ~%.1f%% compared with the prior period.", financial_percent_change);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "positive", title, detail)) goto oom;
+    }
+
+    if (finance_point_count >= 3 && finance_max_month) {
+        double avg = finance_sum / (double)finance_point_count;
+        if (avg > 0.0 && finance_max_nonbase >= avg * 1.7 && finance_max_nonbase - avg >= 1000.0) {
+            double delta = ((finance_max_nonbase - avg) / avg) * 100.0;
+            char *month_label = format_month_label(finance_max_month);
+            if (!month_label) month_label = strdup(finance_max_month);
+            char *title = strdup("Spend surge outside base contract");
+            char *detail = alloc_printf("%s recorded $%.0f in non-BC spend (~%.0f%% above average).",
+                                        month_label ? month_label : finance_max_month,
+                                        finance_max_nonbase,
+                                        delta);
+            free(month_label);
+            if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+        }
+    }
+
+    if (isfinite(type_share_opex) && type_share_opex >= 0.5) {
+        char *title = strdup("Operational expense heavy");
+        char *detail = alloc_printf("%.1f%% of categorized spend is OPEX. Investigate chronic issues driving callbacks and repairs.", type_share_opex * 100.0);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+    }
+    if (isfinite(type_share_capex) && type_share_capex < 0.10 && isfinite(repair_share) && repair_share >= 0.28) {
+        char *title = strdup("Capex investment lagging");
+        char *detail = alloc_printf("Only %.1f%% of spend is CAPEX despite high repair activity. Build modernization roadmap.", type_share_capex * 100.0);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+    }
+    if (isfinite(type_share_other) && type_share_other >= 0.25) {
+        char *title = strdup("Uncategorized spend rising");
+        char *detail = alloc_printf("%.1f%% of spend lacks classification. Tighten coding with the vendor.", type_share_other * 100.0);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "info", title, detail)) goto oom;
+    }
+
+    double open_spend = financial_stats ? financial_stats->open_spend : 0.0;
+    double total_spend = financial_stats ? financial_stats->total_spend : 0.0;
+    if (open_spend > total_spend * 0.35 && open_spend > 5000.0) {
+        char *title = strdup("Large open spend backlog");
+        char *detail = alloc_printf("$%.0f in proposals/invoices remain open.", open_spend);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+    }
+
+    if (savings_direction && strcmp(savings_direction, "up") == 0 && savings_percent_change >= 5.0) {
+        char *title = strdup("Savings velocity improving");
+        char *detail = alloc_printf("Savings increased ~%.1f%% against the prior window.", savings_percent_change);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "positive", title, detail)) goto oom;
+    }
+
+    double savings_rate = financial_stats ? financial_stats->savings_rate : NAN;
+    if (isfinite(savings_rate) && savings_rate >= 0.25) {
+        char *title = strdup("Savings rate outperforming");
+        char *detail = alloc_printf("Capturing %.1f%% of proposed spend as savings.", savings_rate * 100.0);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "positive", title, detail)) goto oom;
+    } else if (isfinite(savings_rate) && savings_rate < 0.05) {
+        char *title = strdup("Limited savings captured");
+        char *detail = alloc_printf("Savings rate sits at %.1f%%. Review negotiations.", savings_rate * 100.0);
+        if (!title || !detail || !push_highlight_callout(callouts, capacity, &count, &order_counter, "warning", title, detail)) goto oom;
+    }
+
+    if (count > 1) {
+        qsort(callouts, count, sizeof(HighlightCallout), compare_highlight_callouts);
+    }
+    if (count > OVERVIEW_CALLOUT_OUTPUT_LIMIT) {
+        for (size_t i = OVERVIEW_CALLOUT_OUTPUT_LIMIT; i < count; ++i) {
+            highlight_callout_clear(&callouts[i]);
+        }
+        count = OVERVIEW_CALLOUT_OUTPUT_LIMIT;
+    }
+    *out_count = count;
+    return 1;
+
+oom:
+    highlight_callout_array_clear(callouts, count);
+    *out_count = 0;
+    return 0;
 }
 static void report_data_init(ReportData *data);
 static void report_data_clear(ReportData *data);
@@ -8642,173 +9560,45 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
         savings_trend = "insufficient";
     }
 
-    int timeline_window_months = (timeline_stats && timeline_stats->months_window > 0) ? timeline_stats->months_window : 0;
-    long pm_actual_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->pm_window_total : 0;
-    long tst_actual_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->tst_window_total : 0;
-    long cb_equipment_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->cb_equipment_window_total : 0;
-    long cb_all_count = (timeline_stats && timeline_window_months > 0) ? timeline_stats->cb_all_window_total : 0;
-    double pm_expected = NAN;
-    double tst_expected = NAN;
-    double pm_ratio = NAN;
-    double tst_ratio = NAN;
-    if (timeline_window_months > 0 && device_count > 0) {
-        double window_months_d = (double)timeline_window_months;
-        pm_expected = (double)device_count * (window_months_d / 3.0);
-        tst_expected = (double)device_count * (window_months_d / 12.0);
-        if (pm_expected > 0.0) {
-            pm_ratio = (double)pm_actual_count / pm_expected;
-        }
-        if (tst_expected > 0.0) {
-            tst_ratio = (double)tst_actual_count / tst_expected;
-        }
+    LocationAdvisorySummary advisory;
+    location_advisory_init(&advisory);
+    if (!compute_location_advisory(report,
+                                   service_stats,
+                                   financial_stats,
+                                   timeline_stats,
+                                   open_deficiencies,
+                                   device_count,
+                                   service_available,
+                                   financial_available,
+                                   closure_rate,
+                                   &advisory)) {
+        location_advisory_clear(&advisory);
+        goto oom;
     }
 
-    double annual_factor = (timeline_window_months > 0) ? (12.0 / (double)timeline_window_months) : NAN;
-    double opex_annualized = (timeline_stats && isfinite(annual_factor)) ? timeline_stats->spend_opex_window_total * annual_factor : NAN;
-    double equipment_per_device_per_year = NAN;
-    double callbacks_per_device_per_year = NAN;
-    if (isfinite(annual_factor) && device_count > 0) {
-        equipment_per_device_per_year = ((double)cb_equipment_count * annual_factor) / (double)device_count;
-        callbacks_per_device_per_year = ((double)cb_all_count * annual_factor) / (double)device_count;
-    }
-
-    const double modernization_cost_per_device = g_modernization_cost_per_device > 0.0 ? g_modernization_cost_per_device : 0.0;
-    double modernization_total_cost = modernization_cost_per_device * (device_count > 0 ? (double)device_count : 1.0);
-    double modernization_expected_savings = 0.0;
-    double modernization_payback_years = NAN;
-
-    const char *maintenance_status = "insufficient";
-    const char *modernization_status = "insufficient";
-    const char *vendor_status = "insufficient";
-    char maintenance_message[256];
-    char modernization_message[256];
-    char vendor_message[256];
-    maintenance_message[0] = '\0';
-    modernization_message[0] = '\0';
-    vendor_message[0] = '\0';
-
-    bool pm_valid = isfinite(pm_ratio);
-    bool tst_valid = isfinite(tst_ratio);
-    if (timeline_window_months <= 0 || device_count <= 0) {
-        maintenance_status = "insufficient";
-        snprintf(maintenance_message, sizeof(maintenance_message),
-                 "Not enough recent service history to evaluate maintenance cadence.");
-    } else if (pm_valid && pm_ratio < 0.75) {
-        maintenance_status = "attention";
-        snprintf(maintenance_message, sizeof(maintenance_message),
-                 "Preventative maintenance is at %.0f%% (%ld visits vs. %.1f expected over the last %d months). Increase PM cadence and schedule a site audit.",
-                 pm_ratio * 100.0, pm_actual_count, pm_expected, timeline_window_months);
-    } else if (tst_valid && tst_ratio < 0.75) {
-        maintenance_status = "attention";
-        snprintf(maintenance_message, sizeof(maintenance_message),
-                 "Testing cadence is low at %.0f%% (%ld tests vs. %.1f expected). Ensure annual testing is completed for each device.",
-                 tst_ratio * 100.0, tst_actual_count, tst_expected);
-    } else if ((pm_valid && pm_ratio >= 0.95) && (!tst_valid || tst_ratio >= 0.9)) {
-        maintenance_status = "healthy";
-        snprintf(maintenance_message, sizeof(maintenance_message),
-                 "Preventative maintenance is strong at %.0f%% and testing is on track. Continue the current maintenance program.",
-                 pm_ratio * 100.0);
-    } else {
-        maintenance_status = "watch";
-        snprintf(maintenance_message, sizeof(maintenance_message),
-                 "Maintenance cadence is mostly on target, but continue to monitor PM (%.0f%%) and testing (%.0f%%) coverage.",
-                 pm_valid ? pm_ratio * 100.0 : 100.0, tst_valid ? tst_ratio * 100.0 : 100.0);
-    }
-
-    double reliability_factor = 0.0;
-    if (isfinite(equipment_per_device_per_year)) {
-        reliability_factor = clamp_double((equipment_per_device_per_year - 1.0) / 4.0, 0.0, 1.0);
-    }
-    double savings_factor = 0.0;
-    if (isfinite(reliability_factor)) {
-        savings_factor = 0.15 + 0.35 * reliability_factor;
-    }
-    if (pm_valid && pm_ratio < 0.75) {
-        savings_factor *= 0.2;
-    }
-
-    if (timeline_window_months < 6 || !isfinite(opex_annualized) || opex_annualized <= 0.0 || device_count <= 0) {
-        modernization_status = "insufficient";
-        snprintf(modernization_message, sizeof(modernization_message),
-                 "Modernization ROI cannot be evaluated yet; accumulate at least six months of OPEX and service data.");
-        modernization_expected_savings = NAN;
-        modernization_payback_years = NAN;
-    } else if (pm_valid && pm_ratio < 0.75) {
-        modernization_status = "defer";
-        snprintf(modernization_message, sizeof(modernization_message),
-                 "Address preventative maintenance gaps before pursuing modernization. Current PM coverage is %.0f%%.", pm_ratio * 100.0);
-        modernization_expected_savings = NAN;
-        modernization_payback_years = NAN;
-    } else {
-        modernization_expected_savings = opex_annualized * clamp_double(savings_factor, 0.0, 0.5);
-        if (modernization_expected_savings > 0.0) {
-            modernization_payback_years = modernization_total_cost / modernization_expected_savings;
-        }
-        if (!isfinite(modernization_payback_years) || modernization_payback_years <= 0.0) {
-            modernization_status = "monitor";
-            snprintf(modernization_message, sizeof(modernization_message),
-                     "With annual OPEX of $%.0f, modernization savings are unclear. Monitor equipment health and revisit after trend stabilizes.",
-                     opex_annualized);
-            modernization_expected_savings = NAN;
-            modernization_payback_years = NAN;
-        } else if (modernization_payback_years <= 8.0 || (isfinite(equipment_per_device_per_year) && equipment_per_device_per_year >= 3.0)) {
-            modernization_status = "plan";
-            snprintf(modernization_message, sizeof(modernization_message),
-                     "Modernization could recover costs in approximately %.1f years with estimated savings of $%.0f per year.",
-                     modernization_payback_years, modernization_expected_savings);
-        } else if (modernization_payback_years <= 12.0) {
-            modernization_status = "consider";
-            snprintf(modernization_message, sizeof(modernization_message),
-                     "Modernization payback is roughly %.1f years. Evaluate during capital planning, especially if failures persist (%.1f equipment callbacks/device/year).",
-                     modernization_payback_years,
-                     isfinite(equipment_per_device_per_year) ? equipment_per_device_per_year : 0.0);
-        } else {
-            modernization_status = "monitor";
-            snprintf(modernization_message, sizeof(modernization_message),
-                     "Modernization payback exceeds %.1f years. Continue optimizing maintenance and track OPEX trends before committing.",
-                     modernization_payback_years);
-        }
-        if (modernization_status[0] != 'i' && modernization_status[0] != 'd' && isfinite(closure_rate) && closure_rate < 0.65) {
-            strncat(modernization_message, " Address outstanding deficiencies in parallel.", sizeof(modernization_message) - strlen(modernization_message) - 1);
-        }
-    }
-
-    double denied_rate = NAN;
-    double negotiated_rate = NAN;
-    double challenged_rate = NAN;
-    double closure_percent = isfinite(closure_rate) ? closure_rate * 100.0 : NAN;
-    if (financial_available && financial_stats) {
-        denied_rate = safe_divide((double)financial_stats->denied_records, (double)financial_stats->total_records);
-        negotiated_rate = safe_divide((double)financial_stats->negotiated_records, (double)financial_stats->total_records);
-        challenged_rate = safe_divide((double)financial_stats->challenged_records, (double)financial_stats->total_records);
-    }
-    if (!financial_available || !financial_stats || financial_stats->total_records <= 0) {
-        vendor_status = "insufficient";
-        snprintf(vendor_message, sizeof(vendor_message),
-                 "Financial records are limited; unable to evaluate vendor proposal quality.");
-    } else {
-        bool closure_poor = isfinite(closure_rate) && closure_rate < 0.65;
-        bool denied_high = isfinite(denied_rate) && denied_rate > 0.2;
-        bool challenges_high = isfinite(challenged_rate) && challenged_rate > 0.15;
-        bool negotiated_high = isfinite(negotiated_rate) && negotiated_rate > 0.4;
-        if (denied_high || challenges_high || closure_poor) {
-            vendor_status = "needs_review";
-            snprintf(vendor_message, sizeof(vendor_message),
-                     "Vendor performance warrants review: %.0f%% denied, %.0f%% challenged, deficiency closure at %.0f%%.",
-                     isfinite(denied_rate) ? denied_rate * 100.0 : 0.0,
-                     isfinite(challenged_rate) ? challenged_rate * 100.0 : 0.0,
-                     isfinite(closure_percent) ? closure_percent : 0.0);
-        } else if (negotiated_high) {
-            vendor_status = "monitor";
-            snprintf(vendor_message, sizeof(vendor_message),
-                     "Negotiations are common (%.0f%% of proposals trimmed). Continue monitoring pricing discipline.",
-                     isfinite(negotiated_rate) ? negotiated_rate * 100.0 : 0.0);
-        } else {
-            vendor_status = "stable";
-            snprintf(vendor_message, sizeof(vendor_message),
-                     "Proposal and closure patterns appear healthy. Maintain current vendor cadence.");
-        }
-    }
+    int timeline_window_months = advisory.maintenance.window_months;
+    double pm_expected = advisory.maintenance.pm_expected;
+    double pm_ratio = advisory.maintenance.pm_ratio;
+    double tst_expected = advisory.maintenance.tst_expected;
+    double tst_ratio = advisory.maintenance.tst_ratio;
+    double opex_annualized = advisory.modernization.opex_annual;
+    double equipment_per_device_per_year = advisory.modernization.equipment_callbacks_per_device;
+    double callbacks_per_device_per_year = advisory.modernization.callbacks_per_device_per_year;
+    long cb_equipment_count = advisory.modernization.callback_events;
+    double modernization_expected_savings = advisory.modernization.expected_savings;
+    double modernization_payback_years = advisory.modernization.payback_years;
+    double modernization_total_cost = advisory.modernization.modernization_cost;
+    double denied_rate = advisory.vendor.denied_rate;
+    double negotiated_rate = advisory.vendor.negotiated_rate;
+    double challenged_rate = advisory.vendor.challenged_rate;
+    long pm_actual_count = (long)lround(advisory.maintenance.pm_actual);
+    long tst_actual_count = (long)lround(advisory.maintenance.tst_actual);
+    const char *maintenance_status = advisory.maintenance.status ? advisory.maintenance.status : "insufficient";
+    const char *maintenance_message = advisory.maintenance.message ? advisory.maintenance.message : "Maintenance cadence pending analysis.";
+    const char *modernization_status = advisory.modernization.status ? advisory.modernization.status : "insufficient";
+    const char *modernization_message = advisory.modernization.message ? advisory.modernization.message : "Modernization guidance pending additional data.";
+    const char *vendor_status = advisory.vendor.status ? advisory.vendor.status : "insufficient";
+    const char *vendor_message = advisory.vendor.message ? advisory.vendor.message : "Vendor analysis pending financial data.";
 
     if (!buffer_append_char(&buf, '{')) goto oom;
 
@@ -13449,10 +14239,23 @@ static int build_location_overview_tex(const ReportJob *job,
     const char *fail_stage = "initialization";
 
     char *site_tex = NULL;
-    char *address_tex = NULL;
-    char *range_label = NULL;
-    char *range_tex = NULL;
-    char *generated_tex = NULL;
+   char *address_tex = NULL;
+   char *range_label = NULL;
+   char *range_tex = NULL;
+   char *generated_tex = NULL;
+    JsonValue *financial_root = NULL;
+    JsonValue *timeline_root = NULL;
+    HighlightCallout callouts[MAX_OVERVIEW_CALLOUTS];
+    size_t callout_count = 0;
+    memset(callouts, 0, sizeof(callouts));
+    LocationAdvisorySummary advisory_summary;
+    location_advisory_init(&advisory_summary);
+    char *maintenance_status_tex = NULL;
+    char *modernization_status_tex = NULL;
+    char *vendor_status_tex = NULL;
+    char *maintenance_message_tex = NULL;
+    char *modernization_message_tex = NULL;
+    char *vendor_message_tex = NULL;
 
     fail_stage = "deriving site metadata";
     const char *site_src = NULL;
@@ -13607,6 +14410,67 @@ static int build_location_overview_tex(const ReportJob *job,
     bool timeline_financial_available = timeline_has_financial && financial_available;
     bool timeline_any_available = timeline_json && (timeline_service_available || timeline_financial_available);
 
+    double closure_rate = (total_deficiencies > 0)
+                              ? safe_divide((double)(total_deficiencies - open_deficiencies), (double)total_deficiencies)
+                              : NAN;
+    bool deficiencies_available = audit_count > 0;
+
+    char *json_error = NULL;
+    if (financial_json && financial_json[0]) {
+        financial_root = json_parse(financial_json, &json_error);
+        if (!financial_root && json_error) {
+            log_info("Overview: failed to parse financial summary JSON: %s", json_error);
+        }
+        free(json_error);
+        json_error = NULL;
+    }
+    if (timeline_json && timeline_json[0]) {
+        timeline_root = json_parse(timeline_json, &json_error);
+        if (!timeline_root && json_error) {
+            log_info("Overview: failed to parse timeline JSON: %s", json_error);
+        }
+        free(json_error);
+        json_error = NULL;
+    }
+
+    fail_stage = "computing advisory summary";
+    if (!compute_location_advisory(report,
+                                   service_stats,
+                                   financial_stats,
+                                   timeline_stats,
+                                   open_deficiencies,
+                                   device_count,
+                                   service_available,
+                                   financial_available,
+                                   closure_rate,
+                                   &advisory_summary)) {
+        goto cleanup;
+    }
+
+    fail_stage = "generating highlights";
+    if (!generate_highlight_callouts(report,
+                                    service_stats,
+                                    financial_stats,
+                                    financial_root,
+                                    timeline_root,
+                                    device_count,
+                                    total_deficiencies,
+                                    open_deficiencies,
+                                    closure_rate,
+                                    deficiencies_available,
+                                    service_available,
+                                    financial_available,
+                                    callouts,
+                                    MAX_OVERVIEW_CALLOUTS,
+                                    &callout_count)) {
+        goto cleanup;
+    }
+
+    json_free(financial_root);
+    financial_root = NULL;
+    json_free(timeline_root);
+    timeline_root = NULL;
+
     double tickets_per_device = (service_available && device_count > 0)
                                     ? ((double)total_service_tickets / (double)device_count)
                                     : 0.0;
@@ -13625,6 +14489,8 @@ static int build_location_overview_tex(const ReportJob *job,
         "\\usepackage{tikz}\n"
         "\\usepackage{pgfplots}\n"
         "\\usepackage{pgfplotstable}\n"
+        "\\usepackage[most]{tcolorbox}\n"
+        "\\usepackage{helvet}\n"
         "\\pgfplotsset{compat=1.18}\n"
         "\\usepgfplotslibrary{colorbrewer}\n"
         "\\definecolor{Set2-1}{HTML}{66C2A5}\n"
@@ -13634,6 +14500,16 @@ static int build_location_overview_tex(const ReportJob *job,
         "\\definecolor{Set2-5}{HTML}{A6D854}\n"
         "\\definecolor{Set2-6}{HTML}{FFD92F}\n"
         "\\definecolor{Set3-4}{HTML}{FB8072}\n"
+        "\\definecolor{CalloutAlert}{HTML}{F94144}\n"
+        "\\definecolor{CalloutWarning}{HTML}{F3722C}\n"
+        "\\definecolor{CalloutInfo}{HTML}{577590}\n"
+        "\\definecolor{CalloutPositive}{HTML}{43AA8B}\n"
+        "\\definecolor{AccentPrimary}{HTML}{1F2933}\n"
+        "\\definecolor{AccentSecondary}{HTML}{3D5AFE}\n"
+        "\\definecolor{NeutralLight}{HTML}{F5F7FA}\n"
+        "\\definecolor{NeutralBorder}{HTML}{D5DBE5}\n"
+        "\\renewcommand{\\familydefault}{\\sfdefault}\n"
+        "\\newcommand{\\sectiondivider}{\\noindent\\color{AccentPrimary}\\rule{\\textwidth}{0.8pt}\\par\\medskip}\n"
         "\\geometry{margin=1in}\n"
         "\\hypersetup{colorlinks=false}\n"
         "\\begin{document}\n\n")) goto cleanup;
@@ -13654,6 +14530,7 @@ static int build_location_overview_tex(const ReportJob *job,
 
     fail_stage = "writing at-a-glance";
     if (!buffer_append_cstr(&buf, "\\section*{At-a-Glance}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\renewcommand{\\arraystretch}{1.2}\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}p{0.35\\textwidth}}\n\\toprule\n")) goto cleanup;
     if (!buffer_appendf(&buf, "Location & %s\\\\\n", site_tex)) goto cleanup;
@@ -13693,8 +14570,229 @@ static int build_location_overview_tex(const ReportJob *job,
         if (!buffer_append_cstr(&buf, "\\textit{No financial records were available for this reporting window.}\\par\n\n")) goto cleanup;
     }
 
+    fail_stage = "writing highlights";
+    if (!buffer_append_cstr(&buf, "\\section*{Analyst Highlights}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
+    if (callout_count == 0) {
+        if (!buffer_append_cstr(&buf, "\\textit{No automated highlights are available for this reporting window.}\\par\\medskip\n\n")) goto cleanup;
+    } else {
+        for (size_t i = 0; i < callout_count; ++i) {
+            HighlightCallout *co = &callouts[i];
+            const char *frame_color = "CalloutInfo";
+            if (co->severity) {
+                if (strcasecmp(co->severity, "alert") == 0) {
+                    frame_color = "CalloutAlert";
+                } else if (strcasecmp(co->severity, "warning") == 0) {
+                    frame_color = "CalloutWarning";
+                } else if (strcasecmp(co->severity, "positive") == 0) {
+                    frame_color = "CalloutPositive";
+                }
+            }
+            char *title_tex = latex_escape(co->title ? co->title : "Highlight");
+            char *detail_tex = latex_escape(co->detail ? co->detail : "Insight pending.");
+            if (!title_tex || !detail_tex) {
+                free(title_tex);
+                free(detail_tex);
+                goto cleanup;
+            }
+            if (!buffer_appendf(&buf,
+                    "\\begin{tcolorbox}[colback=%s!12,colframe=%s,boxrule=0.9pt,sharp corners,enhanced,title={\\textbf{%s}}]\\n\\small %s\\n\\end{tcolorbox}\\n\\n",
+                    frame_color,
+                    frame_color,
+                    title_tex,
+                    detail_tex)) {
+                free(title_tex);
+                free(detail_tex);
+                goto cleanup;
+            }
+            free(title_tex);
+            free(detail_tex);
+        }
+    }
+
+    fail_stage = "writing advisory";
+    if (!buffer_append_cstr(&buf, "\\section*{Operational Advisory}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
+
+    const char *maintenance_color = "CalloutInfo";
+    const char *modernization_color = "CalloutInfo";
+    const char *vendor_color = "CalloutInfo";
+    if (advisory_summary.maintenance.status) {
+        if (strcasecmp(advisory_summary.maintenance.status, "attention") == 0) {
+            maintenance_color = "CalloutWarning";
+        } else if (strcasecmp(advisory_summary.maintenance.status, "healthy") == 0) {
+            maintenance_color = "CalloutPositive";
+        } else if (strcasecmp(advisory_summary.maintenance.status, "watch") == 0) {
+            maintenance_color = "CalloutInfo";
+        }
+    }
+    if (advisory_summary.modernization.status) {
+        if (strcasecmp(advisory_summary.modernization.status, "plan") == 0 ||
+            strcasecmp(advisory_summary.modernization.status, "consider") == 0) {
+            modernization_color = "CalloutPositive";
+        } else if (strcasecmp(advisory_summary.modernization.status, "monitor") == 0 ||
+                   strcasecmp(advisory_summary.modernization.status, "defer") == 0) {
+            modernization_color = "CalloutWarning";
+        } else if (strcasecmp(advisory_summary.modernization.status, "insufficient") == 0) {
+            modernization_color = "CalloutInfo";
+        }
+    }
+    if (advisory_summary.vendor.status) {
+        if (strcasecmp(advisory_summary.vendor.status, "needs_review") == 0) {
+            vendor_color = "CalloutAlert";
+        } else if (strcasecmp(advisory_summary.vendor.status, "monitor") == 0) {
+            vendor_color = "CalloutWarning";
+        } else if (strcasecmp(advisory_summary.vendor.status, "stable") == 0) {
+            vendor_color = "CalloutPositive";
+        }
+    }
+
+    char *maintenance_status_caps = advisory_summary.maintenance.status ? strdup(advisory_summary.maintenance.status) : strdup("insufficient");
+    char *modernization_status_caps = advisory_summary.modernization.status ? strdup(advisory_summary.modernization.status) : strdup("insufficient");
+    char *vendor_status_caps = advisory_summary.vendor.status ? strdup(advisory_summary.vendor.status) : strdup("insufficient");
+    if (!maintenance_status_caps || !modernization_status_caps || !vendor_status_caps) {
+        free(maintenance_status_caps);
+        free(modernization_status_caps);
+        free(vendor_status_caps);
+        goto cleanup;
+    }
+    for (char *p = maintenance_status_caps; *p; ++p) {
+        if (*p == '_' || *p == '-') *p = ' ';
+        *p = (char)toupper((unsigned char)*p);
+    }
+    for (char *p = modernization_status_caps; *p; ++p) {
+        if (*p == '_' || *p == '-') *p = ' ';
+        *p = (char)toupper((unsigned char)*p);
+    }
+    for (char *p = vendor_status_caps; *p; ++p) {
+        if (*p == '_' || *p == '-') *p = ' ';
+        *p = (char)toupper((unsigned char)*p);
+    }
+
+    maintenance_status_tex = latex_escape(maintenance_status_caps);
+    modernization_status_tex = latex_escape(modernization_status_caps);
+    vendor_status_tex = latex_escape(vendor_status_caps);
+    free(maintenance_status_caps);
+    free(modernization_status_caps);
+    free(vendor_status_caps);
+    if (!maintenance_status_tex || !modernization_status_tex || !vendor_status_tex) {
+        free(maintenance_status_tex);
+        free(modernization_status_tex);
+        free(vendor_status_tex);
+        goto cleanup;
+    }
+
+    maintenance_message_tex = latex_escape(advisory_summary.maintenance.message ? advisory_summary.maintenance.message : "Insights pending.");
+    modernization_message_tex = latex_escape(advisory_summary.modernization.message ? advisory_summary.modernization.message : "Insights pending.");
+    vendor_message_tex = latex_escape(advisory_summary.vendor.message ? advisory_summary.vendor.message : "Insights pending.");
+    if (!maintenance_message_tex || !modernization_message_tex || !vendor_message_tex) {
+        free(maintenance_status_tex);
+        free(modernization_status_tex);
+        free(vendor_status_tex);
+        free(maintenance_message_tex);
+        free(modernization_message_tex);
+        free(vendor_message_tex);
+        goto cleanup;
+    }
+
+    if (!buffer_appendf(&buf,
+            "\\begin{tcolorbox}[colback=NeutralLight,colframe=%s,boxrule=0.8pt,sharp corners,title={\\textbf{Maintenance} \\hfill \\textcolor{%s}{\\small %s}}]\\n",
+            maintenance_color,
+            maintenance_color,
+            maintenance_status_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "\\small %s\\\n\\medskip\n", maintenance_message_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\begin{tabular}{@{}ll@{}}\n")) goto cleanup;
+    if (isfinite(advisory_summary.maintenance.pm_ratio)) {
+        if (!buffer_appendf(&buf, "PM coverage & %.0f\\%%\\\\\n", advisory_summary.maintenance.pm_ratio * 100.0)) goto cleanup;
+    }
+    if (isfinite(advisory_summary.maintenance.pm_expected) && isfinite(advisory_summary.maintenance.pm_actual)) {
+        if (!buffer_appendf(&buf, "PM expected/actual & %.1f / %.0f\\\\\n",
+                            advisory_summary.maintenance.pm_expected,
+                            advisory_summary.maintenance.pm_actual)) goto cleanup;
+    }
+    if (isfinite(advisory_summary.maintenance.tst_ratio)) {
+        if (!buffer_appendf(&buf, "Testing coverage & %.0f\\%%\\\\\n", advisory_summary.maintenance.tst_ratio * 100.0)) goto cleanup;
+    }
+    if (isfinite(advisory_summary.maintenance.tst_expected) && isfinite(advisory_summary.maintenance.tst_actual)) {
+        if (!buffer_appendf(&buf, "Testing expected/actual & %.1f / %.0f\\\\\n",
+                            advisory_summary.maintenance.tst_expected,
+                            advisory_summary.maintenance.tst_actual)) goto cleanup;
+    }
+    if (advisory_summary.maintenance.window_months > 0) {
+        if (!buffer_appendf(&buf, "Observation window & %d months\\\\\n", advisory_summary.maintenance.window_months)) goto cleanup;
+    }
+    if (!buffer_append_cstr(&buf, "\\end{tabular}\\n\\end{tcolorbox}\\n\\medskip\\n")) goto cleanup;
+
+    if (!buffer_appendf(&buf,
+            "\\begin{tcolorbox}[colback=NeutralLight,colframe=%s,boxrule=0.8pt,sharp corners,title={\\textbf{Modernization} \\hfill \\textcolor{%s}{\\small %s}}]\\n",
+            modernization_color,
+            modernization_color,
+            modernization_status_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "\\small %s\\\n\\medskip\n", modernization_message_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\begin{tabular}{@{}ll@{}}\n")) goto cleanup;
+    if (isfinite(advisory_summary.modernization.equipment_callbacks_per_device)) {
+        if (!buffer_appendf(&buf, "Equipment callbacks / device & %.2f\\\\\n", advisory_summary.modernization.equipment_callbacks_per_device)) goto cleanup;
+    }
+    if (isfinite(advisory_summary.modernization.callbacks_per_device_per_year)) {
+        if (!buffer_appendf(&buf, "Callbacks / device / yr & %.2f\\\\\n", advisory_summary.modernization.callbacks_per_device_per_year)) goto cleanup;
+    }
+    if (isfinite(advisory_summary.modernization.opex_annual)) {
+        if (!buffer_append_cstr(&buf, "Annualised OPEX & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, advisory_summary.modernization.opex_annual)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    }
+    if (isfinite(advisory_summary.modernization.expected_savings)) {
+        if (!buffer_append_cstr(&buf, "Expected savings & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, advisory_summary.modernization.expected_savings)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    }
+    if (isfinite(advisory_summary.modernization.payback_years)) {
+        if (!buffer_appendf(&buf, "Payback horizon & %.1f yrs\\\\\n", advisory_summary.modernization.payback_years)) goto cleanup;
+    }
+    if (isfinite(advisory_summary.modernization.modernization_cost)) {
+        if (!buffer_append_cstr(&buf, "Modernization cost & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, advisory_summary.modernization.modernization_cost)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    }
+    if (!buffer_append_cstr(&buf, "\\end{tabular}\\n\\end{tcolorbox}\\n\\medskip\\n")) goto cleanup;
+
+    if (!buffer_appendf(&buf,
+            "\\begin{tcolorbox}[colback=NeutralLight,colframe=%s,boxrule=0.8pt,sharp corners,title={\\textbf{Vendor} \\hfill \\textcolor{%s}{\\small %s}}]\\n",
+            vendor_color,
+            vendor_color,
+            vendor_status_tex)) goto cleanup;
+    if (!buffer_appendf(&buf, "\\small %s\\\n\\medskip\n", vendor_message_tex)) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\begin{tabular}{@{}ll@{}}\n")) goto cleanup;
+    if (isfinite(advisory_summary.vendor.denied_rate)) {
+        if (!buffer_appendf(&buf, "Denied rate & %.0f\\%%\\\\\n", advisory_summary.vendor.denied_rate * 100.0)) goto cleanup;
+    }
+    if (isfinite(advisory_summary.vendor.negotiated_rate)) {
+        if (!buffer_appendf(&buf, "Negotiated rate & %.0f\\%%\\\\\n", advisory_summary.vendor.negotiated_rate * 100.0)) goto cleanup;
+    }
+    if (isfinite(advisory_summary.vendor.challenged_rate)) {
+        if (!buffer_appendf(&buf, "Challenged rate & %.0f\\%%\\\\\n", advisory_summary.vendor.challenged_rate * 100.0)) goto cleanup;
+    }
+    if (isfinite(advisory_summary.vendor.closure_rate)) {
+        if (!buffer_appendf(&buf, "Closure rate & %.0f\\%%\\\\\n", advisory_summary.vendor.closure_rate * 100.0)) goto cleanup;
+    }
+    if (!buffer_append_cstr(&buf, "\\end{tabular}\\n\\end{tcolorbox}\\n\\medskip\\n")) goto cleanup;
+
+    free(maintenance_status_tex);
+    maintenance_status_tex = NULL;
+    free(modernization_status_tex);
+    modernization_status_tex = NULL;
+    free(vendor_status_tex);
+    vendor_status_tex = NULL;
+    free(maintenance_message_tex);
+    maintenance_message_tex = NULL;
+    free(modernization_message_tex);
+    modernization_message_tex = NULL;
+    free(vendor_message_tex);
+    vendor_message_tex = NULL;
+
     fail_stage = "writing service performance";
     if (!buffer_append_cstr(&buf, "\\section*{Service Performance}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
     if (!service_available) {
         if (!buffer_append_cstr(&buf, "\\textit{No service dispatch records were available for this reporting window.}\\\\par\n\n")) goto cleanup;
     } else {
@@ -13927,6 +15025,7 @@ static int build_location_overview_tex(const ReportJob *job,
 
     fail_stage = "writing financial overview";
     if (!buffer_append_cstr(&buf, "\\section*{Financial Overview}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
     if (!financial_available) {
         if (!buffer_append_cstr(&buf, "\\textit{No financial records were available for this reporting window.}\\\\par\n\n")) goto cleanup;
     } else {
@@ -14070,6 +15169,7 @@ static int build_location_overview_tex(const ReportJob *job,
 
     fail_stage = "writing deficiency snapshot";
     if (!buffer_append_cstr(&buf, "\\section*{Deficiency Snapshot}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
     if (!buffer_append_cstr(&buf, "\\begin{tabular}{lrr}\n\\toprule\nDevice & Open & Closed\\\\\n\\midrule\n")) goto cleanup;
     for (size_t i = 0; i < report->devices.count; ++i) {
         const ReportDevice *device = &report->devices.items[i];
@@ -14096,6 +15196,7 @@ static int build_location_overview_tex(const ReportJob *job,
 
     fail_stage = "writing timeline summary";
     if (!buffer_append_cstr(&buf, "\\section*{Timeline Summary}\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
     if (timeline_any_available) {
         char *timeline_parse_error = NULL;
         JsonValue *timeline_root = json_parse(timeline_json, &timeline_parse_error);
@@ -14473,6 +15574,16 @@ static int build_location_overview_tex(const ReportJob *job,
     success = 1;
 
 cleanup:
+    json_free(financial_root);
+    json_free(timeline_root);
+    highlight_callout_array_clear(callouts, callout_count);
+    location_advisory_clear(&advisory_summary);
+    free(maintenance_status_tex);
+    free(modernization_status_tex);
+    free(vendor_status_tex);
+    free(maintenance_message_tex);
+    free(modernization_message_tex);
+    free(vendor_message_tex);
     free(site_tex);
     free(address_tex);
     free(range_label);
@@ -14881,6 +15992,7 @@ static int build_report_latex(PGconn *conn,
 
     if (job->deficiency_only) {
         if (!buffer_append_cstr(&buf, "\\section*{Deficiency List}\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
         if (!buffer_append_cstr(&buf,
                 "\\textbf{Location}: \\assetlocation\\\\\n"
                 "\\textbf{Owner}: \\clientname\\\\\n"
