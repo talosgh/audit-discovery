@@ -2752,6 +2752,45 @@ fieldset.modal-field legend {
   border-bottom: 1px solid var(--border);
 }
 
+.metric-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.metric-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(70, 166, 180, 0.16);
+  overflow: hidden;
+}
+
+.metric-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+
+.metric-bar-fill--tickets {
+  background: linear-gradient(90deg, #43aa8b, #3d8f76);
+}
+
+.metric-bar-fill--spend {
+  background: linear-gradient(90deg, #577590, #335066);
+}
+
+.metric-bar-fill--savings {
+  background: linear-gradient(90deg, #f3722c, #f8961e);
+}
+
+.metric-bar-fill--closure {
+  background: linear-gradient(90deg, #277da1, #4bb3fd);
+}
+
+.metric-bar-fill--open {
+  background: linear-gradient(90deg, #f94144, #f25f5c);
+}
+
 .window-table tbody tr.baseline {
   background: rgba(70, 166, 180, 0.08);
 }

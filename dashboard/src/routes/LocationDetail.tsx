@@ -177,6 +177,40 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const serviceAvailable = createMemo(() => serviceStatus() !== 'missing');
   const financialAvailable = createMemo(() => financialStatus() !== 'missing');
   const overviewWindows = createMemo(() => analyticsOverview()?.windows ?? []);
+  const overviewMetricScales = createMemo(() => {
+    const windows = overviewWindows();
+    let tickets = 0;
+    let spendPerDevice = 0;
+    let savingsRate = 0;
+    let closureRate = 0;
+    let openPerDevice = 0;
+    windows.forEach((window) => {
+      const metrics = window.metrics;
+      if (!metrics) return;
+      if (metrics.tickets_per_device != null && Number.isFinite(metrics.tickets_per_device)) {
+        tickets = Math.max(tickets, Math.abs(metrics.tickets_per_device));
+      }
+      if (metrics.spend_per_device != null && Number.isFinite(metrics.spend_per_device)) {
+        spendPerDevice = Math.max(spendPerDevice, Math.abs(metrics.spend_per_device));
+      }
+      if (metrics.savings_rate != null && Number.isFinite(metrics.savings_rate)) {
+        savingsRate = Math.max(savingsRate, Math.abs(metrics.savings_rate));
+      }
+      if (metrics.closure_rate != null && Number.isFinite(metrics.closure_rate)) {
+        closureRate = Math.max(closureRate, Math.abs(metrics.closure_rate));
+      }
+      if (metrics.open_per_device != null && Number.isFinite(metrics.open_per_device)) {
+        openPerDevice = Math.max(openPerDevice, Math.abs(metrics.open_per_device));
+      }
+    });
+    return {
+      tickets: tickets > 0 ? tickets : 1,
+      spendPerDevice: spendPerDevice > 0 ? spendPerDevice : 1,
+      savingsRate: savingsRate > 0 ? savingsRate : 1,
+      closureRate: closureRate > 0 ? closureRate : 1,
+      openPerDevice: openPerDevice > 0 ? openPerDevice : 1
+    };
+  });
   const serviceActivitySummary = createMemo(() => serviceSummary()?.activity_summary ?? []);
   const serviceActivityBreakdown = createMemo(() => serviceSummary()?.activity_breakdown ?? []);
   const financialSavingsTrend = createMemo(() => financialSummary()?.monthly_savings ?? []);
@@ -2149,11 +2183,71 @@ const dataCoverage = createMemo(() => {
                                     describeOverviewRange(window.range_start ?? undefined, window.range_end ?? undefined, window.preset ?? undefined)}
                                 </div>
                               </th>
-                              <td>{formatMaybeNumber(window.metrics.tickets_per_device, 2)}</td>
-                              <td>{window.metrics.spend_per_device != null ? formatCurrency(window.metrics.spend_per_device) : '—'}</td>
-                              <td>{formatRatioPercent(window.metrics.savings_rate)}</td>
-                              <td>{formatRatioPercent(window.metrics.closure_rate)}</td>
-                              <td>{formatMaybeNumber(window.metrics.open_per_device, 2)}</td>
+                              <td>
+                                <div class="metric-cell">
+                                  <span>{formatMaybeNumber(window.metrics.tickets_per_device, 2)}</span>
+                                  <Show when={window.metrics.tickets_per_device != null}>
+                                    <div class="metric-bar" aria-hidden="true">
+                                      <div
+                                        class="metric-bar-fill metric-bar-fill--tickets"
+                                        style={{ width: `${Math.min(100, Math.abs((window.metrics.tickets_per_device ?? 0) / overviewMetricScales().tickets) * 100)}%` }}
+                                      />
+                                    </div>
+                                  </Show>
+                                </div>
+                              </td>
+                              <td>
+                                <div class="metric-cell">
+                                  <span>{window.metrics.spend_per_device != null ? formatCurrency(window.metrics.spend_per_device) : '—'}</span>
+                                  <Show when={window.metrics.spend_per_device != null}>
+                                    <div class="metric-bar" aria-hidden="true">
+                                      <div
+                                        class="metric-bar-fill metric-bar-fill--spend"
+                                        style={{ width: `${Math.min(100, Math.abs((window.metrics.spend_per_device ?? 0) / overviewMetricScales().spendPerDevice) * 100)}%` }}
+                                      />
+                                    </div>
+                                  </Show>
+                                </div>
+                              </td>
+                              <td>
+                                <div class="metric-cell">
+                                  <span>{formatRatioPercent(window.metrics.savings_rate)}</span>
+                                  <Show when={window.metrics.savings_rate != null}>
+                                    <div class="metric-bar" aria-hidden="true">
+                                      <div
+                                        class="metric-bar-fill metric-bar-fill--savings"
+                                        style={{ width: `${Math.min(100, Math.abs((window.metrics.savings_rate ?? 0) / overviewMetricScales().savingsRate) * 100)}%` }}
+                                      />
+                                    </div>
+                                  </Show>
+                                </div>
+                              </td>
+                              <td>
+                                <div class="metric-cell">
+                                  <span>{formatRatioPercent(window.metrics.closure_rate)}</span>
+                                  <Show when={window.metrics.closure_rate != null}>
+                                    <div class="metric-bar" aria-hidden="true">
+                                      <div
+                                        class="metric-bar-fill metric-bar-fill--closure"
+                                        style={{ width: `${Math.min(100, Math.abs((window.metrics.closure_rate ?? 0) / overviewMetricScales().closureRate) * 100)}%` }}
+                                      />
+                                    </div>
+                                  </Show>
+                                </div>
+                              </td>
+                              <td>
+                                <div class="metric-cell">
+                                  <span>{formatMaybeNumber(window.metrics.open_per_device, 2)}</span>
+                                  <Show when={window.metrics.open_per_device != null}>
+                                    <div class="metric-bar" aria-hidden="true">
+                                      <div
+                                        class="metric-bar-fill metric-bar-fill--open"
+                                        style={{ width: `${Math.min(100, Math.abs((window.metrics.open_per_device ?? 0) / overviewMetricScales().openPerDevice) * 100)}%` }}
+                                      />
+                                    </div>
+                                  </Show>
+                                </div>
+                              </td>
                             </tr>
                           )}
                         </For>
