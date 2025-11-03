@@ -13627,6 +13627,13 @@ static int build_location_overview_tex(const ReportJob *job,
         "\\usepackage{pgfplotstable}\n"
         "\\pgfplotsset{compat=1.18}\n"
         "\\usepgfplotslibrary{colorbrewer}\n"
+        "\\definecolor{Set2-1}{HTML}{66C2A5}\n"
+        "\\definecolor{Set2-2}{HTML}{FC8D62}\n"
+        "\\definecolor{Set2-3}{HTML}{8DA0CB}\n"
+        "\\definecolor{Set2-4}{HTML}{E78AC3}\n"
+        "\\definecolor{Set2-5}{HTML}{A6D854}\n"
+        "\\definecolor{Set2-6}{HTML}{FFD92F}\n"
+        "\\definecolor{Set3-4}{HTML}{FB8072}\n"
         "\\geometry{margin=1in}\n"
         "\\hypersetup{colorlinks=false}\n"
         "\\begin{document}\n\n")) goto cleanup;
