@@ -1553,7 +1553,7 @@ static char *build_financial_summary_json(PGconn *conn, const LocationProfile *p
 static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, const char *range_start, const char *range_end, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out);
 
 static int collect_overview_window(PGconn *conn,
-                                   const ReportJob *job,
+                                   const char *address,
                                    const LocationProfile *profile,
                                    const ReportData *report,
                                    const OverviewWindowSpec *spec,
@@ -1564,7 +1564,7 @@ static int collect_overview_window(PGconn *conn,
                                    double closure_rate,
                                    double open_per_device,
                                    char **error_out) {
-    if (!conn || !job || !spec || !window) {
+    if (!conn || !address || !spec || !window) {
         if (error_out && !*error_out) {
             *error_out = strdup("Invalid overview collection parameters");
         }
@@ -1616,7 +1616,7 @@ static int collect_overview_window(PGconn *conn,
     }
 
     char *analytics_error = NULL;
-    window->service_json = build_service_summary_json(conn, profile, job->address, window->range_start, window->range_end, &window->service_stats, &analytics_error);
+    window->service_json = build_service_summary_json(conn, profile, address, window->range_start, window->range_end, &window->service_stats, &analytics_error);
     if (!window->service_json) {
         if (error_out && !*error_out) {
             *error_out = analytics_error ? analytics_error : strdup("Failed to load service analytics");
@@ -1640,7 +1640,7 @@ static int collect_overview_window(PGconn *conn,
     free(analytics_error);
     analytics_error = NULL;
 
-    window->timeline_json = build_service_financial_timeline_json(conn, profile, job->address, window->range_start, window->range_end, &window->timeline_stats, &window->timeline_service_available, &window->timeline_financial_available, &analytics_error);
+    window->timeline_json = build_service_financial_timeline_json(conn, profile, address, window->range_start, window->range_end, &window->timeline_stats, &window->timeline_service_available, &window->timeline_financial_available, &analytics_error);
     if (!window->timeline_json) {
         if (error_out && !*error_out) {
             *error_out = analytics_error ? analytics_error : strdup("Failed to compute timeline analytics");
@@ -1705,6 +1705,53 @@ oom:
 fail:
     overview_window_clear(window);
     return 0;
+}
+
+static int collect_overview_windows(PGconn *conn,
+                                    const char *address,
+                                    const LocationProfile *profile,
+                                    const ReportData *report,
+                                    const OverviewWindowSpec *specs,
+                                    size_t spec_count,
+                                    int device_count,
+                                    int total_deficiencies,
+                                    int open_deficiencies,
+                                    double closure_rate,
+                                    double open_per_device,
+                                    OverviewWindow *windows,
+                                    size_t *window_count_out,
+                                    char **error_out) {
+    if (!windows) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid overview window buffer");
+        }
+        return 0;
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < spec_count; ++i) {
+        if (!collect_overview_window(conn,
+                                     address,
+                                     profile,
+                                     report,
+                                     &specs[i],
+                                     &windows[count],
+                                     device_count,
+                                     total_deficiencies,
+                                     open_deficiencies,
+                                     closure_rate,
+                                     open_per_device,
+                                     error_out)) {
+            for (size_t j = 0; j < count; ++j) {
+                overview_window_clear(&windows[j]);
+            }
+            return 0;
+        }
+        count += 1;
+    }
+    if (window_count_out) {
+        *window_count_out = count;
+    }
+    return 1;
 }
 
 static char *format_window_range_label(const OverviewWindow *window, const ReportData *report) {
@@ -2408,10 +2455,11 @@ static const char *determine_trend_direction(double latest, double previous, dou
 static double forecast_next_value(double latest, double previous);
 static bool string_is_integer(const char *text);
 static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, const char *range_start, const char *range_end, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out);
-static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats, bool timeline_has_service, bool timeline_has_financial);
+static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats, bool timeline_has_service, bool timeline_has_financial, const OverviewWindow *overview_windows, size_t overview_window_count);
 static void overview_window_init(OverviewWindow *window);
 static void overview_window_clear(OverviewWindow *window);
-static int collect_overview_window(PGconn *conn, const ReportJob *job, const LocationProfile *profile, const ReportData *report, const OverviewWindowSpec *spec, OverviewWindow *window, int device_count, int total_deficiencies, int open_deficiencies, double closure_rate, double open_per_device, char **error_out);
+static int collect_overview_window(PGconn *conn, const char *address, const LocationProfile *profile, const ReportData *report, const OverviewWindowSpec *spec, OverviewWindow *window, int device_count, int total_deficiencies, int open_deficiencies, double closure_rate, double open_per_device, char **error_out);
+static int collect_overview_windows(PGconn *conn, const char *address, const LocationProfile *profile, const ReportData *report, const OverviewWindowSpec *specs, size_t spec_count, int device_count, int total_deficiencies, int open_deficiencies, double closure_rate, double open_per_device, OverviewWindow *windows, size_t *window_count_out, char **error_out);
 static int generate_overview_callouts(const ReportData *report, OverviewWindow *window, const OverviewWindow *baseline);
 static char *format_window_range_label(const OverviewWindow *window, const ReportData *report);
 static int buffer_append_signed_percent(Buffer *buf, double ratio, int precision);
@@ -2599,10 +2647,75 @@ static char *build_location_detail_payload(PGconn *conn, const LocationDetailReq
             }
         }
     }
+    OverviewWindow overview_windows[OVERVIEW_WINDOW_COUNT];
+    for (size_t i = 0; i < OVERVIEW_WINDOW_COUNT; ++i) {
+        overview_window_init(&overview_windows[i]);
+    }
+    size_t overview_window_count = 0;
+    bool overview_windows_ready = false;
+    char *overview_window_error = NULL;
+
+    if (service_json || financial_json) {
+        int installed_devices = (profile.device_count.has_value) ? profile.device_count.value : 0;
+        int device_count = installed_devices > 0 ? installed_devices : (int)report.summary.total_devices;
+        int total_deficiencies = report.summary.total_deficiencies;
+        int open_deficiencies = (int)open_deficiency_count;
+        double closure_rate = (total_deficiencies > 0)
+                                  ? safe_divide((double)(total_deficiencies - open_deficiencies), (double)total_deficiencies)
+                                  : NAN;
+        double open_per_device = (device_count > 0)
+                                     ? safe_divide((double)open_deficiencies, (double)device_count)
+                                     : NAN;
+
+        if (collect_overview_windows(conn,
+                                     lookup_address,
+                                     &profile,
+                                     &report,
+                                     OVERVIEW_WINDOW_SPECS,
+                                     OVERVIEW_WINDOW_COUNT,
+                                     device_count,
+                                     total_deficiencies,
+                                     open_deficiencies,
+                                     closure_rate,
+                                     open_per_device,
+                                     overview_windows,
+                                     &overview_window_count,
+                                     &overview_window_error)) {
+            if (overview_window_count > 0) {
+                OverviewWindow *baseline = &overview_windows[0];
+                for (size_t i = 0; i < overview_window_count; ++i) {
+                    if (!generate_overview_callouts(&report, &overview_windows[i], baseline)) {
+                        log_info("Overview: failed to derive callouts for window %s", overview_windows[i].label ? overview_windows[i].label : "(unnamed)");
+                    }
+                }
+                overview_windows_ready = true;
+            }
+        } else {
+            if (overview_window_error) {
+                log_info("Overview window collection failed for %s: %s", lookup_address ? lookup_address : "(unknown)", overview_window_error);
+            }
+        }
+        free(overview_window_error);
+        overview_window_error = NULL;
+    }
+
     char *analytics_json = NULL;
     if (service_json || financial_json) {
         const char *timeline_payload = timeline_json && timeline_json[0] ? timeline_json : "[]";
-        analytics_json = build_location_analytics_json(&report, &profile, open_deficiency_count, &service_stats, &financial_stats, timeline_payload, &timeline_stats, timeline_service, timeline_financial);
+        analytics_json = build_location_analytics_json(&report,
+                                                       &profile,
+                                                       open_deficiency_count,
+                                                       &service_stats,
+                                                       &financial_stats,
+                                                       timeline_payload,
+                                                       &timeline_stats,
+                                                       timeline_service,
+                                                       timeline_financial,
+                                                       overview_windows_ready ? overview_windows : NULL,
+                                                       overview_windows_ready ? overview_window_count : 0);
+    }
+    for (size_t i = 0; i < OVERVIEW_WINDOW_COUNT; ++i) {
+        overview_window_clear(&overview_windows[i]);
     }
     report_data_clear(&report);
 
@@ -9923,7 +10036,7 @@ static int buffer_append_double_or_null(Buffer *buf, double value, int precision
     return buffer_appendf(buf, fmt, value);
 }
 
-static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats, bool timeline_has_service, bool timeline_has_financial) {
+static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats, bool timeline_has_service, bool timeline_has_financial, const OverviewWindow *overview_windows, size_t overview_window_count) {
     if (!report) {
         return NULL;
     }
@@ -10096,6 +10209,115 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
     if (!buffer_append_cstr(&buf, "\"financial\":")) goto oom;
     if (!buffer_append_json_string(&buf, coverage_status(financial_available_timeline))) goto oom;
     if (!buffer_append_char(&buf, '}')) goto oom;
+    if (!buffer_append_cstr(&buf, ",\"windows\":[")) goto oom;
+    for (size_t i = 0; i < overview_window_count; ++i) {
+        const OverviewWindow *win = &overview_windows[i];
+        if (i > 0) {
+            if (!buffer_append_char(&buf, ',')) goto oom;
+        }
+        char *range_label = format_window_range_label(win, report);
+        if (!buffer_append_char(&buf, '{')) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_cstr(&buf, "\"label\":")) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_json_string(&buf, win->label)) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_cstr(&buf, ",\"preset\":")) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_json_string(&buf, win->preset)) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_cstr(&buf, ",\"baseline\":")) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_cstr(&buf, (i == 0) ? "true" : "false")) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_cstr(&buf, ",\"range_start\":")) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_json_string(&buf, win->range_start)) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_cstr(&buf, ",\"range_end\":")) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_json_string(&buf, win->range_end)) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_cstr(&buf, ",\"range_label\":")) {
+            free(range_label);
+            goto oom;
+        }
+        if (!buffer_append_json_string(&buf, range_label)) {
+            free(range_label);
+            goto oom;
+        }
+        free(range_label);
+        if (!buffer_append_cstr(&buf, ",\"service_available\":")) goto oom;
+        if (!buffer_append_cstr(&buf, win->service_available ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"financial_available\":")) goto oom;
+        if (!buffer_append_cstr(&buf, win->financial_available ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"deficiencies_available\":")) goto oom;
+        if (!buffer_append_cstr(&buf, win->deficiencies_available ? "true" : "false")) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"metrics\":{")) goto oom;
+        if (!buffer_append_cstr(&buf, "\"device_count\":")) goto oom;
+        if (!buffer_appendf(&buf, "%d", win->device_count)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"total_deficiencies\":")) goto oom;
+        if (!buffer_appendf(&buf, "%d", win->total_deficiencies)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"open_deficiencies\":")) goto oom;
+        if (!buffer_appendf(&buf, "%d", win->open_deficiencies)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"tickets_per_device\":")) goto oom;
+        if (!buffer_append_double_or_null(&buf, win->tickets_per_device, 3)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"service_hours\":")) goto oom;
+        if (!buffer_append_double_or_null(&buf, win->service_hours, 2)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"spend_total\":")) goto oom;
+        if (!buffer_append_double_or_null(&buf, win->spend_total, 0)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"spend_per_device\":")) goto oom;
+        if (!buffer_append_double_or_null(&buf, win->spend_per_device, 0)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"savings_total\":")) goto oom;
+        if (!buffer_append_double_or_null(&buf, win->savings_total, 0)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"savings_rate\":")) goto oom;
+        if (!buffer_append_double_or_null(&buf, win->savings_rate, 4)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"closure_rate\":")) goto oom;
+        if (!buffer_append_double_or_null(&buf, win->closure_rate, 4)) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"open_per_device\":")) goto oom;
+        if (!buffer_append_double_or_null(&buf, win->open_per_device, 3)) goto oom;
+        if (!buffer_append_char(&buf, '}')) goto oom;
+        if (!buffer_append_cstr(&buf, ",\"callouts\":[")) goto oom;
+        for (size_t c = 0; c < win->callout_count; ++c) {
+            const HighlightCallout *co = &win->callouts[c];
+            if (c > 0) {
+                if (!buffer_append_char(&buf, ',')) goto oom;
+            }
+            if (!buffer_append_char(&buf, '{')) goto oom;
+            if (!buffer_append_cstr(&buf, "\"severity\":")) goto oom;
+            if (!buffer_append_json_string(&buf, co->severity ? co->severity : "info")) goto oom;
+            if (!buffer_append_cstr(&buf, ",\"title\":")) goto oom;
+            if (!buffer_append_json_string(&buf, co->title)) goto oom;
+            if (!buffer_append_cstr(&buf, ",\"detail\":")) goto oom;
+            if (!buffer_append_json_string(&buf, co->detail)) goto oom;
+            if (!buffer_append_char(&buf, '}')) goto oom;
+        }
+        if (!buffer_append_char(&buf, ']')) goto oom;
+        if (!buffer_append_char(&buf, '}')) goto oom;
+    }
+    if (!buffer_append_char(&buf, ']')) goto oom;
     if (!buffer_append_char(&buf, '}')) goto oom;
 
     if (!buffer_append_cstr(&buf, ",\"advisory\":{")) goto oom;
@@ -13562,36 +13784,35 @@ narrative_join:
         double open_per_device = (device_count > 0) ? ((double)open_deficiencies / (double)device_count) : NAN;
 
         size_t window_count = 0;
-        for (size_t i = 0; i < spec_count; ++i) {
-            char *window_error = NULL;
-            if (!collect_overview_window(conn,
-                                         job,
-                                         profile_ptr,
-                                         &report,
-                                         &specs[i],
-                                         &windows[window_count],
-                                         device_count,
-                                         total_deficiencies,
-                                         open_deficiencies,
-                                         closure_rate,
-                                         open_per_device,
-                                         &window_error)) {
-                if (error_out && !*error_out) {
-                    *error_out = window_error ? window_error : strdup("Failed to compute overview analytics");
-                } else {
-                    free(window_error);
-                }
-                for (size_t clear_idx = 0; clear_idx <= window_count; ++clear_idx) {
-                    overview_window_clear(&windows[clear_idx]);
-                }
-                for (size_t label_idx = OVERVIEW_WINDOW_COUNT; label_idx < spec_count; ++label_idx) {
-                    free(dynamic_labels[label_idx]);
-                }
-                goto cleanup;
+        char *window_error = NULL;
+        if (!collect_overview_windows(conn,
+                                      job->address,
+                                      profile_ptr,
+                                      &report,
+                                      specs,
+                                      spec_count,
+                                      device_count,
+                                      total_deficiencies,
+                                      open_deficiencies,
+                                      closure_rate,
+                                      open_per_device,
+                                      windows,
+                                      &window_count,
+                                      &window_error)) {
+            if (error_out && !*error_out) {
+                *error_out = window_error ? window_error : strdup("Failed to compute overview analytics");
+            } else {
+                free(window_error);
             }
-            free(window_error);
-            window_count += 1;
+            for (size_t clear_idx = 0; clear_idx < OVERVIEW_WINDOW_MAX; ++clear_idx) {
+                overview_window_clear(&windows[clear_idx]);
+            }
+            for (size_t label_idx = OVERVIEW_WINDOW_COUNT; label_idx < spec_count; ++label_idx) {
+                free(dynamic_labels[label_idx]);
+            }
+            goto cleanup;
         }
+        free(window_error);
 
         if (!build_location_overview_tex(job, profile_ptr, &report, windows, window_count, tex_path, &latex_error)) {
             if (error_out && !*error_out) {

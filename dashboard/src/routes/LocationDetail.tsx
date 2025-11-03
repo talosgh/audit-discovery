@@ -176,6 +176,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const deficiencyAvailable = createMemo(() => deficiencyStatus() !== 'missing');
   const serviceAvailable = createMemo(() => serviceStatus() !== 'missing');
   const financialAvailable = createMemo(() => financialStatus() !== 'missing');
+  const overviewWindows = createMemo(() => analyticsOverview()?.windows ?? []);
   const serviceActivitySummary = createMemo(() => serviceSummary()?.activity_summary ?? []);
   const serviceActivityBreakdown = createMemo(() => serviceSummary()?.activity_breakdown ?? []);
   const financialSavingsTrend = createMemo(() => financialSummary()?.monthly_savings ?? []);
@@ -2114,6 +2115,75 @@ const dataCoverage = createMemo(() => {
                   )}
                 </For>
               </div>
+              <Show when={overviewWindows().length > 0}>
+                <section class="overview-windows-card" aria-labelledby="window-comparison-title">
+                  <header class="overview-windows-header">
+                    <h2 id="window-comparison-title">Time Window Comparison</h2>
+                    <p>All-time history with fiscal, quarterly, and monthly performance snapshots.</p>
+                  </header>
+                  <div class="window-table-wrapper">
+                    <table class="window-table">
+                      <thead>
+                        <tr>
+                          <th scope="col">Window</th>
+                          <th scope="col">Tickets&nbsp;/&nbsp;device</th>
+                          <th scope="col">Spend&nbsp;/&nbsp;device</th>
+                          <th scope="col">Savings rate</th>
+                          <th scope="col">Closure rate</th>
+                          <th scope="col">Open issues&nbsp;/&nbsp;device</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <For each={overviewWindows()}>
+                          {(window) => (
+                            <tr classList={{ baseline: window.baseline }}>
+                              <th scope="row">
+                                <div class="window-label">
+                                  <span>{window.label ?? window.preset ?? 'Window'}</span>
+                                  <Show when={window.baseline}>
+                                    <span class="window-badge">All history</span>
+                                  </Show>
+                                </div>
+                                <div class="window-range">
+                                  {window.range_label ??
+                                    describeOverviewRange(window.range_start ?? undefined, window.range_end ?? undefined, window.preset ?? undefined)}
+                                </div>
+                              </th>
+                              <td>{formatMaybeNumber(window.metrics.tickets_per_device, 2)}</td>
+                              <td>{window.metrics.spend_per_device != null ? formatCurrency(window.metrics.spend_per_device) : '—'}</td>
+                              <td>{formatRatioPercent(window.metrics.savings_rate)}</td>
+                              <td>{formatRatioPercent(window.metrics.closure_rate)}</td>
+                              <td>{formatMaybeNumber(window.metrics.open_per_device, 2)}</td>
+                            </tr>
+                          )}
+                        </For>
+                      </tbody>
+                    </table>
+                  </div>
+                  <For each={overviewWindows()}>
+                    {(window) => (
+                      <Show when={(window.callouts ?? []).length > 0}>
+                        <div class="window-callouts">
+                          <h3>{window.label ?? window.preset ?? 'Window'} Highlights</h3>
+                          <div class="insight-callouts">
+                            <For each={window.callouts}>
+                              {(callout) => (
+                                <article class={`insight-callout insight-callout--${callout.severity}`} role="note">
+                                  <div class="callout-icon" aria-hidden="true">{calloutIcons[callout.severity]}</div>
+                                  <div class="callout-body">
+                                    <h3>{callout.title}</h3>
+                                    <p>{callout.detail}</p>
+                                  </div>
+                                </article>
+                              )}
+                            </For>
+                          </div>
+                        </div>
+                      </Show>
+                    )}
+                  </For>
+                </section>
+              </Show>
             </section>
 
             <Show when={insightCallouts().length > 0}>

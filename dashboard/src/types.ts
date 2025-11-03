@@ -467,6 +467,40 @@ export interface TimelinePoint {
   other?: number;
 }
 
+export interface OverviewWindowCallout {
+  severity: 'alert' | 'warning' | 'info' | 'positive';
+  title: string;
+  detail: string;
+}
+
+export interface OverviewWindowMetrics {
+  device_count: number;
+  total_deficiencies: number;
+  open_deficiencies: number;
+  tickets_per_device: number | null;
+  service_hours: number | null;
+  spend_total: number | null;
+  spend_per_device: number | null;
+  savings_total: number | null;
+  savings_rate: number | null;
+  closure_rate: number | null;
+  open_per_device: number | null;
+}
+
+export interface OverviewWindowSummary {
+  label: string | null;
+  preset: string | null;
+  baseline: boolean;
+  range_start: string | null;
+  range_end: string | null;
+  range_label: string | null;
+  service_available: boolean;
+  financial_available: boolean;
+  deficiencies_available: boolean;
+  metrics: OverviewWindowMetrics;
+  callouts: OverviewWindowCallout[];
+}
+
 export interface LocationAnalyticsOverview {
   device_count: number;
   data_coverage: {
@@ -474,6 +508,7 @@ export interface LocationAnalyticsOverview {
     service: CoverageStatus;
     financial: CoverageStatus;
   };
+  windows: OverviewWindowSummary[];
 }
 
 export interface MaintenanceAdvisory {
