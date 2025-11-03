@@ -422,6 +422,55 @@ typedef struct {
     VendorAdvisorySummary vendor;
 } LocationAdvisorySummary;
 
+#define OVERVIEW_WINDOW_COUNT 4
+#define OVERVIEW_WINDOW_MAX (OVERVIEW_WINDOW_COUNT + 2)
+
+typedef struct {
+    const char *preset;
+    const char *label;
+    const char *override_start;
+    const char *override_end;
+} OverviewWindowSpec;
+
+typedef struct {
+    const char *label;
+    const char *preset;
+    char *range_start;
+    char *range_end;
+    bool service_available;
+    bool financial_available;
+    bool deficiencies_available;
+    ServiceAnalytics service_stats;
+    FinancialAnalytics financial_stats;
+    TimelineStats timeline_stats;
+    bool timeline_service_available;
+    bool timeline_financial_available;
+    char *service_json;
+    char *financial_json;
+    char *timeline_json;
+    HighlightCallout callouts[OVERVIEW_CALLOUT_OUTPUT_LIMIT];
+    size_t callout_count;
+    LocationAdvisorySummary advisory;
+    int device_count;
+    int total_deficiencies;
+    int open_deficiencies;
+    double closure_rate;
+    double open_per_device;
+    double tickets_per_device;
+    double service_hours;
+    double spend_total;
+    double spend_per_device;
+    double savings_total;
+    double savings_rate;
+} OverviewWindow;
+
+static const OverviewWindowSpec OVERVIEW_WINDOW_SPECS[OVERVIEW_WINDOW_COUNT] = {
+    {"all_time", "All Time", NULL, NULL},
+    {"last_fiscal", "Last Fiscal Year", NULL, NULL},
+    {"last_quarter", "Last Quarter", NULL, NULL},
+    {"last_month", "Last Month", NULL, NULL}
+};
+
 static const char *REPORT_SUMMARY_DOCSTRING =
     "Contains high-level metrics about the elevator audit.\n"
     "- total_deficiencies: Total number of deficiencies/violations across all devices.\n"
@@ -757,7 +806,11 @@ static bool compute_preset_range(const char *preset, char **start_out, char **en
     struct tm start_tm = now_tm;
     struct tm end_tm = now_tm;
 
-    if (strcasecmp(preset, "last_month") == 0) {
+    if (strcasecmp(preset, "all_time") == 0) {
+        *start_out = NULL;
+        *end_out = NULL;
+        return true;
+    } else if (strcasecmp(preset, "last_month") == 0) {
         start_tm.tm_mday = 1;
         start_tm.tm_mon -= 1;
         if (!normalize_tm(&start_tm)) goto preset_fail;
@@ -1044,7 +1097,22 @@ static int buffer_append_percent(Buffer *buf, double ratio, int precision) {
     char fmt[16];
     snprintf(fmt, sizeof(fmt), "%%.%df", precision);
     return buffer_appendf(buf, fmt, ratio * 100.0) &&
-           buffer_append_cstr(buf, "\\\\%");
+           buffer_append_cstr(buf, "\\%");
+}
+
+static int buffer_append_signed_percent(Buffer *buf, double ratio, int precision) {
+    if (!buf) {
+        return 0;
+    }
+    if (!isfinite(ratio)) {
+        return buffer_append_cstr(buf, "N/A");
+    }
+    if (precision < 0) precision = 1;
+    if (precision > 3) precision = 3;
+    char fmt[16];
+    snprintf(fmt, sizeof(fmt), "%%+.%df", precision);
+    return buffer_appendf(buf, fmt, ratio * 100.0) &&
+           buffer_append_cstr(buf, "\\%");
 }
 
 static char *alloc_printf(const char *fmt, ...) {
@@ -1449,6 +1517,232 @@ static int compute_location_advisory(const ReportData *report,
 
     (void)open_deficiencies;
     return 1;
+}
+
+static void overview_window_init(OverviewWindow *window) {
+    if (!window) {
+        return;
+    }
+    memset(window, 0, sizeof(*window));
+    location_advisory_init(&window->advisory);
+}
+
+static void overview_window_clear(OverviewWindow *window) {
+    if (!window) {
+        return;
+    }
+    highlight_callout_array_clear(window->callouts, window->callout_count);
+    window->callout_count = 0;
+    location_advisory_clear(&window->advisory);
+    free(window->range_start);
+    free(window->range_end);
+    free(window->service_json);
+    free(window->financial_json);
+    free(window->timeline_json);
+    window->range_start = NULL;
+    window->range_end = NULL;
+    window->service_json = NULL;
+    window->financial_json = NULL;
+    window->timeline_json = NULL;
+    window->label = NULL;
+    window->preset = NULL;
+}
+
+static char *build_service_summary_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, const char *range_start, const char *range_end, ServiceAnalytics *analytics_out, char **error_out);
+static char *build_financial_summary_json(PGconn *conn, const LocationProfile *profile, const char *range_start, const char *range_end, FinancialAnalytics *analytics_out, char **error_out);
+static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, const char *range_start, const char *range_end, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out);
+
+static int collect_overview_window(PGconn *conn,
+                                   const ReportJob *job,
+                                   const LocationProfile *profile,
+                                   const ReportData *report,
+                                   const OverviewWindowSpec *spec,
+                                   OverviewWindow *window,
+                                   int device_count,
+                                   int total_deficiencies,
+                                   int open_deficiencies,
+                                   double closure_rate,
+                                   double open_per_device,
+                                   char **error_out) {
+    if (!conn || !job || !spec || !window) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Invalid overview collection parameters");
+        }
+        return 0;
+    }
+
+    overview_window_clear(window);
+    overview_window_init(window);
+    window->label = spec->label;
+    window->preset = spec->preset;
+    window->device_count = device_count;
+    window->total_deficiencies = total_deficiencies;
+    window->open_deficiencies = open_deficiencies;
+    window->closure_rate = closure_rate;
+    window->open_per_device = open_per_device;
+    window->deficiencies_available = true;
+
+    char *range_error = NULL;
+    if ((spec->override_start && spec->override_start[0]) ||
+        (spec->override_end && spec->override_end[0])) {
+        if (spec->override_start && spec->override_start[0]) {
+            window->range_start = strdup(spec->override_start);
+            if (!window->range_start) goto oom;
+        }
+        if (spec->override_end && spec->override_end[0]) {
+            window->range_end = strdup(spec->override_end);
+            if (!window->range_end) goto oom;
+        }
+    } else if (spec->preset && strcasecmp(spec->preset, "all_time") == 0) {
+        if (report && report->summary.audit_range.start) {
+            window->range_start = strdup(report->summary.audit_range.start);
+            if (!window->range_start) goto oom;
+        }
+        if (report && report->summary.audit_range.end) {
+            window->range_end = strdup(report->summary.audit_range.end);
+            if (!window->range_end) goto oom;
+        }
+    } else {
+        if (!compute_preset_range(spec->preset, &window->range_start, &window->range_end, &range_error)) {
+            if (error_out && !*error_out) {
+                *error_out = range_error ? range_error : strdup("Failed to compute report range");
+            } else {
+                free(range_error);
+            }
+            goto fail;
+        }
+        free(range_error);
+        range_error = NULL;
+    }
+
+    char *analytics_error = NULL;
+    window->service_json = build_service_summary_json(conn, profile, job->address, window->range_start, window->range_end, &window->service_stats, &analytics_error);
+    if (!window->service_json) {
+        if (error_out && !*error_out) {
+            *error_out = analytics_error ? analytics_error : strdup("Failed to load service analytics");
+        } else {
+            free(analytics_error);
+        }
+        goto fail;
+    }
+    free(analytics_error);
+    analytics_error = NULL;
+
+    window->financial_json = build_financial_summary_json(conn, profile, window->range_start, window->range_end, &window->financial_stats, &analytics_error);
+    if (!window->financial_json) {
+        if (error_out && !*error_out) {
+            *error_out = analytics_error ? analytics_error : strdup("Failed to load financial analytics");
+        } else {
+            free(analytics_error);
+        }
+        goto fail;
+    }
+    free(analytics_error);
+    analytics_error = NULL;
+
+    window->timeline_json = build_service_financial_timeline_json(conn, profile, job->address, window->range_start, window->range_end, &window->timeline_stats, &window->timeline_service_available, &window->timeline_financial_available, &analytics_error);
+    if (!window->timeline_json) {
+        if (error_out && !*error_out) {
+            *error_out = analytics_error ? analytics_error : strdup("Failed to compute timeline analytics");
+        } else {
+            free(analytics_error);
+        }
+        goto fail;
+    }
+    free(analytics_error);
+    analytics_error = NULL;
+
+    window->service_available = window->service_stats.has_records ||
+                                 window->service_stats.total_tickets > 0 ||
+                                 window->service_stats.total_activity_tickets > 0 ||
+                                 window->service_stats.total_hours > 0.0;
+    window->financial_available = window->financial_stats.has_records ||
+                                  window->financial_stats.total_records > 0 ||
+                                  fabs(window->financial_stats.total_spend) > 0.0 ||
+                                  fabs(window->financial_stats.approved_spend) > 0.0 ||
+                                  fabs(window->financial_stats.open_spend) > 0.0 ||
+                                  fabs(window->financial_stats.total_savings) > 0.0 ||
+                                  fabs(window->financial_stats.proposed_spend) > 0.0;
+
+    window->service_hours = window->service_stats.total_hours;
+    if (window->service_available && device_count > 0) {
+        window->tickets_per_device = safe_divide((double)window->service_stats.total_tickets, (double)device_count);
+    } else {
+        window->tickets_per_device = NAN;
+    }
+
+    window->spend_total = window->financial_stats.total_spend;
+    if (window->financial_available && device_count > 0) {
+        window->spend_per_device = safe_divide(window->financial_stats.total_spend, (double)device_count);
+    } else {
+        window->spend_per_device = NAN;
+    }
+    window->savings_total = window->financial_stats.total_savings;
+    window->savings_rate = window->financial_stats.savings_rate;
+
+    if (!compute_location_advisory(report,
+                                    &window->service_stats,
+                                    &window->financial_stats,
+                                    &window->timeline_stats,
+                                    open_deficiencies,
+                                    device_count,
+                                    window->service_available,
+                                    window->financial_available,
+                                    closure_rate,
+                                    &window->advisory)) {
+        if (error_out && !*error_out) {
+            *error_out = strdup("Failed to compute advisory summary");
+        }
+        goto fail;
+    }
+
+    return 1;
+
+oom:
+    if (error_out && !*error_out) {
+        *error_out = strdup("Out of memory");
+    }
+fail:
+    overview_window_clear(window);
+    return 0;
+}
+
+static char *format_window_range_label(const OverviewWindow *window, const ReportData *report) {
+    if (!window) {
+        return strdup("All available data");
+    }
+    const char *preset = window->preset ? window->preset : "";
+    const char *range_start = window->range_start;
+    const char *range_end = window->range_end;
+    if (strcasecmp(preset, "all_time") == 0) {
+        if (!range_start && report && report->summary.audit_range.start) {
+            range_start = report->summary.audit_range.start;
+        }
+        if (!range_end && report && report->summary.audit_range.end) {
+            range_end = report->summary.audit_range.end;
+        }
+    }
+
+    char *start_pretty = range_start ? format_pretty_date(range_start) : NULL;
+    char *end_pretty = range_end ? format_pretty_date(range_end) : NULL;
+    char *result = NULL;
+    if (start_pretty && end_pretty) {
+        result = alloc_printf("%s – %s", start_pretty, end_pretty);
+    } else if (start_pretty) {
+        result = alloc_printf("Since %s", start_pretty);
+    } else if (end_pretty) {
+        result = alloc_printf("Through %s", end_pretty);
+    } else if (strcasecmp(preset, "all_time") == 0) {
+        result = strdup("All available history");
+    } else {
+        result = strdup("Specified window");
+    }
+    free(start_pretty);
+    free(end_pretty);
+    if (!result) {
+        result = strdup("All available history");
+    }
+    return result;
 }
 
 static int generate_highlight_callouts(const ReportData *report,
@@ -1913,6 +2207,186 @@ oom:
     *out_count = 0;
     return 0;
 }
+
+static double percent_delta(double baseline, double value) {
+    if (!isfinite(baseline) || fabs(baseline) < 1e-6 || !isfinite(value)) {
+        return NAN;
+    }
+    return ((value - baseline) / fabs(baseline)) * 100.0;
+}
+
+static int generate_overview_callouts(const ReportData *report, OverviewWindow *window, const OverviewWindow *baseline) {
+    if (!window) {
+        return 0;
+    }
+
+    JsonValue *financial_root = NULL;
+    JsonValue *timeline_root = NULL;
+    char *parse_error = NULL;
+
+    if (window->financial_json && window->financial_json[0]) {
+        financial_root = json_parse(window->financial_json, &parse_error);
+        if (!financial_root && parse_error) {
+            log_info("Overview: failed to parse financial JSON for %s: %s",
+                     window->label ? window->label : "window",
+                     parse_error);
+        }
+        free(parse_error);
+        parse_error = NULL;
+    }
+    if (window->timeline_json && window->timeline_json[0]) {
+        timeline_root = json_parse(window->timeline_json, &parse_error);
+        if (!timeline_root && parse_error) {
+            log_info("Overview: failed to parse timeline JSON for %s: %s",
+                     window->label ? window->label : "window",
+                     parse_error);
+        }
+        free(parse_error);
+        parse_error = NULL;
+    }
+
+    size_t callout_count = 0;
+    if (!generate_highlight_callouts(report,
+                                     &window->service_stats,
+                                     &window->financial_stats,
+                                     financial_root,
+                                     timeline_root,
+                                     window->device_count,
+                                     window->total_deficiencies,
+                                     window->open_deficiencies,
+                                     window->closure_rate,
+                                     window->deficiencies_available,
+                                     window->service_available,
+                                     window->financial_available,
+                                     window->callouts,
+                                     OVERVIEW_CALLOUT_OUTPUT_LIMIT,
+                                     &callout_count)) {
+        json_free(financial_root);
+        json_free(timeline_root);
+        window->callout_count = 0;
+        return 0;
+    }
+
+    size_t order_counter = (callout_count > 0) ? window->callouts[callout_count - 1].order + 1 : 0;
+
+    if (baseline && baseline != window) {
+        double delta = percent_delta(baseline->tickets_per_device, window->tickets_per_device);
+        if (isfinite(delta) && fabs(delta) >= 15.0) {
+            const char *severity = (delta > 0.0) ? "warning" : "positive";
+            char *title = strdup("Service load shift");
+            char *detail = alloc_printf("Tickets per device changed %.1f%% versus all-time (%.2f → %.2f).",
+                                        delta,
+                                        baseline->tickets_per_device,
+                                        window->tickets_per_device);
+            if (!title || !detail || !push_highlight_callout(window->callouts,
+                                                             OVERVIEW_CALLOUT_OUTPUT_LIMIT,
+                                                             &callout_count,
+                                                             &order_counter,
+                                                             severity,
+                                                             title,
+                                                             detail)) {
+                free(title);
+                free(detail);
+            }
+        }
+
+        delta = percent_delta(baseline->spend_per_device, window->spend_per_device);
+        if (isfinite(delta) && fabs(delta) >= 15.0) {
+            const char *severity = (delta > 0.0) ? "warning" : "positive";
+            char *title = strdup("Spend trend variance");
+            char *detail = alloc_printf("Average spend per device moved %.1f%% versus all-time ($%.0f → $%.0f).",
+                                        delta,
+                                        baseline->spend_per_device,
+                                        window->spend_per_device);
+            if (!title || !detail || !push_highlight_callout(window->callouts,
+                                                             OVERVIEW_CALLOUT_OUTPUT_LIMIT,
+                                                             &callout_count,
+                                                             &order_counter,
+                                                             severity,
+                                                             title,
+                                                             detail)) {
+                free(title);
+                free(detail);
+            }
+        }
+
+        if (isfinite(baseline->savings_rate) && isfinite(window->savings_rate)) {
+            double point_delta = (window->savings_rate - baseline->savings_rate) * 100.0;
+            if (fabs(point_delta) >= 5.0) {
+                const char *severity = (point_delta >= 0.0) ? "positive" : "warning";
+                char *title = strdup("Savings performance shift");
+                char *detail = alloc_printf("Savings rate moved %.1f pts (%.1f%% → %.1f%%).",
+                                            point_delta,
+                                            baseline->savings_rate * 100.0,
+                                            window->savings_rate * 100.0);
+                if (!title || !detail || !push_highlight_callout(window->callouts,
+                                                                 OVERVIEW_CALLOUT_OUTPUT_LIMIT,
+                                                                 &callout_count,
+                                                                 &order_counter,
+                                                                 severity,
+                                                                 title,
+                                                                 detail)) {
+                    free(title);
+                    free(detail);
+                }
+            }
+        }
+
+        if (isfinite(baseline->closure_rate) && isfinite(window->closure_rate)) {
+            double point_delta = (window->closure_rate - baseline->closure_rate) * 100.0;
+            if (fabs(point_delta) >= 8.0) {
+                const char *severity = (point_delta >= 0.0) ? "positive" : "warning";
+                char *title = strdup("Closure-rate drift");
+                char *detail = alloc_printf("Deficiency closure moved %.1f pts (%.0f%% → %.0f%%).",
+                                            point_delta,
+                                            baseline->closure_rate * 100.0,
+                                            window->closure_rate * 100.0);
+                if (!title || !detail || !push_highlight_callout(window->callouts,
+                                                                 OVERVIEW_CALLOUT_OUTPUT_LIMIT,
+                                                                 &callout_count,
+                                                                 &order_counter,
+                                                                 severity,
+                                                                 title,
+                                                                 detail)) {
+                    free(title);
+                    free(detail);
+                }
+            }
+        }
+
+        delta = percent_delta(baseline->open_per_device, window->open_per_device);
+        if (isfinite(delta) && fabs(delta) >= 10.0) {
+            const char *severity = (delta > 0.0) ? "warning" : "positive";
+            char *title = strdup("Open deficiency trend");
+            char *detail = alloc_printf("Open issues per device shifted %.1f%% (%.2f → %.2f).",
+                                        delta,
+                                        baseline->open_per_device,
+                                        window->open_per_device);
+            if (!title || !detail || !push_highlight_callout(window->callouts,
+                                                             OVERVIEW_CALLOUT_OUTPUT_LIMIT,
+                                                             &callout_count,
+                                                             &order_counter,
+                                                             severity,
+                                                             title,
+                                                             detail)) {
+                free(title);
+                free(detail);
+            }
+        }
+    }
+
+    if (callout_count > OVERVIEW_CALLOUT_OUTPUT_LIMIT) {
+        callout_count = OVERVIEW_CALLOUT_OUTPUT_LIMIT;
+    }
+    if (callout_count > 1) {
+        qsort(window->callouts, callout_count, sizeof(HighlightCallout), compare_highlight_callouts);
+    }
+    window->callout_count = callout_count;
+
+    json_free(financial_root);
+    json_free(timeline_root);
+    return 1;
+}
 static void report_data_init(ReportData *data);
 static void report_data_clear(ReportData *data);
 static void report_device_init(ReportDevice *device);
@@ -1935,7 +2409,13 @@ static double forecast_next_value(double latest, double previous);
 static bool string_is_integer(const char *text);
 static char *build_service_financial_timeline_json(PGconn *conn, const LocationProfile *profile, const char *lookup_address, const char *range_start, const char *range_end, TimelineStats *stats, bool *service_available, bool *financial_available, char **error_out);
 static char *build_location_analytics_json(const ReportData *report, const LocationProfile *profile, size_t open_deficiencies, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const char *timeline_json, const TimelineStats *timeline_stats, bool timeline_has_service, bool timeline_has_financial);
-static int build_location_overview_tex(const ReportJob *job, const LocationProfile *profile, const ReportData *report, const ServiceAnalytics *service_stats, const FinancialAnalytics *financial_stats, const TimelineStats *timeline_stats, const char *service_json, const char *financial_json, const char *timeline_json, bool timeline_has_service, bool timeline_has_financial, const char *output_path, char **error_out);
+static void overview_window_init(OverviewWindow *window);
+static void overview_window_clear(OverviewWindow *window);
+static int collect_overview_window(PGconn *conn, const ReportJob *job, const LocationProfile *profile, const ReportData *report, const OverviewWindowSpec *spec, OverviewWindow *window, int device_count, int total_deficiencies, int open_deficiencies, double closure_rate, double open_per_device, char **error_out);
+static int generate_overview_callouts(const ReportData *report, OverviewWindow *window, const OverviewWindow *baseline);
+static char *format_window_range_label(const OverviewWindow *window, const ReportData *report);
+static int buffer_append_signed_percent(Buffer *buf, double ratio, int precision);
+static int build_location_overview_tex(const ReportJob *job, const LocationProfile *profile, const ReportData *report, OverviewWindow *windows, size_t window_count, const char *output_path, char **error_out);
 static TimelineEntry *timeline_find_entry(TimelineEntry *entries, size_t count, const char *month);
 static int timeline_ensure_entry(TimelineEntry **entries, size_t *count, size_t *capacity, const char *month, TimelineEntry **out_entry);
 static void timeline_free_entries(TimelineEntry *entries, size_t count);
@@ -12995,71 +13475,146 @@ narrative_join:
     const LocationProfile *profile_ptr = profile_available ? &profile : NULL;
 
     if (is_overview) {
-        ServiceAnalytics overview_service_stats;
-        FinancialAnalytics overview_financial_stats;
-        TimelineStats overview_timeline_stats;
-        memset(&overview_service_stats, 0, sizeof(overview_service_stats));
-        memset(&overview_financial_stats, 0, sizeof(overview_financial_stats));
-        memset(&overview_timeline_stats, 0, sizeof(overview_timeline_stats));
-        bool timeline_service_available = false;
-        bool timeline_financial_available = false;
-        char *analytics_error = NULL;
+        OverviewWindowSpec specs[OVERVIEW_WINDOW_MAX];
+        memcpy(specs, OVERVIEW_WINDOW_SPECS, sizeof(OVERVIEW_WINDOW_SPECS));
+        size_t spec_count = OVERVIEW_WINDOW_COUNT;
+        char *dynamic_labels[OVERVIEW_WINDOW_MAX];
+        memset(dynamic_labels, 0, sizeof(dynamic_labels));
 
-        char *service_json = build_service_summary_json(conn, profile_ptr, job->address, job->range_start, job->range_end, &overview_service_stats, &analytics_error);
-        if (!service_json) {
-            if (error_out && !*error_out) {
-                *error_out = analytics_error ? analytics_error : strdup("Failed to load service analytics");
-            } else {
-                free(analytics_error);
+        bool preset_known = false;
+        if (job->range_preset && job->range_preset[0]) {
+            for (size_t i = 0; i < OVERVIEW_WINDOW_COUNT; ++i) {
+                if (strcasecmp(job->range_preset, OVERVIEW_WINDOW_SPECS[i].preset) == 0) {
+                    preset_known = true;
+                    break;
+                }
             }
-            goto cleanup;
         }
-        free(analytics_error);
-        analytics_error = NULL;
 
-        char *financial_json = build_financial_summary_json(conn, profile_ptr, job->range_start, job->range_end, &overview_financial_stats, &analytics_error);
-        if (!financial_json) {
-            if (error_out && !*error_out) {
-                *error_out = analytics_error ? analytics_error : strdup("Failed to load financial analytics");
-            } else {
-                free(analytics_error);
+        if (job->range_preset && strcasecmp(job->range_preset, "custom") == 0) {
+            if (job->range_start && job->range_end && spec_count < OVERVIEW_WINDOW_MAX) {
+                specs[spec_count++] = (OverviewWindowSpec){
+                    .preset = "custom",
+                    .label = "Custom Range",
+                    .override_start = job->range_start,
+                    .override_end = job->range_end
+                };
             }
-            free(service_json);
-            goto cleanup;
-        }
-        free(analytics_error);
-        analytics_error = NULL;
-
-        char *timeline_json = build_service_financial_timeline_json(conn, profile_ptr, job->address, job->range_start, job->range_end, &overview_timeline_stats, &timeline_service_available, &timeline_financial_available, &analytics_error);
-        if (!timeline_json) {
-            if (error_out && !*error_out) {
-                *error_out = analytics_error ? analytics_error : strdup("Failed to compute timeline analytics");
-            } else {
-                free(analytics_error);
+        } else if (job->range_preset && job->range_preset[0] && !preset_known && spec_count < OVERVIEW_WINDOW_MAX) {
+            char *label = strdup(job->range_preset);
+            if (label) {
+                bool new_word = true;
+                for (size_t idx = 0; label[idx]; ++idx) {
+                    unsigned char ch = (unsigned char)label[idx];
+                    if (ch == '_' || ch == '-') {
+                        label[idx] = ' ';
+                        new_word = true;
+                        continue;
+                    }
+                    if (isalpha(ch)) {
+                        label[idx] = (char)(new_word ? toupper(ch) : tolower(ch));
+                        new_word = false;
+                    } else {
+                        new_word = isspace(ch);
+                    }
+                }
             }
-            free(service_json);
-            free(financial_json);
-            goto cleanup;
+            dynamic_labels[spec_count] = label;
+            specs[spec_count++] = (OverviewWindowSpec){
+                .preset = job->range_preset,
+                .label = label ? label : job->range_preset,
+                .override_start = (job->range_start && job->range_start[0]) ? job->range_start : NULL,
+                .override_end = (job->range_end && job->range_end[0]) ? job->range_end : NULL
+            };
+        } else if ((!job->range_preset || job->range_preset[0] == '\0') &&
+                   job->range_start && job->range_end && spec_count < OVERVIEW_WINDOW_MAX) {
+            specs[spec_count++] = (OverviewWindowSpec){
+                .preset = "custom",
+                .label = "Custom Range",
+                .override_start = job->range_start,
+                .override_end = job->range_end
+            };
         }
-        free(analytics_error);
-        analytics_error = NULL;
 
-        if (!build_location_overview_tex(job, profile_ptr, &report, &overview_service_stats, &overview_financial_stats, &overview_timeline_stats, service_json, financial_json, timeline_json, timeline_service_available, timeline_financial_available, tex_path, &latex_error)) {
+        OverviewWindow windows[OVERVIEW_WINDOW_MAX];
+        for (size_t i = 0; i < OVERVIEW_WINDOW_MAX; ++i) {
+            overview_window_init(&windows[i]);
+        }
+
+        int installed_devices = (profile_ptr && profile_ptr->device_count.has_value) ? profile_ptr->device_count.value : 0;
+        int audited_devices = report.summary.total_devices;
+        int device_count = installed_devices > 0 ? installed_devices : audited_devices;
+        int total_deficiencies = report.summary.total_deficiencies;
+        int open_deficiencies = 0;
+        for (size_t i = 0; i < report.devices.count; ++i) {
+            const ReportDevice *device = &report.devices.items[i];
+            for (size_t j = 0; j < device->deficiencies.count; ++j) {
+                const ReportDeficiency *def = &device->deficiencies.items[j];
+                bool resolved = def->resolved.has_value && def->resolved.value;
+                if (!resolved) {
+                    open_deficiencies += 1;
+                }
+            }
+        }
+        double closure_rate = (total_deficiencies > 0)
+                                  ? safe_divide((double)(total_deficiencies - open_deficiencies), (double)total_deficiencies)
+                                  : NAN;
+        double open_per_device = (device_count > 0) ? ((double)open_deficiencies / (double)device_count) : NAN;
+
+        size_t window_count = 0;
+        for (size_t i = 0; i < spec_count; ++i) {
+            char *window_error = NULL;
+            if (!collect_overview_window(conn,
+                                         job,
+                                         profile_ptr,
+                                         &report,
+                                         &specs[i],
+                                         &windows[window_count],
+                                         device_count,
+                                         total_deficiencies,
+                                         open_deficiencies,
+                                         closure_rate,
+                                         open_per_device,
+                                         &window_error)) {
+                if (error_out && !*error_out) {
+                    *error_out = window_error ? window_error : strdup("Failed to compute overview analytics");
+                } else {
+                    free(window_error);
+                }
+                for (size_t clear_idx = 0; clear_idx <= window_count; ++clear_idx) {
+                    overview_window_clear(&windows[clear_idx]);
+                }
+                for (size_t label_idx = OVERVIEW_WINDOW_COUNT; label_idx < spec_count; ++label_idx) {
+                    free(dynamic_labels[label_idx]);
+                }
+                goto cleanup;
+            }
+            free(window_error);
+            window_count += 1;
+        }
+
+        if (!build_location_overview_tex(job, profile_ptr, &report, windows, window_count, tex_path, &latex_error)) {
             if (error_out && !*error_out) {
                 *error_out = latex_error ? latex_error : strdup("Failed to build overview LaTeX");
             } else {
                 free(latex_error);
             }
-            free(service_json);
-            free(financial_json);
-            free(timeline_json);
+            for (size_t i = 0; i < window_count; ++i) {
+                overview_window_clear(&windows[i]);
+            }
+            for (size_t label_idx = OVERVIEW_WINDOW_COUNT; label_idx < spec_count; ++label_idx) {
+                free(dynamic_labels[label_idx]);
+            }
             goto cleanup;
         }
         free(latex_error);
         latex_error = NULL;
-        free(service_json);
-        free(financial_json);
-        free(timeline_json);
+        for (size_t i = 0; i < window_count; ++i) {
+            overview_window_clear(&windows[i]);
+        }
+        for (size_t label_idx = OVERVIEW_WINDOW_COUNT; label_idx < spec_count; ++label_idx) {
+            free(dynamic_labels[label_idx]);
+        }
     } else {
         if (!build_report_latex(conn, &report, &narratives, job, profile_ptr, tex_path, &latex_error)) {
             if (error_out && !*error_out) {
@@ -14174,21 +14729,34 @@ static int append_narrative_section(Buffer *buf, const char *title, const char *
 static int build_location_overview_tex(const ReportJob *job,
                                        const LocationProfile *profile,
                                        const ReportData *report,
-                                       const ServiceAnalytics *service_stats,
-                                       const FinancialAnalytics *financial_stats,
-                                       const TimelineStats *timeline_stats,
-                                       const char *service_json,
-                                       const char *financial_json,
-                                       const char *timeline_json,
-                                       bool timeline_has_service,
-                                       bool timeline_has_financial,
+                                       OverviewWindow *windows,
+                                       size_t window_count,
                                        const char *output_path,
                                        char **error_out) {
-    if (!job || !report || !service_stats || !financial_stats || !output_path) {
+    if (!job || !report || !windows || window_count == 0 || !output_path) {
         if (error_out && !*error_out) {
             *error_out = strdup("Invalid overview report parameters");
         }
         return 0;
+    }
+
+    OverviewWindow *baseline = &windows[0];
+    const ServiceAnalytics *service_stats = &baseline->service_stats;
+    const FinancialAnalytics *financial_stats = &baseline->financial_stats;
+    const TimelineStats *timeline_stats = &baseline->timeline_stats;
+    const char *service_json = baseline->service_json;
+    const char *financial_json = baseline->financial_json;
+    const char *timeline_json = baseline->timeline_json;
+    bool timeline_has_service = baseline->timeline_service_available;
+    bool timeline_has_financial = baseline->timeline_financial_available;
+
+    for (size_t i = 0; i < window_count; ++i) {
+        if (!generate_overview_callouts(report, &windows[i], baseline)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Failed to generate overview highlights");
+            }
+            return 0;
+        }
     }
 
     Buffer buf;
@@ -14245,11 +14813,9 @@ static int build_location_overview_tex(const ReportJob *job,
    char *generated_tex = NULL;
     JsonValue *financial_root = NULL;
     JsonValue *timeline_root = NULL;
-    HighlightCallout callouts[MAX_OVERVIEW_CALLOUTS];
-    size_t callout_count = 0;
-    memset(callouts, 0, sizeof(callouts));
-    LocationAdvisorySummary advisory_summary;
-    location_advisory_init(&advisory_summary);
+    HighlightCallout *callouts = baseline->callouts;
+    size_t callout_count = baseline->callout_count;
+    const LocationAdvisorySummary *advisory_summary = &baseline->advisory;
     char *maintenance_status_tex = NULL;
     char *modernization_status_tex = NULL;
     char *vendor_status_tex = NULL;
@@ -14410,67 +14976,6 @@ static int build_location_overview_tex(const ReportJob *job,
     bool timeline_financial_available = timeline_has_financial && financial_available;
     bool timeline_any_available = timeline_json && (timeline_service_available || timeline_financial_available);
 
-    double closure_rate = (total_deficiencies > 0)
-                              ? safe_divide((double)(total_deficiencies - open_deficiencies), (double)total_deficiencies)
-                              : NAN;
-    bool deficiencies_available = audit_count > 0;
-
-    char *json_error = NULL;
-    if (financial_json && financial_json[0]) {
-        financial_root = json_parse(financial_json, &json_error);
-        if (!financial_root && json_error) {
-            log_info("Overview: failed to parse financial summary JSON: %s", json_error);
-        }
-        free(json_error);
-        json_error = NULL;
-    }
-    if (timeline_json && timeline_json[0]) {
-        timeline_root = json_parse(timeline_json, &json_error);
-        if (!timeline_root && json_error) {
-            log_info("Overview: failed to parse timeline JSON: %s", json_error);
-        }
-        free(json_error);
-        json_error = NULL;
-    }
-
-    fail_stage = "computing advisory summary";
-    if (!compute_location_advisory(report,
-                                   service_stats,
-                                   financial_stats,
-                                   timeline_stats,
-                                   open_deficiencies,
-                                   device_count,
-                                   service_available,
-                                   financial_available,
-                                   closure_rate,
-                                   &advisory_summary)) {
-        goto cleanup;
-    }
-
-    fail_stage = "generating highlights";
-    if (!generate_highlight_callouts(report,
-                                    service_stats,
-                                    financial_stats,
-                                    financial_root,
-                                    timeline_root,
-                                    device_count,
-                                    total_deficiencies,
-                                    open_deficiencies,
-                                    closure_rate,
-                                    deficiencies_available,
-                                    service_available,
-                                    financial_available,
-                                    callouts,
-                                    MAX_OVERVIEW_CALLOUTS,
-                                    &callout_count)) {
-        goto cleanup;
-    }
-
-    json_free(financial_root);
-    financial_root = NULL;
-    json_free(timeline_root);
-    timeline_root = NULL;
-
     double tickets_per_device = (service_available && device_count > 0)
                                     ? ((double)total_service_tickets / (double)device_count)
                                     : 0.0;
@@ -14618,39 +15123,38 @@ static int build_location_overview_tex(const ReportJob *job,
     const char *maintenance_color = "CalloutInfo";
     const char *modernization_color = "CalloutInfo";
     const char *vendor_color = "CalloutInfo";
-    if (advisory_summary.maintenance.status) {
-        if (strcasecmp(advisory_summary.maintenance.status, "attention") == 0) {
+    if (advisory_summary && advisory_summary->maintenance.status) {
+        if (strcasecmp(advisory_summary->maintenance.status, "attention") == 0) {
             maintenance_color = "CalloutWarning";
-        } else if (strcasecmp(advisory_summary.maintenance.status, "healthy") == 0) {
+        } else if (strcasecmp(advisory_summary->maintenance.status, "healthy") == 0) {
             maintenance_color = "CalloutPositive";
-        } else if (strcasecmp(advisory_summary.maintenance.status, "watch") == 0) {
+        } else if (strcasecmp(advisory_summary->maintenance.status, "watch") == 0) {
             maintenance_color = "CalloutInfo";
         }
     }
-    if (advisory_summary.modernization.status) {
-        if (strcasecmp(advisory_summary.modernization.status, "plan") == 0 ||
-            strcasecmp(advisory_summary.modernization.status, "consider") == 0) {
+    if (advisory_summary && advisory_summary->modernization.status) {
+        if (strcasecmp(advisory_summary->modernization.status, "plan") == 0 ||
+            strcasecmp(advisory_summary->modernization.status, "consider") == 0) {
             modernization_color = "CalloutPositive";
-        } else if (strcasecmp(advisory_summary.modernization.status, "monitor") == 0 ||
-                   strcasecmp(advisory_summary.modernization.status, "defer") == 0) {
+        } else if (strcasecmp(advisory_summary->modernization.status, "monitor") == 0 ||
+                   strcasecmp(advisory_summary->modernization.status, "defer") == 0) {
             modernization_color = "CalloutWarning";
-        } else if (strcasecmp(advisory_summary.modernization.status, "insufficient") == 0) {
+        } else if (strcasecmp(advisory_summary->modernization.status, "insufficient") == 0) {
             modernization_color = "CalloutInfo";
         }
     }
-    if (advisory_summary.vendor.status) {
-        if (strcasecmp(advisory_summary.vendor.status, "needs_review") == 0) {
+    if (advisory_summary && advisory_summary->vendor.status) {
+        if (strcasecmp(advisory_summary->vendor.status, "needs_review") == 0) {
             vendor_color = "CalloutAlert";
-        } else if (strcasecmp(advisory_summary.vendor.status, "monitor") == 0) {
+        } else if (strcasecmp(advisory_summary->vendor.status, "monitor") == 0) {
             vendor_color = "CalloutWarning";
-        } else if (strcasecmp(advisory_summary.vendor.status, "stable") == 0) {
+        } else if (strcasecmp(advisory_summary->vendor.status, "stable") == 0) {
             vendor_color = "CalloutPositive";
         }
     }
-
-    char *maintenance_status_caps = advisory_summary.maintenance.status ? strdup(advisory_summary.maintenance.status) : strdup("insufficient");
-    char *modernization_status_caps = advisory_summary.modernization.status ? strdup(advisory_summary.modernization.status) : strdup("insufficient");
-    char *vendor_status_caps = advisory_summary.vendor.status ? strdup(advisory_summary.vendor.status) : strdup("insufficient");
+    char *maintenance_status_caps = (advisory_summary && advisory_summary->maintenance.status) ? strdup(advisory_summary->maintenance.status) : strdup("insufficient");
+    char *modernization_status_caps = (advisory_summary && advisory_summary->modernization.status) ? strdup(advisory_summary->modernization.status) : strdup("insufficient");
+    char *vendor_status_caps = (advisory_summary && advisory_summary->vendor.status) ? strdup(advisory_summary->vendor.status) : strdup("insufficient");
     if (!maintenance_status_caps || !modernization_status_caps || !vendor_status_caps) {
         free(maintenance_status_caps);
         free(modernization_status_caps);
@@ -14683,9 +15187,9 @@ static int build_location_overview_tex(const ReportJob *job,
         goto cleanup;
     }
 
-    maintenance_message_tex = latex_escape(advisory_summary.maintenance.message ? advisory_summary.maintenance.message : "Insights pending.");
-    modernization_message_tex = latex_escape(advisory_summary.modernization.message ? advisory_summary.modernization.message : "Insights pending.");
-    vendor_message_tex = latex_escape(advisory_summary.vendor.message ? advisory_summary.vendor.message : "Insights pending.");
+    maintenance_message_tex = latex_escape((advisory_summary && advisory_summary->maintenance.message) ? advisory_summary->maintenance.message : "Insights pending.");
+    modernization_message_tex = latex_escape((advisory_summary && advisory_summary->modernization.message) ? advisory_summary->modernization.message : "Insights pending.");
+    vendor_message_tex = latex_escape((advisory_summary && advisory_summary->vendor.message) ? advisory_summary->vendor.message : "Insights pending.");
     if (!maintenance_message_tex || !modernization_message_tex || !vendor_message_tex) {
         free(maintenance_status_tex);
         free(modernization_status_tex);
@@ -14702,24 +15206,24 @@ static int build_location_overview_tex(const ReportJob *job,
             maintenance_color,
             maintenance_status_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "\\small %s\n\\medskip\n\\begin{tabular}{@{}ll@{}}\n", maintenance_message_tex)) goto cleanup;
-    if (isfinite(advisory_summary.maintenance.pm_ratio)) {
-        if (!buffer_appendf(&buf, "PM coverage & %.0f\\%%\\\\\n", advisory_summary.maintenance.pm_ratio * 100.0)) goto cleanup;
+    if (advisory_summary && isfinite(advisory_summary->maintenance.pm_ratio)) {
+        if (!buffer_appendf(&buf, "PM coverage & %.0f\\%%\\\\\n", advisory_summary->maintenance.pm_ratio * 100.0)) goto cleanup;
     }
-    if (isfinite(advisory_summary.maintenance.pm_expected) && isfinite(advisory_summary.maintenance.pm_actual)) {
+    if (advisory_summary && isfinite(advisory_summary->maintenance.pm_expected) && isfinite(advisory_summary->maintenance.pm_actual)) {
         if (!buffer_appendf(&buf, "PM expected/actual & %.1f / %.0f\\\\\n",
-                            advisory_summary.maintenance.pm_expected,
-                            advisory_summary.maintenance.pm_actual)) goto cleanup;
+                            advisory_summary->maintenance.pm_expected,
+                            advisory_summary->maintenance.pm_actual)) goto cleanup;
     }
-    if (isfinite(advisory_summary.maintenance.tst_ratio)) {
-        if (!buffer_appendf(&buf, "Testing coverage & %.0f\\%%\\\\\n", advisory_summary.maintenance.tst_ratio * 100.0)) goto cleanup;
+    if (advisory_summary && isfinite(advisory_summary->maintenance.tst_ratio)) {
+        if (!buffer_appendf(&buf, "Testing coverage & %.0f\\%%\\\\\n", advisory_summary->maintenance.tst_ratio * 100.0)) goto cleanup;
     }
-    if (isfinite(advisory_summary.maintenance.tst_expected) && isfinite(advisory_summary.maintenance.tst_actual)) {
+    if (advisory_summary && isfinite(advisory_summary->maintenance.tst_expected) && isfinite(advisory_summary->maintenance.tst_actual)) {
         if (!buffer_appendf(&buf, "Testing expected/actual & %.1f / %.0f\\\\\n",
-                            advisory_summary.maintenance.tst_expected,
-                            advisory_summary.maintenance.tst_actual)) goto cleanup;
+                            advisory_summary->maintenance.tst_expected,
+                            advisory_summary->maintenance.tst_actual)) goto cleanup;
     }
-    if (advisory_summary.maintenance.window_months > 0) {
-        if (!buffer_appendf(&buf, "Observation window & %d months\\\\\n", advisory_summary.maintenance.window_months)) goto cleanup;
+    if (advisory_summary && advisory_summary->maintenance.window_months > 0) {
+        if (!buffer_appendf(&buf, "Observation window & %d months\\\\\n", advisory_summary->maintenance.window_months)) goto cleanup;
     }
     if (!buffer_append_cstr(&buf, "\\end{tabular}\n\\end{tcolorbox}\n\\medskip\n")) goto cleanup;
 
@@ -14729,28 +15233,28 @@ static int build_location_overview_tex(const ReportJob *job,
             modernization_color,
             modernization_status_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "\\small %s\n\\medskip\n\\begin{tabular}{@{}ll@{}}\n", modernization_message_tex)) goto cleanup;
-    if (isfinite(advisory_summary.modernization.equipment_callbacks_per_device)) {
-        if (!buffer_appendf(&buf, "Equipment callbacks / device & %.2f\\\\\n", advisory_summary.modernization.equipment_callbacks_per_device)) goto cleanup;
+    if (advisory_summary && isfinite(advisory_summary->modernization.equipment_callbacks_per_device)) {
+        if (!buffer_appendf(&buf, "Equipment callbacks / device & %.2f\\\\\n", advisory_summary->modernization.equipment_callbacks_per_device)) goto cleanup;
     }
-    if (isfinite(advisory_summary.modernization.callbacks_per_device_per_year)) {
-        if (!buffer_appendf(&buf, "Callbacks / device / yr & %.2f\\\\\n", advisory_summary.modernization.callbacks_per_device_per_year)) goto cleanup;
+    if (advisory_summary && isfinite(advisory_summary->modernization.callbacks_per_device_per_year)) {
+        if (!buffer_appendf(&buf, "Callbacks / device / yr & %.2f\\\\\n", advisory_summary->modernization.callbacks_per_device_per_year)) goto cleanup;
     }
-    if (isfinite(advisory_summary.modernization.opex_annual)) {
+    if (advisory_summary && isfinite(advisory_summary->modernization.opex_annual)) {
         if (!buffer_append_cstr(&buf, "Annualised OPEX & ")) goto cleanup;
-        if (!buffer_append_currency(&buf, advisory_summary.modernization.opex_annual)) goto cleanup;
+        if (!buffer_append_currency(&buf, advisory_summary->modernization.opex_annual)) goto cleanup;
         if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
     }
-    if (isfinite(advisory_summary.modernization.expected_savings)) {
+    if (advisory_summary && isfinite(advisory_summary->modernization.expected_savings)) {
         if (!buffer_append_cstr(&buf, "Expected savings & ")) goto cleanup;
-        if (!buffer_append_currency(&buf, advisory_summary.modernization.expected_savings)) goto cleanup;
+        if (!buffer_append_currency(&buf, advisory_summary->modernization.expected_savings)) goto cleanup;
         if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
     }
-    if (isfinite(advisory_summary.modernization.payback_years)) {
-        if (!buffer_appendf(&buf, "Payback horizon & %.1f yrs\\\\\n", advisory_summary.modernization.payback_years)) goto cleanup;
+    if (advisory_summary && isfinite(advisory_summary->modernization.payback_years)) {
+        if (!buffer_appendf(&buf, "Payback horizon & %.1f yrs\\\\\n", advisory_summary->modernization.payback_years)) goto cleanup;
     }
-    if (isfinite(advisory_summary.modernization.modernization_cost)) {
+    if (advisory_summary && isfinite(advisory_summary->modernization.modernization_cost)) {
         if (!buffer_append_cstr(&buf, "Modernization cost & ")) goto cleanup;
-        if (!buffer_append_currency(&buf, advisory_summary.modernization.modernization_cost)) goto cleanup;
+        if (!buffer_append_currency(&buf, advisory_summary->modernization.modernization_cost)) goto cleanup;
         if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
     }
     if (!buffer_append_cstr(&buf, "\\end{tabular}\n\\end{tcolorbox}\n\\medskip\n")) goto cleanup;
@@ -14761,17 +15265,17 @@ static int build_location_overview_tex(const ReportJob *job,
             vendor_color,
             vendor_status_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "\\small %s\n\\medskip\n\\begin{tabular}{@{}ll@{}}\n", vendor_message_tex)) goto cleanup;
-    if (isfinite(advisory_summary.vendor.denied_rate)) {
-        if (!buffer_appendf(&buf, "Denied rate & %.0f\\%%\\\\\n", advisory_summary.vendor.denied_rate * 100.0)) goto cleanup;
+    if (advisory_summary && isfinite(advisory_summary->vendor.denied_rate)) {
+        if (!buffer_appendf(&buf, "Denied rate & %.0f\\%%\\\\\n", advisory_summary->vendor.denied_rate * 100.0)) goto cleanup;
     }
-    if (isfinite(advisory_summary.vendor.negotiated_rate)) {
-        if (!buffer_appendf(&buf, "Negotiated rate & %.0f\\%%\\\\\n", advisory_summary.vendor.negotiated_rate * 100.0)) goto cleanup;
+    if (advisory_summary && isfinite(advisory_summary->vendor.negotiated_rate)) {
+        if (!buffer_appendf(&buf, "Negotiated rate & %.0f\\%%\\\\\n", advisory_summary->vendor.negotiated_rate * 100.0)) goto cleanup;
     }
-    if (isfinite(advisory_summary.vendor.challenged_rate)) {
-        if (!buffer_appendf(&buf, "Challenged rate & %.0f\\%%\\\\\n", advisory_summary.vendor.challenged_rate * 100.0)) goto cleanup;
+    if (advisory_summary && isfinite(advisory_summary->vendor.challenged_rate)) {
+        if (!buffer_appendf(&buf, "Challenged rate & %.0f\\%%\\\\\n", advisory_summary->vendor.challenged_rate * 100.0)) goto cleanup;
     }
-    if (isfinite(advisory_summary.vendor.closure_rate)) {
-        if (!buffer_appendf(&buf, "Closure rate & %.0f\\%%\\\\\n", advisory_summary.vendor.closure_rate * 100.0)) goto cleanup;
+    if (advisory_summary && isfinite(advisory_summary->vendor.closure_rate)) {
+        if (!buffer_appendf(&buf, "Closure rate & %.0f\\%%\\\\\n", advisory_summary->vendor.closure_rate * 100.0)) goto cleanup;
     }
     if (!buffer_append_cstr(&buf, "\\end{tabular}\n\\end{tcolorbox}\n\\medskip\n")) goto cleanup;
 
@@ -15555,6 +16059,126 @@ static int build_location_overview_tex(const ReportJob *job,
         if (!buffer_append_cstr(&buf, "No timeline records were available for this range.\\\\par\n")) goto cleanup;
     }
 
+    if (window_count > 1) {
+        fail_stage = "writing window comparison";
+        if (!buffer_append_cstr(&buf, "\\section*{Window Comparison}\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\begin{tabularx}{\\textwidth}{@{}l l c c c c c@{}}\\toprule\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "Window & Range & Tickets/Device & Spend/Device & Savings Rate & Closure Rate & Open/Device\\\\\n\\midrule\n")) goto cleanup;
+        for (size_t i = 0; i < window_count; ++i) {
+            OverviewWindow *win = &windows[i];
+            char *label_tex = latex_escape(win->label ? win->label : "Window");
+            char *range_label = format_window_range_label(win, report);
+            char *range_tex = latex_escape(range_label ? range_label : "Selected window");
+            free(range_label);
+            if (!label_tex || !range_tex) {
+                free(label_tex);
+                free(range_tex);
+                goto cleanup;
+            }
+            if (!buffer_appendf(&buf, "%s & %s & ", label_tex, range_tex)) {
+                free(label_tex);
+                free(range_tex);
+                goto cleanup;
+            }
+            free(label_tex);
+            free(range_tex);
+
+            if (isfinite(win->tickets_per_device)) {
+                if (!buffer_appendf(&buf, "%.2f", win->tickets_per_device)) goto cleanup;
+            } else {
+                if (!buffer_append_cstr(&buf, "—")) goto cleanup;
+            }
+            if (!buffer_append_cstr(&buf, " & ")) goto cleanup;
+
+            if (isfinite(win->spend_per_device)) {
+                if (!buffer_append_currency(&buf, win->spend_per_device)) goto cleanup;
+            } else {
+                if (!buffer_append_cstr(&buf, "—")) goto cleanup;
+            }
+            if (!buffer_append_cstr(&buf, " & ")) goto cleanup;
+
+            if (isfinite(win->savings_rate)) {
+                if (!buffer_appendf(&buf, "%.1f\\%%", win->savings_rate * 100.0)) goto cleanup;
+            } else {
+                if (!buffer_append_cstr(&buf, "—")) goto cleanup;
+            }
+            if (!buffer_append_cstr(&buf, " & ")) goto cleanup;
+
+            if (isfinite(win->closure_rate)) {
+                if (!buffer_appendf(&buf, "%.0f\\%%", win->closure_rate * 100.0)) goto cleanup;
+            } else {
+                if (!buffer_append_cstr(&buf, "—")) goto cleanup;
+            }
+            if (!buffer_append_cstr(&buf, " & ")) goto cleanup;
+
+            if (isfinite(win->open_per_device)) {
+                if (!buffer_appendf(&buf, "%.2f", win->open_per_device)) goto cleanup;
+            } else {
+                if (!buffer_append_cstr(&buf, "—")) goto cleanup;
+            }
+            if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+        }
+        if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabularx}\n\n")) goto cleanup;
+
+        for (size_t i = 1; i < window_count; ++i) {
+            OverviewWindow *win = &windows[i];
+            char *label_tex = latex_escape(win->label ? win->label : "Window");
+            char *range_label = format_window_range_label(win, report);
+            char *range_tex = latex_escape(range_label ? range_label : "Selected window");
+            free(range_label);
+            if (!label_tex || !range_tex) {
+                free(label_tex);
+                free(range_tex);
+                goto cleanup;
+            }
+            if (!buffer_appendf(&buf, "\\subsection*{%s Insights (%s)}\n", label_tex, range_tex)) {
+                free(label_tex);
+                free(range_tex);
+                goto cleanup;
+            }
+            free(label_tex);
+            free(range_tex);
+            if (!buffer_append_cstr(&buf, "\\sectiondivider\n")) goto cleanup;
+            if (win->callout_count == 0) {
+                if (!buffer_append_cstr(&buf, "\\textit{No automated highlights for this window.}\\par\\medskip\n\n")) goto cleanup;
+            } else {
+                for (size_t c = 0; c < win->callout_count; ++c) {
+                    HighlightCallout *co = &win->callouts[c];
+                    const char *frame_color = "CalloutInfo";
+                    if (co->severity) {
+                        if (strcasecmp(co->severity, "alert") == 0) {
+                            frame_color = "CalloutAlert";
+                        } else if (strcasecmp(co->severity, "warning") == 0) {
+                            frame_color = "CalloutWarning";
+                        } else if (strcasecmp(co->severity, "positive") == 0) {
+                            frame_color = "CalloutPositive";
+                        }
+                    }
+                    char *title_tex = latex_escape(co->title ? co->title : "Highlight");
+                    char *detail_tex = latex_escape(co->detail ? co->detail : "Insight pending.");
+                    if (!title_tex || !detail_tex) {
+                        free(title_tex);
+                        free(detail_tex);
+                        goto cleanup;
+                    }
+                    if (!buffer_appendf(&buf,
+                            "\\begin{tcolorbox}[colback=%s!12,colframe=%s,boxrule=0.9pt,sharp corners,enhanced,title={\\textbf{%s}}]\n\\small %s\n\\end{tcolorbox}\n\n",
+                            frame_color,
+                            frame_color,
+                            title_tex,
+                            detail_tex)) {
+                        free(title_tex);
+                        free(detail_tex);
+                        goto cleanup;
+                    }
+                    free(title_tex);
+                    free(detail_tex);
+                }
+            }
+        }
+    }
+
     fail_stage = "finalizing document";
     if (!buffer_append_cstr(&buf, "\\end{document}\n")) goto cleanup;
 
@@ -15574,8 +16198,6 @@ static int build_location_overview_tex(const ReportJob *job,
 cleanup:
     json_free(financial_root);
     json_free(timeline_root);
-    highlight_callout_array_clear(callouts, callout_count);
-    location_advisory_clear(&advisory_summary);
     free(maintenance_status_tex);
     free(modernization_status_tex);
     free(vendor_status_tex);

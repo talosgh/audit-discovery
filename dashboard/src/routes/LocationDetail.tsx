@@ -27,14 +27,13 @@ interface LocationDetailProps {
   onSelectAudit(id: string): void;
 }
 
-type RangePresetOption = 'rolling_12_months' | 'last_quarter' | 'last_month' | 'ytd' | 'last_fiscal' | 'custom';
+type RangePresetOption = 'all_time' | 'last_fiscal' | 'last_quarter' | 'last_month' | 'custom';
 
 const RANGE_PRESET_OPTIONS: Array<{ value: RangePresetOption; label: string }> = [
-  { value: 'rolling_12_months', label: 'Last 12 months' },
+  { value: 'all_time', label: 'All time' },
+  { value: 'last_fiscal', label: 'Previous fiscal year' },
   { value: 'last_quarter', label: 'Last quarter' },
   { value: 'last_month', label: 'Last month' },
-  { value: 'ytd', label: 'Year to date' },
-  { value: 'last_fiscal', label: 'Previous fiscal year' },
   { value: 'custom', label: 'Custom range' }
 ];
 
@@ -67,6 +66,9 @@ const describeOverviewRange = (
   end?: string | null,
   preset?: string | null
 ): string => {
+  if (preset === 'all_time') {
+    return 'All available history';
+  }
   if (start && end) {
     const startLabel = formatIsoDate(start);
     const endLabel = formatIsoDate(end);
@@ -126,7 +128,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
   const [formError, setFormError] = createSignal<string | null>(null);
   const [includeAllVisits, setIncludeAllVisits] = createSignal(true);
   const [selectedVisitIds, setSelectedVisitIds] = createSignal<Set<string>>(new Set());
-  const [rangePreset, setRangePreset] = createSignal<RangePresetOption>('rolling_12_months');
+  const [rangePreset, setRangePreset] = createSignal<RangePresetOption>('all_time');
   const [customRangeStart, setCustomRangeStart] = createSignal('');
   const [customRangeEnd, setCustomRangeEnd] = createSignal('');
   const [activePanel, setActivePanel] = createSignal<'overview' | 'deficiencies' | 'service' | 'financial'>('overview');
@@ -466,7 +468,8 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     setReportMode(mode);
     if (mode === 'overview') {
       setIncludeAllVisits(true);
-      setRangePreset('rolling_12_months');
+      setSelectedVisitIds(new Set());
+      setRangePreset('all_time');
       setCustomRangeStart('');
       setCustomRangeEnd('');
     }
@@ -3683,6 +3686,9 @@ const dataCoverage = createMemo(() => {
                       rangePreset() === 'custom' ? customRangeEnd().trim() || undefined : undefined,
                       rangePreset()
                     )}
+                  </p>
+                  <p class="modal-hint">
+                    Overview reports always analyse all available history alongside the previous fiscal year, last quarter, and last month. Choose a preset to emphasise which window anchors the narrative.
                   </p>
                 </fieldset>
               </Show>
