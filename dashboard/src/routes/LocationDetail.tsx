@@ -591,7 +591,7 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
       setIsGenerating(true);
       setStatusMessage(`${label} queued for generation (${selectionLabel})…`);
       setLastDownload(null);
-      const requestPayload = {
+      const requestPayload: ReportJobCreateRequest = {
         address: props.location.address,
         locationRowId: detail()?.summary.location_row_id ?? props.location.locationRowId ?? null,
         coverBuildingOwner: owner,
@@ -600,10 +600,17 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
         coverState: state,
         coverZip: zip,
         coverContactName: contactName,
-        coverContactEmail: contactEmail,
-        notes: notesSeed,
-        recommendations: recsSeed
-      } as ReportJobCreateRequest;
+        coverContactEmail: contactEmail
+      };
+
+      if (!isOverview) {
+        if (notesSeed.length > 0) {
+          requestPayload.notes = notesSeed;
+        }
+        if (recsSeed.length > 0) {
+          requestPayload.recommendations = recsSeed;
+        }
+      }
 
       if (isOverview) {
         requestPayload.reportType = 'overview';
@@ -3679,24 +3686,26 @@ const dataCoverage = createMemo(() => {
                   </p>
                 </fieldset>
               </Show>
-              <label class="modal-field modal-field--full">
-                <span>Narrative Seed</span>
-                <textarea
-                  value={narrativeSeed()}
-                  onInput={(event) => setNarrativeSeed(event.currentTarget.value)}
-                  rows={4}
-                  placeholder="Key observations to emphasize in the executive summary and findings."
-                />
-              </label>
-              <label class="modal-field modal-field--full">
-                <span>Recommendations Seed</span>
-                <textarea
-                  value={recommendationsSeed()}
-                  onInput={(event) => setRecommendationsSeed(event.currentTarget.value)}
-                  rows={4}
-                  placeholder="Notes about remediation priorities or client directives."
-                />
-              </label>
+              <Show when={reportMode() !== 'overview'}>
+                <label class="modal-field modal-field--full">
+                  <span>Narrative Seed</span>
+                  <textarea
+                    value={narrativeSeed()}
+                    onInput={(event) => setNarrativeSeed(event.currentTarget.value)}
+                    rows={4}
+                    placeholder="Key observations to emphasize in the executive summary and findings."
+                  />
+                </label>
+                <label class="modal-field modal-field--full">
+                  <span>Recommendations Seed</span>
+                  <textarea
+                    value={recommendationsSeed()}
+                    onInput={(event) => setRecommendationsSeed(event.currentTarget.value)}
+                    rows={4}
+                    placeholder="Notes about remediation priorities or client directives."
+                  />
+                </label>
+              </Show>
               <Show when={formError()}>
                 {(msg) => <p class="modal-error" role="alert">{msg()}</p>}
               </Show>
