@@ -3687,24 +3687,26 @@ const dataCoverage = createMemo(() => {
                 </fieldset>
               </Show>
               <Show when={reportMode() !== 'overview'}>
-                <label class="modal-field modal-field--full">
-                  <span>Narrative Seed</span>
-                  <textarea
-                    value={narrativeSeed()}
-                    onInput={(event) => setNarrativeSeed(event.currentTarget.value)}
-                    rows={4}
-                    placeholder="Key observations to emphasize in the executive summary and findings."
-                  />
-                </label>
-                <label class="modal-field modal-field--full">
-                  <span>Recommendations Seed</span>
-                  <textarea
-                    value={recommendationsSeed()}
-                    onInput={(event) => setRecommendationsSeed(event.currentTarget.value)}
-                    rows={4}
-                    placeholder="Notes about remediation priorities or client directives."
-                  />
-                </label>
+                <>
+                  <label class="modal-field modal-field--full">
+                    <span>Narrative Seed</span>
+                    <textarea
+                      value={narrativeSeed()}
+                      onInput={(event) => setNarrativeSeed(event.currentTarget.value)}
+                      rows={4}
+                      placeholder="Key observations to emphasize in the executive summary and findings."
+                    />
+                  </label>
+                  <label class="modal-field modal-field--full">
+                    <span>Recommendations Seed</span>
+                    <textarea
+                      value={recommendationsSeed()}
+                      onInput={(event) => setRecommendationsSeed(event.currentTarget.value)}
+                      rows={4}
+                      placeholder="Notes about remediation priorities or client directives."
+                    />
+                  </label>
+                </>
               </Show>
               <Show when={formError()}>
                 {(msg) => <p class="modal-error" role="alert">{msg()}</p>}

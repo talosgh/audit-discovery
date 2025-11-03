@@ -14597,7 +14597,7 @@ static int build_location_overview_tex(const ReportJob *job,
                 goto cleanup;
             }
             if (!buffer_appendf(&buf,
-                    "\\begin{tcolorbox}[colback=%s!12,colframe=%s,boxrule=0.9pt,sharp corners,enhanced,title={\\textbf{%s}}]\\n\\small %s\\n\\end{tcolorbox}\\n\\n",
+                    "\\begin{tcolorbox}[colback=%s!12,colframe=%s,boxrule=0.9pt,sharp corners,enhanced,title={\\textbf{%s}}]\n\\small %s\n\\end{tcolorbox}\n\n",
                     frame_color,
                     frame_color,
                     title_tex,
@@ -14697,12 +14697,11 @@ static int build_location_overview_tex(const ReportJob *job,
     }
 
     if (!buffer_appendf(&buf,
-            "\\begin{tcolorbox}[colback=NeutralLight,colframe=%s,boxrule=0.8pt,sharp corners,title={\\textbf{Maintenance} \\hfill \\textcolor{%s}{\\small %s}}]\\n",
+            "\\begin{tcolorbox}[colback=NeutralLight,colframe=%s,boxrule=0.8pt,sharp corners,title={\\textbf{Maintenance} \\hfill \\textcolor{%s}{\\small %s}}]\n",
             maintenance_color,
             maintenance_color,
             maintenance_status_tex)) goto cleanup;
-    if (!buffer_appendf(&buf, "\\small %s\\\n\\medskip\n", maintenance_message_tex)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\begin{tabular}{@{}ll@{}}\n")) goto cleanup;
+    if (!buffer_appendf(&buf, "\\small %s\n\\medskip\n\\begin{tabular}{@{}ll@{}}\n", maintenance_message_tex)) goto cleanup;
     if (isfinite(advisory_summary.maintenance.pm_ratio)) {
         if (!buffer_appendf(&buf, "PM coverage & %.0f\\%%\\\\\n", advisory_summary.maintenance.pm_ratio * 100.0)) goto cleanup;
     }
@@ -14722,15 +14721,14 @@ static int build_location_overview_tex(const ReportJob *job,
     if (advisory_summary.maintenance.window_months > 0) {
         if (!buffer_appendf(&buf, "Observation window & %d months\\\\\n", advisory_summary.maintenance.window_months)) goto cleanup;
     }
-    if (!buffer_append_cstr(&buf, "\\end{tabular}\\n\\end{tcolorbox}\\n\\medskip\\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\end{tabular}\n\\end{tcolorbox}\n\\medskip\n")) goto cleanup;
 
     if (!buffer_appendf(&buf,
-            "\\begin{tcolorbox}[colback=NeutralLight,colframe=%s,boxrule=0.8pt,sharp corners,title={\\textbf{Modernization} \\hfill \\textcolor{%s}{\\small %s}}]\\n",
+            "\\begin{tcolorbox}[colback=NeutralLight,colframe=%s,boxrule=0.8pt,sharp corners,title={\\textbf{Modernization} \\hfill \\textcolor{%s}{\\small %s}}]\n",
             modernization_color,
             modernization_color,
             modernization_status_tex)) goto cleanup;
-    if (!buffer_appendf(&buf, "\\small %s\\\n\\medskip\n", modernization_message_tex)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\begin{tabular}{@{}ll@{}}\n")) goto cleanup;
+    if (!buffer_appendf(&buf, "\\small %s\n\\medskip\n\\begin{tabular}{@{}ll@{}}\n", modernization_message_tex)) goto cleanup;
     if (isfinite(advisory_summary.modernization.equipment_callbacks_per_device)) {
         if (!buffer_appendf(&buf, "Equipment callbacks / device & %.2f\\\\\n", advisory_summary.modernization.equipment_callbacks_per_device)) goto cleanup;
     }
@@ -14755,15 +14753,14 @@ static int build_location_overview_tex(const ReportJob *job,
         if (!buffer_append_currency(&buf, advisory_summary.modernization.modernization_cost)) goto cleanup;
         if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
     }
-    if (!buffer_append_cstr(&buf, "\\end{tabular}\\n\\end{tcolorbox}\\n\\medskip\\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\end{tabular}\n\\end{tcolorbox}\n\\medskip\n")) goto cleanup;
 
     if (!buffer_appendf(&buf,
-            "\\begin{tcolorbox}[colback=NeutralLight,colframe=%s,boxrule=0.8pt,sharp corners,title={\\textbf{Vendor} \\hfill \\textcolor{%s}{\\small %s}}]\\n",
+            "\\begin{tcolorbox}[colback=NeutralLight,colframe=%s,boxrule=0.8pt,sharp corners,title={\\textbf{Vendor} \\hfill \\textcolor{%s}{\\small %s}}]\n",
             vendor_color,
             vendor_color,
             vendor_status_tex)) goto cleanup;
-    if (!buffer_appendf(&buf, "\\small %s\\\n\\medskip\n", vendor_message_tex)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\begin{tabular}{@{}ll@{}}\n")) goto cleanup;
+    if (!buffer_appendf(&buf, "\\small %s\n\\medskip\n\\begin{tabular}{@{}ll@{}}\n", vendor_message_tex)) goto cleanup;
     if (isfinite(advisory_summary.vendor.denied_rate)) {
         if (!buffer_appendf(&buf, "Denied rate & %.0f\\%%\\\\\n", advisory_summary.vendor.denied_rate * 100.0)) goto cleanup;
     }
@@ -14776,7 +14773,7 @@ static int build_location_overview_tex(const ReportJob *job,
     if (isfinite(advisory_summary.vendor.closure_rate)) {
         if (!buffer_appendf(&buf, "Closure rate & %.0f\\%%\\\\\n", advisory_summary.vendor.closure_rate * 100.0)) goto cleanup;
     }
-    if (!buffer_append_cstr(&buf, "\\end{tabular}\\n\\end{tcolorbox}\\n\\medskip\\n")) goto cleanup;
+    if (!buffer_append_cstr(&buf, "\\end{tabular}\n\\end{tcolorbox}\n\\medskip\n")) goto cleanup;
 
     free(maintenance_status_tex);
     maintenance_status_tex = NULL;
