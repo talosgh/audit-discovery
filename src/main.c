@@ -798,6 +798,135 @@ static char *format_range_label(const char *start, const char *end) {
     return range;
 }
 
+static char *slugify_filename_component(const char *text) {
+    const char *source = text;
+    if (!source || !*source) {
+        source = "report";
+    }
+    char *clean = sanitize_ascii(source);
+    if (clean && clean[0] != '\0') {
+        source = clean;
+    }
+
+    Buffer slug;
+    if (!buffer_init(&slug)) {
+        free(clean);
+        return NULL;
+    }
+
+    bool last_dash = false;
+    for (const unsigned char *p = (const unsigned char *)source; *p; ++p) {
+        unsigned char c = *p;
+        if (isalnum(c)) {
+            if (!buffer_append_char(&slug, (char)tolower(c))) {
+                buffer_free(&slug);
+                free(clean);
+                return NULL;
+            }
+            last_dash = false;
+        } else if (c == ' ' || c == '-' || c == '_' || c == '.' || c == '/' || c == '\\' || c == ',') {
+            if (!last_dash && slug.length > 0) {
+                if (!buffer_append_char(&slug, '-')) {
+                    buffer_free(&slug);
+                    free(clean);
+                    return NULL;
+                }
+                last_dash = true;
+            }
+        }
+    }
+
+    if (slug.length == 0) {
+        buffer_append_cstr(&slug, "report");
+    } else if (last_dash && slug.length > 0) {
+        slug.data[--slug.length] = '\0';
+    }
+
+    char *result = slug.data;
+    slug.data = NULL;
+    buffer_free(&slug);
+    if (clean) {
+        free(clean);
+    }
+    if (!result) {
+        result = strdup("report");
+    }
+    return result;
+}
+
+static void normalized_date_component(char *dest, size_t dest_size, const char *candidate) {
+    if (!dest || dest_size == 0) {
+        return;
+    }
+    size_t pos = 0;
+    if (candidate) {
+        for (const unsigned char *p = (const unsigned char *)candidate; *p && pos + 1 < dest_size; ++p) {
+            unsigned char c = *p;
+            if (isdigit(c)) {
+                dest[pos++] = (char)c;
+            } else if ((c == '-' || c == '/' || c == ' ' || c == '.') && pos > 0 && dest[pos - 1] != '-') {
+                dest[pos++] = '-';
+            }
+        }
+        while (pos > 0 && dest[pos - 1] == '-') {
+            --pos;
+        }
+    }
+
+    if (pos == 0) {
+        time_t now = time(NULL);
+        struct tm tm_now;
+        if (localtime_r(&now, &tm_now) && strftime(dest, dest_size, "%Y-%m-%d", &tm_now) > 0) {
+            return;
+        }
+        strncpy(dest, "today", dest_size);
+        dest[dest_size - 1] = '\0';
+        return;
+    }
+
+    dest[pos] = '\0';
+}
+
+static char *build_report_artifact_name(const ReportJob *job, const ReportData *report) {
+    char *address_slug = slugify_filename_component(job && job->address ? job->address : NULL);
+    if (!address_slug) {
+        return NULL;
+    }
+
+    char date_component[32];
+    const char *best_date = NULL;
+    if (job) {
+        if (job->range_end && job->range_end[0]) {
+            best_date = job->range_end;
+        } else if (job->range_start && job->range_start[0]) {
+            best_date = job->range_start;
+        }
+    }
+    if (!best_date && report) {
+        if (report->summary.audit_range.end) {
+            best_date = report->summary.audit_range.end;
+        } else if (report->summary.audit_range.start) {
+            best_date = report->summary.audit_range.start;
+        }
+    }
+    normalized_date_component(date_component, sizeof(date_component), best_date);
+
+    const char *suffix = "";
+    if (job && job->deficiency_only) {
+        suffix = "-deficiencies";
+    }
+
+    size_t needed = strlen(address_slug) + 1 + strlen(date_component) + strlen(suffix) + 5;
+    char *filename = malloc(needed);
+    if (!filename) {
+        free(address_slug);
+        return NULL;
+    }
+    snprintf(filename, needed, "%s-%s%s.pdf", address_slug, date_component, suffix);
+    free(address_slug);
+    return filename;
+}
+
 static int buffer_append_currency(Buffer *buf, double amount) {
     if (!buf) {
         return 0;
@@ -1265,6 +1394,9 @@ static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownl
 static void cleanup_report_download(ReportDownloadArtifact *artifact);
 static void *report_worker_main(void *arg);
 static void signal_report_worker(void);
+static char *slugify_filename_component(const char *text);
+static void normalized_date_component(char *dest, size_t dest_size, const char *candidate);
+static char *build_report_artifact_name(const ReportJob *job, const ReportData *report);
 static void narrative_set_init(NarrativeSet *set);
 static void narrative_set_clear(NarrativeSet *set);
 static int build_report_latex(PGconn *conn, const ReportData *report, const NarrativeSet *narratives, const ReportJob *job, const LocationProfile *profile, const char *output_path, char **error_out);
@@ -12224,12 +12356,16 @@ static void *report_worker_main(void *arg) {
         int success = process_report_job(conn, &job, &pdf_data, &pdf_size, &process_error);
         char *update_error = NULL;
         if (success) {
-            const char *artifact_name = job.deficiency_only ? "deficiency-list.pdf" : (job.type == REPORT_JOB_TYPE_LOCATION_OVERVIEW ? "location_overview.pdf" : "audit_report.pdf");
+            char *artifact_name = build_report_artifact_name(&job, NULL);
+            const char *artifact_filename = artifact_name ? artifact_name
+                                                          : (job.deficiency_only ? "deficiency-list.pdf"
+                                                                                 : (job.type == REPORT_JOB_TYPE_LOCATION_OVERVIEW ? "location_overview.pdf"
+                                                                                                                                : "audit_report.pdf"));
             if (!db_complete_report_job(conn,
                                         job.job_id,
                                         "completed",
                                         NULL,
-                                        artifact_name,
+                                        artifact_filename,
                                         "application/pdf",
                                         pdf_data,
                                         pdf_size,
@@ -12238,6 +12374,7 @@ static void *report_worker_main(void *arg) {
             } else {
                 log_info("Report job %s completed", job.job_id);
             }
+            free(artifact_name);
         } else {
             const char *message = process_error ? process_error : "Report generation failed";
             if (!db_complete_report_job(conn,

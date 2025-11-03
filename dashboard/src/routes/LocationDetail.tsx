@@ -320,10 +320,12 @@ const LocationDetail: Component<LocationDetailProps> = (props) => {
     }
     if (status.status === 'completed' && status.download_ready) {
       setStatusMessage(null);
-      setMessage(`${label} ready for download (${selectionDescriptor}).`);
+      const alreadyDownloaded = lastDownload()?.jobId === status.job_id;
+      if (!alreadyDownloaded) {
+        void downloadReportFor(status.job_id, label);
+      }
       setIsGenerating(false);
       stopPolling();
-      setLastDownload(null);
       void refetch();
       return;
     }
