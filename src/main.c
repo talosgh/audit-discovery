@@ -290,6 +290,50 @@ typedef struct {
     double spend_capex_window_total;
 } TimelineStats;
 
+typedef struct {
+    Buffer coords;
+    long total;
+} PlotSeriesBuffer;
+
+typedef struct {
+    const char *label;
+    const char *fill;
+} TimelineSeriesMeta;
+
+static const TimelineSeriesMeta TIMELINE_SERIES_META[] = {
+    { "Preventative Maintenance", "Set2-1" },
+    { "Testing", "Set2-2" },
+    { "Callbacks – Emergency", "Set2-3" },
+    { "Callbacks – Equipment", "Set2-4" },
+    { "Callbacks – Other", "Set2-5" },
+    { "Repairs / Modernization", "Set2-6" }
+};
+
+#define TIMELINE_SERIES_COUNT (int)(sizeof(TIMELINE_SERIES_META) / sizeof(TIMELINE_SERIES_META[0]))
+
+typedef enum {
+    SERVICE_BUCKET_PM,
+    SERVICE_BUCKET_TESTING,
+    SERVICE_BUCKET_CALLBACK_EMERGENCY,
+    SERVICE_BUCKET_CALLBACK_EQUIPMENT,
+    SERVICE_BUCKET_CALLBACK_OTHER,
+    SERVICE_BUCKET_REPAIR,
+    SERVICE_BUCKET_SUPPORT,
+    SERVICE_BUCKET_MISC,
+    SERVICE_BUCKET_COUNT
+} ServiceMixBucketId;
+
+static const char *SERVICE_MIX_BUCKET_LABELS[SERVICE_BUCKET_COUNT] = {
+    "Preventative Maintenance",
+    "Testing",
+    "Callbacks – Emergency",
+    "Callbacks – Equipment",
+    "Callbacks – Other",
+    "Repairs / Modernization",
+    "Site / Standby Support",
+    "Miscellaneous"
+};
+
 static bool timeline_json_has_entries(const char *json) {
     if (!json) {
         return false;
@@ -1389,7 +1433,12 @@ static char *build_report_json_payload(PGconn *conn, const LocationDetailRequest
 static char *build_download_url(const char *job_id);
 static void send_report_job_response(int client_fd, int http_status, const char *status_value, const char *job_id, const ReportJob *job, const char *download_url);
 static int generate_uuid_v4(char out[37]);
-static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char **pdf_bytes_out, size_t *pdf_size_out, char **error_out);
+static int process_report_job(PGconn *conn,
+                              const ReportJob *job,
+                              unsigned char **pdf_bytes_out,
+                              size_t *pdf_size_out,
+                              char **artifact_name_out,
+                              char **error_out);
 static int prepare_report_download(PGconn *conn, const char *job_id, ReportDownloadArtifact *artifact, char **error_out);
 static void cleanup_report_download(ReportDownloadArtifact *artifact);
 static void *report_worker_main(void *arg);
@@ -8486,16 +8535,26 @@ static char *build_location_analytics_json(const ReportData *report, const Locat
         return NULL;
     }
 
-    int device_count = 0;
-    if (profile && profile->device_count.has_value) {
-        device_count = profile->device_count.value;
-    } else if (report->summary.total_devices > 0) {
+    int installed_devices = (profile && profile->device_count.has_value) ? profile->device_count.value : 0;
+    int device_count = installed_devices > 0 ? installed_devices : 0;
+    if (device_count <= 0 && report->summary.total_devices > 0) {
         device_count = report->summary.total_devices;
     }
 
     bool deficiencies_available = report->summary.audit_count > 0;
-    bool service_available = service_stats && service_stats->has_records;
-    bool financial_available = financial_stats && financial_stats->has_records;
+    bool service_available = service_stats &&
+                             (service_stats->has_records ||
+                              service_stats->total_tickets > 0 ||
+                              service_stats->total_activity_tickets > 0 ||
+                              service_stats->total_hours > 0.0);
+    bool financial_available = financial_stats &&
+                               (financial_stats->has_records ||
+                                financial_stats->total_records > 0 ||
+                                fabs(financial_stats->total_spend) > 0.0 ||
+                                fabs(financial_stats->approved_spend) > 0.0 ||
+                                fabs(financial_stats->open_spend) > 0.0 ||
+                                fabs(financial_stats->total_savings) > 0.0 ||
+                                fabs(financial_stats->proposed_spend) > 0.0);
     bool timeline_has_entries = timeline_json_has_entries(timeline_json);
     bool service_available_timeline = service_available || timeline_has_service;
     bool financial_available_timeline = financial_available || timeline_has_financial;
@@ -11771,12 +11830,20 @@ static void cleanup_report_download(ReportDownloadArtifact *artifact) {
     }
 }
 
-static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char **pdf_bytes_out, size_t *pdf_size_out, char **error_out) {
+static int process_report_job(PGconn *conn,
+                              const ReportJob *job,
+                              unsigned char **pdf_bytes_out,
+                              size_t *pdf_size_out,
+                              char **artifact_name_out,
+                              char **error_out) {
     if (pdf_bytes_out) {
         *pdf_bytes_out = NULL;
     }
     if (pdf_size_out) {
         *pdf_size_out = 0;
+    }
+    if (artifact_name_out) {
+        *artifact_name_out = NULL;
     }
     if (!conn || !job || !job->address || !g_report_output_dir) {
         if (error_out && !*error_out) {
@@ -11809,6 +11876,7 @@ static int process_report_job(PGconn *conn, const ReportJob *job, unsigned char 
     size_t total_task_slots = 0;
     size_t tasks_created = 0;
     char *narrative_build_error = NULL;
+    char *generated_artifact_name = NULL;
     unsigned char *pdf_bytes = NULL;
     size_t pdf_size = 0;
 
@@ -12232,6 +12300,9 @@ narrative_join:
         }
         goto cleanup;
     }
+    if (artifact_name_out && !generated_artifact_name) {
+        generated_artifact_name = build_report_artifact_name(job, &report);
+    }
     if (pdf_bytes_out) {
         *pdf_bytes_out = pdf_bytes;
         pdf_bytes = NULL;
@@ -12268,6 +12339,17 @@ cleanup:
     }
     if (pdf_bytes) {
         free(pdf_bytes);
+    }
+    if (artifact_name_out) {
+        if (success) {
+            *artifact_name_out = generated_artifact_name;
+            generated_artifact_name = NULL;
+        } else {
+            *artifact_name_out = NULL;
+        }
+    }
+    if (generated_artifact_name) {
+        free(generated_artifact_name);
     }
     return success;
 }
@@ -12352,11 +12434,14 @@ static void *report_worker_main(void *arg) {
 
         unsigned char *pdf_data = NULL;
         size_t pdf_size = 0;
+        char *artifact_name = NULL;
         char *process_error = NULL;
-        int success = process_report_job(conn, &job, &pdf_data, &pdf_size, &process_error);
+        int success = process_report_job(conn, &job, &pdf_data, &pdf_size, &artifact_name, &process_error);
         char *update_error = NULL;
         if (success) {
-            char *artifact_name = build_report_artifact_name(&job, NULL);
+            if (!artifact_name) {
+                artifact_name = build_report_artifact_name(&job, NULL);
+            }
             const char *artifact_filename = artifact_name ? artifact_name
                                                           : (job.deficiency_only ? "deficiency-list.pdf"
                                                                                  : (job.type == REPORT_JOB_TYPE_LOCATION_OVERVIEW ? "location_overview.pdf"
@@ -12374,7 +12459,6 @@ static void *report_worker_main(void *arg) {
             } else {
                 log_info("Report job %s completed", job.job_id);
             }
-            free(artifact_name);
         } else {
             const char *message = process_error ? process_error : "Report generation failed";
             if (!db_complete_report_job(conn,
@@ -12394,6 +12478,7 @@ static void *report_worker_main(void *arg) {
         free(update_error);
         free(process_error);
         free(pdf_data);
+        free(artifact_name);
         report_job_clear(&job);
     }
 
@@ -13317,11 +13402,47 @@ static int build_location_overview_tex(const ReportJob *job,
     }
 
     Buffer buf;
-    if (!buffer_init(&buf)) {
+    Buffer timeline_symbolic;
+    Buffer timeline_spend_coords;
+    Buffer timeline_legend;
+    Buffer service_mix_symbols;
+    Buffer service_mix_coords;
+    PlotSeriesBuffer timeline_series[TIMELINE_SERIES_COUNT];
+    memset(timeline_series, 0, sizeof(timeline_series));
+
+    if (!buffer_init(&buf) ||
+        !buffer_init(&timeline_symbolic) ||
+        !buffer_init(&timeline_spend_coords) ||
+        !buffer_init(&timeline_legend) ||
+        !buffer_init(&service_mix_symbols) ||
+        !buffer_init(&service_mix_coords)) {
         if (error_out && !*error_out) {
             *error_out = strdup("Out of memory");
         }
+        buffer_free(&buf);
+        buffer_free(&timeline_symbolic);
+        buffer_free(&timeline_spend_coords);
+        buffer_free(&timeline_legend);
+        buffer_free(&service_mix_symbols);
+        buffer_free(&service_mix_coords);
         return 0;
+    }
+    for (int i = 0; i < TIMELINE_SERIES_COUNT; ++i) {
+        if (!buffer_init(&timeline_series[i].coords)) {
+            if (error_out && !*error_out) {
+                *error_out = strdup("Out of memory");
+            }
+            for (int j = 0; j <= i; ++j) {
+                buffer_free(&timeline_series[j].coords);
+            }
+            buffer_free(&buf);
+            buffer_free(&timeline_symbolic);
+            buffer_free(&timeline_spend_coords);
+            buffer_free(&timeline_legend);
+            buffer_free(&service_mix_symbols);
+            buffer_free(&service_mix_coords);
+            return 0;
+        }
     }
 
     int success = 0;
@@ -13452,14 +13573,17 @@ static int build_location_overview_tex(const ReportJob *job,
         }
     }
 
-    int device_count = report->summary.total_devices;
+    int installed_devices = (profile && profile->device_count.has_value) ? profile->device_count.value : 0;
+    int audited_devices = report->summary.total_devices;
+    int device_count = installed_devices > 0 ? installed_devices : audited_devices;
     int audit_count = report->summary.audit_count;
     int total_deficiencies = report->summary.total_deficiencies;
-    double avg_def_per_device = report->summary.average_deficiencies_per_device;
+    double avg_def_per_device = (device_count > 0)
+                                    ? safe_divide((double)total_deficiencies, (double)device_count)
+                                    : report->summary.average_deficiencies_per_device;
 
     long total_service_tickets = service_stats->total_tickets;
     double total_service_hours = service_stats->total_hours;
-    double tickets_per_device = (device_count > 0) ? ((double)total_service_tickets / (double)device_count) : 0.0;
 
     double total_spend = financial_stats->total_spend;
     double approved_spend = financial_stats->approved_spend;
@@ -13467,6 +13591,26 @@ static int build_location_overview_tex(const ReportJob *job,
     double proposed_spend = financial_stats->proposed_spend;
     double total_savings = financial_stats->total_savings;
     double savings_rate = financial_stats->savings_rate;
+
+    bool service_available = service_stats->has_records ||
+                             service_stats->total_tickets > 0 ||
+                             service_stats->total_activity_tickets > 0 ||
+                             service_stats->total_hours > 0.0;
+    bool financial_available = financial_stats->has_records ||
+                               financial_stats->total_records > 0 ||
+                               fabs(financial_stats->total_spend) > 0.0 ||
+                               fabs(financial_stats->approved_spend) > 0.0 ||
+                               fabs(financial_stats->open_spend) > 0.0 ||
+                             fabs(financial_stats->total_savings) > 0.0 ||
+                             fabs(financial_stats->proposed_spend) > 0.0;
+    bool timeline_service_available = timeline_has_service && service_available;
+    bool timeline_financial_available = timeline_has_financial && financial_available;
+    bool timeline_any_available = timeline_json && (timeline_service_available || timeline_financial_available);
+
+    double tickets_per_device = (service_available && device_count > 0)
+                                    ? ((double)total_service_tickets / (double)device_count)
+                                    : 0.0;
+    long service_bucket_counts[SERVICE_BUCKET_COUNT] = {0};
 
     fail_stage = "writing cover page";
     if (!buffer_append_cstr(&buf,
@@ -13478,6 +13622,11 @@ static int build_location_overview_tex(const ReportJob *job,
         "\\usepackage{xcolor}\n"
         "\\usepackage{graphicx}\n"
         "\\usepackage{hyperref}\n"
+        "\\usepackage{tikz}\n"
+        "\\usepackage{pgfplots}\n"
+        "\\usepackage{pgfplotstable}\n"
+        "\\pgfplotsset{compat=1.18}\n"
+        "\\usepgfplotslibrary{colorbrewer}\n"
         "\\geometry{margin=1in}\n"
         "\\hypersetup{colorlinks=false}\n"
         "\\begin{document}\n\n")) goto cleanup;
@@ -13503,273 +13652,413 @@ static int build_location_overview_tex(const ReportJob *job,
     if (!buffer_appendf(&buf, "Location & %s\\\\\n", site_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "Address & %s\\\\\n", address_tex)) goto cleanup;
     if (!buffer_appendf(&buf, "Reporting window & %s\\\\\n", range_tex)) goto cleanup;
-    if (!buffer_appendf(&buf, "Devices audited & %d\\\\\n", device_count)) goto cleanup;
+    if (installed_devices > 0) {
+        if (!buffer_appendf(&buf, "Installed devices & %d\\\\\n", installed_devices)) goto cleanup;
+    }
+    if (audited_devices > 0) {
+        if (!buffer_appendf(&buf, "Devices audited & %d\\\\\n", audited_devices)) goto cleanup;
+    }
     if (!buffer_appendf(&buf, "Audits on record & %d\\\\\n", audit_count)) goto cleanup;
-    if (!buffer_appendf(&buf, "Total deficiencies & %d\\\\\n", total_deficiencies)) goto cleanup;
-    if (!buffer_appendf(&buf, "Average deficiencies per device & %.2f\\\\\n", avg_def_per_device)) goto cleanup;
-    if (!buffer_appendf(&buf, "Open deficiencies & %d\\\\\n", open_deficiencies)) goto cleanup;
-    if (!buffer_appendf(&buf, "Closed deficiencies & %d\\\\\n", closed_deficiencies)) goto cleanup;
-    if (!buffer_appendf(&buf, "Service tickets (window) & %ld\\\\\n", total_service_tickets)) goto cleanup;
-    if (!buffer_appendf(&buf, "Service hours (window) & %.2f\\\\\n", total_service_hours)) goto cleanup;
-    if (!buffer_appendf(&buf, "Tickets per device & %.2f\\\\\n", tickets_per_device)) goto cleanup;
+    if (audit_count > 0 || total_deficiencies > 0 || open_deficiencies > 0 || closed_deficiencies > 0) {
+        if (!buffer_appendf(&buf, "Total deficiencies & %d\\\\\n", total_deficiencies)) goto cleanup;
+        if (!buffer_appendf(&buf, "Average deficiencies per device & %.2f\\\\\n", avg_def_per_device)) goto cleanup;
+        if (!buffer_appendf(&buf, "Open deficiencies & %d\\\\\n", open_deficiencies)) goto cleanup;
+        if (!buffer_appendf(&buf, "Closed deficiencies & %d\\\\\n", closed_deficiencies)) goto cleanup;
+    }
+    if (service_available) {
+        if (!buffer_appendf(&buf, "Service tickets (window) & %ld\\\\\n", total_service_tickets)) goto cleanup;
+        if (!buffer_appendf(&buf, "Service hours (window) & %.2f\\\\\n", total_service_hours)) goto cleanup;
+        if (!buffer_appendf(&buf, "Tickets per device & %.2f\\\\\n", tickets_per_device)) goto cleanup;
+    }
+    if (financial_available) {
+        if (!buffer_append_cstr(&buf, "Spend captured & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, total_spend)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "Negotiated savings & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, total_savings)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+    }
     if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\n\n")) goto cleanup;
+    if (!service_available) {
+        if (!buffer_append_cstr(&buf, "\\textit{No service data was available for this reporting window.}\\par\n\n")) goto cleanup;
+    }
+    if (!financial_available) {
+        if (!buffer_append_cstr(&buf, "\\textit{No financial records were available for this reporting window.}\\par\n\n")) goto cleanup;
+    }
 
     fail_stage = "writing service performance";
     if (!buffer_append_cstr(&buf, "\\section*{Service Performance}\n")) goto cleanup;
-    if (!buffer_appendf(&buf,
-            "The reporting window captured %ld service tickets totalling %.2f hours of technician engagement. ",
-            total_service_tickets,
-            total_service_hours)) goto cleanup;
-    if (!buffer_appendf(&buf,
-            "Across %d devices this averages to %.2f tickets per unit.\\\\par\n",
-            device_count > 0 ? device_count : (int)report->devices.count,
-            tickets_per_device)) goto cleanup;
-
-    char stage_details[128];
-    stage_details[0] = '\0';
-
-    long total_activity_tickets = service_stats->total_activity_tickets;
-    if (total_activity_tickets == 0) {
-        if (!buffer_append_cstr(&buf, "\\textit{No service activity records were available for this range.}\\\\par\n")) goto cleanup;
+    if (!service_available) {
+        if (!buffer_append_cstr(&buf, "\\textit{No service dispatch records were available for this reporting window.}\\\\par\n\n")) goto cleanup;
     } else {
-        fail_stage = "writing service activity mix";
-        if (!buffer_append_cstr(&buf, "\\subsection*{Activity Mix}\n")) goto cleanup;
-        if (!buffer_append_cstr(&buf, "\\begin{tabular}{lrrr}\n\\toprule\nCategory & Tickets & Hours & Share\\\\\n\\midrule\n")) goto cleanup;
-        for (int cat = 0; cat <= SERVICE_ACTIVITY_UNKNOWN; ++cat) {
-            long tickets = service_stats->category_tickets[cat];
-            double hours = service_stats->category_hours[cat];
-            if (tickets == 0 && hours == 0.0) {
-                continue;
-            }
-            double hours_clamped = isfinite(hours) ? hours : 0.0;
-            double share = (double)tickets / (double)total_activity_tickets;
-            share = isfinite(share) ? share : 0.0;
-            const char *label = service_activity_category_name((ServiceActivityCategory)cat);
-            snprintf(stage_details, sizeof(stage_details), "writing service activity row (%s)", label ? label : "Unknown");
-            fail_stage = stage_details;
-            char *label_clean = sanitize_ascii(label ? label : "Unknown");
-            char *label_tex = latex_escape(label_clean ? label_clean : (label ? label : "Unknown"));
-            free(label_clean);
-            if (!label_tex) goto cleanup;
-            if (!buffer_appendf(&buf, "%s & %ld & ", label_tex, tickets)) {
-                log_error("Failed to append service activity tickets (label=%s, tickets=%ld)", label ? label : "Unknown", tickets);
-                free(label_tex);
-                goto cleanup;
-            }
-            free(label_tex);
-            if (!buffer_appendf(&buf, "%.2f", hours_clamped)) {
-                log_error("Failed to append service activity hours (label=%s, hours=%.4f)", label ? label : "Unknown", hours_clamped);
-                goto cleanup;
-            }
-            if (!buffer_append_cstr(&buf, " & ")) {
-                log_error("Failed to append service activity separator (label=%s)", label ? label : "Unknown");
-                goto cleanup;
-            }
-            if (!buffer_append_percent(&buf, share, 1)) {
-                log_error("Failed to append service activity share (label=%s, share=%.4f)", label ? label : "Unknown", share);
-                goto cleanup;
-            }
-            if (!buffer_append_cstr(&buf, "\\\\\n")) {
-                log_error("Failed to finish service activity row (label=%s)", label ? label : "Unknown");
-                goto cleanup;
-            }
-        }
-        if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
-        fail_stage = "writing service performance";
+        if (!buffer_appendf(&buf,
+                "The reporting window captured %ld service tickets totalling %.2f hours of technician engagement. ",
+                total_service_tickets,
+                total_service_hours)) goto cleanup;
+        if (!buffer_appendf(&buf,
+                "Across %d devices this averages to %.2f tickets per unit.\\\\par\n",
+                device_count > 0 ? device_count : (int)report->devices.count,
+                tickets_per_device)) goto cleanup;
 
-        fail_stage = "writing top service issues";
-        if (service_json) {
-            char *service_parse_error = NULL;
-            JsonValue *service_root = json_parse(service_json, &service_parse_error);
-            if (service_root && service_root->type == JSON_OBJECT) {
-                JsonValue *top_problems = json_object_get(service_root, "top_problems");
-                if (top_problems && top_problems->type == JSON_ARRAY && json_array_size(top_problems) > 0) {
-                    size_t count = json_array_size(top_problems);
-                    size_t limit = count > 8 ? 8 : count;
+        char stage_details[128];
+        stage_details[0] = '\0';
+
+        long total_activity_tickets = service_stats->total_activity_tickets;
+        if (total_activity_tickets == 0) {
+            if (!buffer_append_cstr(&buf, "\\textit{No service activity records were available for this range.}\\\\par\n")) goto cleanup;
+        } else {
+            fail_stage = "writing service activity mix";
+            if (!buffer_append_cstr(&buf, "\\subsection*{Activity Mix}\n")) goto cleanup;
+            if (!buffer_append_cstr(&buf, "\\begin{tabular}{lrrr}\n\\toprule\nCategory & Tickets & Hours & Share\\\\\n\\midrule\n")) goto cleanup;
+            for (int cat = 0; cat <= SERVICE_ACTIVITY_UNKNOWN; ++cat) {
+                long tickets = service_stats->category_tickets[cat];
+                double hours = service_stats->category_hours[cat];
+                if (tickets == 0 && hours == 0.0) {
+                    continue;
+                }
+                double hours_clamped = isfinite(hours) ? hours : 0.0;
+                double share = (double)tickets / (double)total_activity_tickets;
+                share = isfinite(share) ? share : 0.0;
+                ServiceActivityCategory cat_enum = (ServiceActivityCategory)cat;
+                ServiceMixBucketId bucket_id = SERVICE_BUCKET_MISC;
+                switch (cat_enum) {
+                    case SERVICE_ACTIVITY_PREVENTATIVE:
+                        bucket_id = SERVICE_BUCKET_PM;
+                        break;
+                    case SERVICE_ACTIVITY_TESTING_NO_LOAD:
+                    case SERVICE_ACTIVITY_TESTING_FULL_LOAD:
+                        bucket_id = SERVICE_BUCKET_TESTING;
+                        break;
+                    case SERVICE_ACTIVITY_CALLBACK_EMERGENCY:
+                        bucket_id = SERVICE_BUCKET_CALLBACK_EMERGENCY;
+                        break;
+                    case SERVICE_ACTIVITY_CALLBACK_EQUIPMENT:
+                        bucket_id = SERVICE_BUCKET_CALLBACK_EQUIPMENT;
+                        break;
+                    case SERVICE_ACTIVITY_CALLBACK_VANDALISM:
+                    case SERVICE_ACTIVITY_CALLBACK_ENVIRONMENTAL:
+                    case SERVICE_ACTIVITY_CALLBACK_UTILITY:
+                    case SERVICE_ACTIVITY_CALLBACK_FIRE_PANEL:
+                    case SERVICE_ACTIVITY_CALLBACK_OTHER:
+                        bucket_id = SERVICE_BUCKET_CALLBACK_OTHER;
+                        break;
+                    case SERVICE_ACTIVITY_REPAIR:
+                        bucket_id = SERVICE_BUCKET_REPAIR;
+                        break;
+                    case SERVICE_ACTIVITY_SITE_VISIT:
+                    case SERVICE_ACTIVITY_STANDBY:
+                        bucket_id = SERVICE_BUCKET_SUPPORT;
+                        break;
+                    case SERVICE_ACTIVITY_UNKNOWN:
+                    default:
+                        bucket_id = SERVICE_BUCKET_MISC;
+                        break;
+                }
+                service_bucket_counts[bucket_id] += tickets;
+                const char *label = service_activity_category_name((ServiceActivityCategory)cat);
+                snprintf(stage_details, sizeof(stage_details), "writing service activity row (%s)", label ? label : "Unknown");
+                fail_stage = stage_details;
+                char *label_clean = sanitize_ascii(label ? label : "Unknown");
+                char *label_tex = latex_escape(label_clean ? label_clean : (label ? label : "Unknown"));
+                free(label_clean);
+                if (!label_tex) goto cleanup;
+                if (!buffer_appendf(&buf, "%s & %ld & ", label_tex, tickets)) {
+                    log_error("Failed to append service activity tickets (label=%s, tickets=%ld)", label ? label : "Unknown", tickets);
+                    free(label_tex);
+                    goto cleanup;
+                }
+                free(label_tex);
+                if (!buffer_appendf(&buf, "%.2f", hours_clamped)) {
+                    log_error("Failed to append service activity hours (label=%s, hours=%.4f)", label ? label : "Unknown", hours_clamped);
+                    goto cleanup;
+                }
+                if (!buffer_append_cstr(&buf, " & ")) {
+                    log_error("Failed to append service activity separator (label=%s)", label ? label : "Unknown");
+                    goto cleanup;
+                }
+                if (!buffer_append_percent(&buf, share, 1)) {
+                    log_error("Failed to append service activity share (label=%s, share=%.4f)", label ? label : "Unknown", share);
+                    goto cleanup;
+                }
+                if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                    log_error("Failed to finish service activity row (label=%s)", label ? label : "Unknown");
+                    goto cleanup;
+                }
+            }
+            if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
+            fail_stage = "writing service performance";
+
             fail_stage = "writing top service issues";
-            if (!buffer_append_cstr(&buf, "\\subsubsection*{Top Reported Issues}\n")) {
-                        json_free(service_root);
-                        free(service_parse_error);
-                        goto cleanup;
-                    }
-                    if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}r}\n\\toprule\nIssue & Tickets\\\\\n\\midrule\n")) {
-                        json_free(service_root);
-                        free(service_parse_error);
-                        goto cleanup;
-                    }
-                    for (size_t i = 0; i < limit; ++i) {
-                        JsonValue *item = json_array_get(top_problems, i);
-                        if (!item || item->type != JSON_OBJECT) {
-                            continue;
-                        }
-                        const char *problem = json_as_string(json_object_get(item, "problem"));
-                        long tickets = 0;
-                        json_as_long(json_object_get(item, "count"), &tickets);
-                        char *problem_clean = sanitize_ascii(problem ? problem : "Unspecified");
-                        char *problem_tex = latex_escape(problem_clean ? problem_clean : (problem ? problem : "Unspecified"));
-                        free(problem_clean);
-                        if (!problem_tex) {
+            if (service_json) {
+                char *service_parse_error = NULL;
+                JsonValue *service_root = json_parse(service_json, &service_parse_error);
+                if (service_root && service_root->type == JSON_OBJECT) {
+                    JsonValue *top_problems = json_object_get(service_root, "top_problems");
+                    if (top_problems && top_problems->type == JSON_ARRAY && json_array_size(top_problems) > 0) {
+                        size_t count = json_array_size(top_problems);
+                        size_t limit = count > 8 ? 8 : count;
+                        if (!buffer_append_cstr(&buf, "\\subsubsection*{Top Reported Issues}\n")) {
                             json_free(service_root);
                             free(service_parse_error);
                             goto cleanup;
                         }
-                        if (!buffer_appendf(&buf, "%s & %ld\\\\\n", problem_tex, tickets)) {
+                        if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}r}\n\\toprule\nIssue & Tickets\\\\\n\\midrule\n")) {
+                            json_free(service_root);
+                            free(service_parse_error);
+                            goto cleanup;
+                        }
+                        for (size_t i = 0; i < limit; ++i) {
+                            JsonValue *item = json_array_get(top_problems, i);
+                            if (!item || item->type != JSON_OBJECT) {
+                                continue;
+                            }
+                            const char *problem = json_as_string(json_object_get(item, "problem"));
+                            long tickets = 0;
+                            json_as_long(json_object_get(item, "count"), &tickets);
+                            char *problem_clean = sanitize_ascii(problem ? problem : "Unspecified");
+                            char *problem_tex = latex_escape(problem_clean ? problem_clean : (problem ? problem : "Unspecified"));
+                            free(problem_clean);
+                            if (!problem_tex) {
+                                json_free(service_root);
+                                free(service_parse_error);
+                                goto cleanup;
+                            }
+                            if (!buffer_appendf(&buf, "%s & %ld\\\\\n", problem_tex, tickets)) {
+                                free(problem_tex);
+                                json_free(service_root);
+                                free(service_parse_error);
+                                goto cleanup;
+                            }
                             free(problem_tex);
+                        }
+                        if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) {
                             json_free(service_root);
                             free(service_parse_error);
                             goto cleanup;
                         }
-                        free(problem_tex);
                     }
-                    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) {
-                        json_free(service_root);
-                        free(service_parse_error);
-                        goto cleanup;
+                }
+            json_free(service_root);
+            free(service_parse_error);
+        }
+    }
+        long service_mix_total = 0;
+        for (int bucket_index = 0; bucket_index < SERVICE_BUCKET_COUNT; ++bucket_index) {
+            service_mix_total += service_bucket_counts[bucket_index];
+        }
+        if (service_mix_total > 0) {
+            typedef struct {
+                const char *label;
+                long tickets;
+            } ServiceMixPlot;
+            ServiceMixPlot mix_plot[SERVICE_BUCKET_COUNT];
+            for (int bucket_index = 0; bucket_index < SERVICE_BUCKET_COUNT; ++bucket_index) {
+                mix_plot[bucket_index].label = SERVICE_MIX_BUCKET_LABELS[bucket_index];
+                mix_plot[bucket_index].tickets = service_bucket_counts[bucket_index];
+            }
+            for (int i = 0; i < SERVICE_BUCKET_COUNT - 1; ++i) {
+                for (int j = i + 1; j < SERVICE_BUCKET_COUNT; ++j) {
+                    if (mix_plot[j].tickets > mix_plot[i].tickets) {
+                        ServiceMixPlot tmp = mix_plot[i];
+                        mix_plot[i] = mix_plot[j];
+                        mix_plot[j] = tmp;
                     }
                 }
             }
-            json_free(service_root);
-            free(service_parse_error);
+            size_t plotted = 0;
+            for (int i = 0; i < SERVICE_BUCKET_COUNT && plotted < 6; ++i) {
+                if (mix_plot[i].tickets <= 0) {
+                    continue;
+                }
+                double share_pct = ((double)mix_plot[i].tickets / (double)service_mix_total) * 100.0;
+                char *label_tex = latex_escape(mix_plot[i].label ? mix_plot[i].label : "Other");
+                if (!label_tex) {
+                    goto cleanup;
+                }
+                if (service_mix_symbols.length > 0) {
+                    if (!buffer_append_cstr(&service_mix_symbols, ",")) {
+                        free(label_tex);
+                        goto cleanup;
+                    }
+                }
+                if (!buffer_append_cstr(&service_mix_symbols, label_tex)) {
+                    free(label_tex);
+                    goto cleanup;
+                }
+                if (service_mix_coords.length == 0) {
+                    if (!buffer_append_char(&service_mix_coords, '{')) {
+                        free(label_tex);
+                        goto cleanup;
+                    }
+                } else {
+                    if (!buffer_append_char(&service_mix_coords, ' ')) {
+                        free(label_tex);
+                        goto cleanup;
+                    }
+                }
+                if (!buffer_appendf(&service_mix_coords, "(%.1f,{%s})", share_pct, label_tex)) {
+                    free(label_tex);
+                    goto cleanup;
+                }
+                free(label_tex);
+                plotted++;
+            }
+            if (service_mix_coords.length > 0) {
+                if (!buffer_append_char(&service_mix_coords, '}')) goto cleanup;
+            }
+            if (plotted > 0 && service_mix_symbols.length > 0) {
+                if (!buffer_append_cstr(&buf, "\\begin{figure}[ht]\\centering\n")) goto cleanup;
+                if (!buffer_append_cstr(&buf, "\\begin{tikzpicture}\n")) goto cleanup;
+                if (!buffer_appendf(&buf,
+                        "\\begin{axis}[width=0.95\\textwidth,height=6cm,xbar, xmin=0, xmax=100, xlabel={Share (\\%%)}, symbolic y coords={%s}, ytick=data, y dir=reverse, ytick style={font=\\small}, xticklabel style={font=\\small}, nodes near coords, nodes near coords style={font=\\small}, bar width=9pt, enlarge y limits=0.12]\n",
+                        service_mix_symbols.data)) goto cleanup;
+                if (!buffer_appendf(&buf, "\\addplot+[xbar, fill=Set3-4, draw=black!15] coordinates %s;\n", service_mix_coords.data)) goto cleanup;
+                if (!buffer_append_cstr(&buf, "\\end{axis}\n\\end{tikzpicture}\n\\caption{Service activity distribution (share of tickets)}\n\\end{figure}\n")) goto cleanup;
+            }
         }
     }
 
     fail_stage = "writing financial overview";
     if (!buffer_append_cstr(&buf, "\\section*{Financial Overview}\n")) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}p{0.35\\textwidth}}\n\\toprule\n")) goto cleanup;
-    if (!buffer_append_cstr(&buf, "Total proposed spend & ")) goto cleanup;
-    if (!buffer_append_currency(&buf, proposed_spend)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
-    if (!buffer_append_cstr(&buf, "Approved spend & ")) goto cleanup;
-    if (!buffer_append_currency(&buf, approved_spend)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
-    if (!buffer_append_cstr(&buf, "Open spend & ")) goto cleanup;
-    if (!buffer_append_currency(&buf, open_spend)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
-    if (!buffer_append_cstr(&buf, "Total spend & ")) goto cleanup;
-    if (!buffer_append_currency(&buf, total_spend)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
-    if (!buffer_append_cstr(&buf, "Negotiated savings & ")) goto cleanup;
-    if (!buffer_append_currency(&buf, total_savings)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
-    if (!buffer_append_cstr(&buf, "Savings rate & ")) goto cleanup;
-    if (!buffer_append_percent(&buf, savings_rate, 1)) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
-    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
+    if (!financial_available) {
+        if (!buffer_append_cstr(&buf, "\\textit{No financial records were available for this reporting window.}\\\\par\n\n")) goto cleanup;
+    } else {
+        if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}p{0.35\\textwidth}}\n\\toprule\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "Total proposed spend & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, proposed_spend)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "Approved spend & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, approved_spend)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "Open spend & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, open_spend)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "Total spend & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, total_spend)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "Negotiated savings & ")) goto cleanup;
+        if (!buffer_append_currency(&buf, total_savings)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "Savings rate & ")) goto cleanup;
+        if (!buffer_append_percent(&buf, savings_rate, 1)) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\\\\n")) goto cleanup;
+        if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) goto cleanup;
 
-    if (financial_json) {
-        char *financial_parse_error = NULL;
-        JsonValue *financial_root = json_parse(financial_json, &financial_parse_error);
-        if (financial_root && financial_root->type == JSON_OBJECT) {
-            JsonValue *category_breakdown = json_object_get(financial_root, "category_breakdown");
-            if (category_breakdown && category_breakdown->type == JSON_ARRAY && json_array_size(category_breakdown) > 0) {
-                size_t count = json_array_size(category_breakdown);
-                size_t limit = count > 10 ? 10 : count;
-                if (!buffer_append_cstr(&buf, "\\subsubsection*{Spend by Category}\n")) {
-                    json_free(financial_root);
-                    free(financial_parse_error);
-                    goto cleanup;
-                }
-                if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}r}\n\\toprule\nCategory & Spend\\\\\n\\midrule\n")) {
-                    json_free(financial_root);
-                    free(financial_parse_error);
-                    goto cleanup;
-                }
-                for (size_t i = 0; i < limit; ++i) {
-                    JsonValue *item = json_array_get(category_breakdown, i);
-                    if (!item || item->type != JSON_OBJECT) {
-                        continue;
-                    }
-                    const char *category_name = json_as_string(json_object_get(item, "category"));
-                    double spend_value = json_as_double_default(json_object_get(item, "spend"), 0.0);
-                    char *category_clean = sanitize_ascii(category_name ? category_name : "Uncategorized");
-                    char *category_tex = latex_escape(category_clean ? category_clean : (category_name ? category_name : "Uncategorized"));
-                    free(category_clean);
-                    if (!category_tex) {
+        if (financial_json) {
+            char *financial_parse_error = NULL;
+            JsonValue *financial_root = json_parse(financial_json, &financial_parse_error);
+            if (financial_root && financial_root->type == JSON_OBJECT) {
+                JsonValue *category_breakdown = json_object_get(financial_root, "category_breakdown");
+                if (category_breakdown && category_breakdown->type == JSON_ARRAY && json_array_size(category_breakdown) > 0) {
+                    size_t count = json_array_size(category_breakdown);
+                    size_t limit = count > 10 ? 10 : count;
+                    if (!buffer_append_cstr(&buf, "\\subsubsection*{Spend by Category}\n")) {
                         json_free(financial_root);
                         free(financial_parse_error);
                         goto cleanup;
                     }
-                    if (!buffer_appendf(&buf, "%s & ", category_tex)) {
+                    if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}r}\n\\toprule\nCategory & Spend\\\\\n\\midrule\n")) {
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                    for (size_t i = 0; i < limit; ++i) {
+                        JsonValue *item = json_array_get(category_breakdown, i);
+                        if (!item || item->type != JSON_OBJECT) {
+                            continue;
+                        }
+                        const char *category_name = json_as_string(json_object_get(item, "category"));
+                        double spend_value = json_as_double_default(json_object_get(item, "spend"), 0.0);
+                        char *category_clean = sanitize_ascii(category_name ? category_name : "Uncategorized");
+                        char *category_tex = latex_escape(category_clean ? category_clean : (category_name ? category_name : "Uncategorized"));
+                        free(category_clean);
+                        if (!category_tex) {
+                            json_free(financial_root);
+                            free(financial_parse_error);
+                            goto cleanup;
+                        }
+                        if (!buffer_appendf(&buf, "%s & ", category_tex)) {
+                            free(category_tex);
+                            json_free(financial_root);
+                            free(financial_parse_error);
+                            goto cleanup;
+                        }
                         free(category_tex);
-                        json_free(financial_root);
-                        free(financial_parse_error);
-                        goto cleanup;
+                        if (!buffer_append_currency(&buf, spend_value)) {
+                            json_free(financial_root);
+                            free(financial_parse_error);
+                            goto cleanup;
+                        }
+                        if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                            json_free(financial_root);
+                            free(financial_parse_error);
+                            goto cleanup;
+                        }
                     }
-                    free(category_tex);
-                    if (!buffer_append_currency(&buf, spend_value)) {
-                        json_free(financial_root);
-                        free(financial_parse_error);
-                        goto cleanup;
-                    }
-                    if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) {
                         json_free(financial_root);
                         free(financial_parse_error);
                         goto cleanup;
                     }
                 }
-                if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) {
-                    json_free(financial_root);
-                    free(financial_parse_error);
-                    goto cleanup;
-                }
-            }
 
-            JsonValue *status_breakdown = json_object_get(financial_root, "status_breakdown");
-            if (status_breakdown && status_breakdown->type == JSON_ARRAY && json_array_size(status_breakdown) > 0) {
-                size_t count = json_array_size(status_breakdown);
-                size_t limit = count > 10 ? 10 : count;
-                if (!buffer_append_cstr(&buf, "\\subsubsection*{Status Distribution}\n")) {
-                    json_free(financial_root);
-                    free(financial_parse_error);
-                    goto cleanup;
-                }
-                if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}r}\n\\toprule\nStatus & Spend\\\\\n\\midrule\n")) {
-                    json_free(financial_root);
-                    free(financial_parse_error);
-                    goto cleanup;
-                }
-                for (size_t i = 0; i < limit; ++i) {
-                    JsonValue *item = json_array_get(status_breakdown, i);
-                    if (!item || item->type != JSON_OBJECT) {
-                        continue;
-                    }
-                    const char *status_name = json_as_string(json_object_get(item, "state"));
-                    double spend_value = json_as_double_default(json_object_get(item, "spend"), 0.0);
-                    char *status_clean = sanitize_ascii(status_name ? status_name : "Unspecified");
-                    char *status_tex = latex_escape(status_clean ? status_clean : (status_name ? status_name : "Unspecified"));
-                    free(status_clean);
-                    if (!status_tex) {
+                JsonValue *status_breakdown = json_object_get(financial_root, "status_breakdown");
+                if (status_breakdown && status_breakdown->type == JSON_ARRAY && json_array_size(status_breakdown) > 0) {
+                    size_t count = json_array_size(status_breakdown);
+                    size_t limit = count > 10 ? 10 : count;
+                    if (!buffer_append_cstr(&buf, "\\subsubsection*{Status Distribution}\n")) {
                         json_free(financial_root);
                         free(financial_parse_error);
                         goto cleanup;
                     }
-                    if (!buffer_appendf(&buf, "%s & ", status_tex)) {
+                    if (!buffer_append_cstr(&buf, "\\begin{tabular}{p{0.55\\textwidth}r}\n\\toprule\nStatus & Spend\\\\\n\\midrule\n")) {
+                        json_free(financial_root);
+                        free(financial_parse_error);
+                        goto cleanup;
+                    }
+                    for (size_t i = 0; i < limit; ++i) {
+                        JsonValue *item = json_array_get(status_breakdown, i);
+                        if (!item || item->type != JSON_OBJECT) {
+                            continue;
+                        }
+                        const char *status_name = json_as_string(json_object_get(item, "state"));
+                        double spend_value = json_as_double_default(json_object_get(item, "spend"), 0.0);
+                        char *status_clean = sanitize_ascii(status_name ? status_name : "Unspecified");
+                        char *status_tex = latex_escape(status_clean ? status_clean : (status_name ? status_name : "Unspecified"));
+                        free(status_clean);
+                        if (!status_tex) {
+                            json_free(financial_root);
+                            free(financial_parse_error);
+                            goto cleanup;
+                        }
+                        if (!buffer_appendf(&buf, "%s & ", status_tex)) {
+                            free(status_tex);
+                            json_free(financial_root);
+                            free(financial_parse_error);
+                            goto cleanup;
+                        }
                         free(status_tex);
+                        if (!buffer_append_currency(&buf, spend_value)) {
+                            json_free(financial_root);
+                            free(financial_parse_error);
+                            goto cleanup;
+                        }
+                        if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                            json_free(financial_root);
+                            free(financial_parse_error);
+                            goto cleanup;
+                        }
+                    }
+                    if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) {
                         json_free(financial_root);
                         free(financial_parse_error);
                         goto cleanup;
                     }
-                    free(status_tex);
-                    if (!buffer_append_currency(&buf, spend_value)) {
-                        json_free(financial_root);
-                        free(financial_parse_error);
-                        goto cleanup;
-                    }
-                    if (!buffer_append_cstr(&buf, "\\\\\n")) {
-                        json_free(financial_root);
-                        free(financial_parse_error);
-                        goto cleanup;
-                    }
-                }
-                if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{tabular}\\\\par\n")) {
-                    json_free(financial_root);
-                    free(financial_parse_error);
-                    goto cleanup;
                 }
             }
+            json_free(financial_root);
+            free(financial_parse_error);
         }
-        json_free(financial_root);
-        free(financial_parse_error);
     }
 
     fail_stage = "writing deficiency snapshot";
@@ -13800,18 +14089,246 @@ static int build_location_overview_tex(const ReportJob *job,
 
     fail_stage = "writing timeline summary";
     if (!buffer_append_cstr(&buf, "\\section*{Timeline Summary}\n")) goto cleanup;
-    if (timeline_json && (timeline_has_service || timeline_has_financial)) {
+    if (timeline_any_available) {
         char *timeline_parse_error = NULL;
         JsonValue *timeline_root = json_parse(timeline_json, &timeline_parse_error);
         if (timeline_root && timeline_root->type == JSON_ARRAY && json_array_size(timeline_root) > 0) {
             size_t timeline_rows = json_array_size(timeline_root);
             size_t max_rows = timeline_rows > 18 ? 18 : timeline_rows;
-            if (!buffer_append_cstr(&buf, "\\begin{longtable}{lrrrrrrrr}\n\\toprule\n")) {
+            size_t timeline_points = 0;
+            double spend_sum = 0.0;
+            const bool include_service_cols = timeline_service_available;
+            const bool include_spend_col = timeline_financial_available;
+            for (size_t i = 0; i < max_rows; ++i) {
+                JsonValue *entry = json_array_get(timeline_root, i);
+                if (!entry || entry->type != JSON_OBJECT) {
+                    continue;
+                }
+                const char *month = json_as_string(json_object_get(entry, "month"));
+                long pm = 0;
+                long cb_emg = 0;
+                long cb_equipment = 0;
+                long cb_env = 0;
+                long cb_other = 0;
+                long tst = 0;
+                long rp = 0;
+                long misc = 0;
+                json_as_long(json_object_get(entry, "pm"), &pm);
+                json_as_long(json_object_get(entry, "cb_emergency"), &cb_emg);
+                json_as_long(json_object_get(entry, "cb_equipment"), &cb_equipment);
+                json_as_long(json_object_get(entry, "cb_env"), &cb_env);
+                json_as_long(json_object_get(entry, "cb_other"), &cb_other);
+                json_as_long(json_object_get(entry, "tst"), &tst);
+                json_as_long(json_object_get(entry, "rp"), &rp);
+                json_as_long(json_object_get(entry, "misc"), &misc);
+                double spend_total = json_as_double_default(json_object_get(entry, "spend"), 0.0);
+                char *month_clean_plot = sanitize_ascii(month ? month : "");
+                const char *month_key = month_clean_plot ? month_clean_plot : (month ? month : "");
+                if (timeline_symbolic.length > 0) {
+                    if (!buffer_append_cstr(&timeline_symbolic, ",")) {
+                        free(month_clean_plot);
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                }
+                if (!buffer_append_cstr(&timeline_symbolic, month_key)) {
+                    free(month_clean_plot);
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                long series_values[TIMELINE_SERIES_COUNT];
+                series_values[0] = pm;
+                series_values[1] = tst;
+                series_values[2] = cb_emg;
+                series_values[3] = cb_equipment;
+                series_values[4] = cb_env + cb_other + misc;
+                series_values[5] = rp;
+                for (int s = 0; s < TIMELINE_SERIES_COUNT; ++s) {
+                    if (timeline_series[s].coords.length == 0) {
+                        if (!buffer_append_char(&timeline_series[s].coords, '{')) {
+                            free(month_clean_plot);
+                            json_free(timeline_root);
+                            free(timeline_parse_error);
+                            goto cleanup;
+                        }
+                    } else {
+                        if (!buffer_append_char(&timeline_series[s].coords, ' ')) {
+                            free(month_clean_plot);
+                            json_free(timeline_root);
+                            free(timeline_parse_error);
+                            goto cleanup;
+                        }
+                    }
+                    if (!buffer_appendf(&timeline_series[s].coords, "(%s,%ld)", month_key, series_values[s])) {
+                        free(month_clean_plot);
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                    timeline_series[s].total += series_values[s];
+                }
+                if (timeline_spend_coords.length == 0) {
+                    if (!buffer_append_char(&timeline_spend_coords, '{')) {
+                        free(month_clean_plot);
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                } else {
+                    if (!buffer_append_char(&timeline_spend_coords, ' ')) {
+                        free(month_clean_plot);
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                }
+                if (!buffer_appendf(&timeline_spend_coords, "(%s,%.2f)", month_key, spend_total)) {
+                    free(month_clean_plot);
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                free(month_clean_plot);
+                spend_sum += spend_total;
+                timeline_points++;
+            }
+            for (int s = 0; s < TIMELINE_SERIES_COUNT; ++s) {
+                if (timeline_series[s].coords.length > 0 && timeline_series[s].coords.data[timeline_series[s].coords.length - 1] != '}') {
+                    if (!buffer_append_char(&timeline_series[s].coords, '}')) {
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                }
+            }
+            if (timeline_spend_coords.length > 0 && timeline_spend_coords.data[timeline_spend_coords.length - 1] != '}') {
+                if (!buffer_append_char(&timeline_spend_coords, '}')) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+            }
+            if (timeline_legend.length > 0 && timeline_legend.data) {
+                timeline_legend.length = 0;
+                timeline_legend.data[0] = '\0';
+            }
+            bool have_service_series = false;
+            for (int s = 0; s < TIMELINE_SERIES_COUNT; ++s) {
+                if (timeline_series[s].total > 0) {
+                    have_service_series = true;
+                    char *legend_tex = latex_escape(TIMELINE_SERIES_META[s].label);
+                    if (!legend_tex) {
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                    if (timeline_legend.length > 0) {
+                        if (!buffer_append_cstr(&timeline_legend, ",")) {
+                            free(legend_tex);
+                            json_free(timeline_root);
+                            free(timeline_parse_error);
+                            goto cleanup;
+                        }
+                    }
+                    if (!buffer_append_cstr(&timeline_legend, legend_tex)) {
+                        free(legend_tex);
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                    free(legend_tex);
+                }
+            }
+            bool have_spend_series = include_spend_col && spend_sum > 0.0;
+            if (have_service_series && timeline_symbolic.length > 0 && timeline_points > 0) {
+                if (!buffer_append_cstr(&buf, "\\begin{figure}[ht]\\centering\n")) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_append_cstr(&buf, "\\begin{tikzpicture}\n")) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_appendf(&buf,
+                        "\\begin{axis}[width=\\textwidth,height=6.5cm,ybar stacked,ymin=0,bar width=11pt,symbolic x coords={%s},xtick=data,xticklabel style={rotate=45,anchor=east,font=\\small},ylabel={Service Tickets},ylabel style={font=\\small},ymajorgrids=true,legend style={font=\\small,at={(0.5,1.25)},anchor=south,legend columns=3}]\n",
+                        timeline_symbolic.data)) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                for (int s = 0; s < TIMELINE_SERIES_COUNT; ++s) {
+                    if (timeline_series[s].total > 0) {
+                        if (!buffer_appendf(&buf, "\\addplot+[ybar, fill=%s, draw=black!10] coordinates %s;\n", TIMELINE_SERIES_META[s].fill, timeline_series[s].coords.data)) {
+                            json_free(timeline_root);
+                            free(timeline_parse_error);
+                            goto cleanup;
+                        }
+                    }
+                }
+                if (timeline_legend.length > 0) {
+                    if (!buffer_appendf(&buf, "\\legend{%s}\n", timeline_legend.data)) {
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                }
+                if (!buffer_append_cstr(&buf, "\\end{axis}\n\\end{tikzpicture}\n\\caption{Service timeline by activity type}\n\\end{figure}\n")) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+            }
+            if (have_spend_series && timeline_symbolic.length > 0 && timeline_points > 0) {
+                if (!buffer_append_cstr(&buf, "\\begin{figure}[ht]\\centering\n")) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_append_cstr(&buf, "\\begin{tikzpicture}\n")) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_appendf(&buf,
+                        "\\begin{axis}[width=\\textwidth,height=5.5cm,ymin=0,symbolic x coords={%s},xtick=data,xticklabel style={rotate=45,anchor=east,font=\\small},ylabel={Monthly Spend (USD)},ylabel style={font=\\small},ymajorgrids=true,legend style={font=\\small,at={(0.02,0.98)},anchor=north west},scaled y ticks=false,yticklabel style={/pgf/number format/.cd,fixed,precision=0,1000 sep=\\,}]\n",
+                        timeline_symbolic.data)) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_appendf(&buf, "\\addplot+[thick, color=Set1-5, mark=*, mark options={scale=0.8}] coordinates %s;\n", timeline_spend_coords.data)) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+                if (!buffer_append_cstr(&buf, "\\legend{Total spend}\n\\end{axis}\n\\end{tikzpicture}\n\\caption{Financial spend trend}\n\\end{figure}\n")) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+            }
+            const char *table_spec;
+            const char *header_line;
+            if (include_service_cols && include_spend_col) {
+                table_spec = "\\begin{longtable}{lrrrrrrrrr}\n\\toprule\n";
+                header_line = "Month & PM & CB-Emg & CB-Equip & CB-Env & CB-Other & TST & RP & Misc & Spend\\\\\n\\midrule\n";
+            } else if (include_service_cols) {
+                table_spec = "\\begin{longtable}{lrrrrrrrr}\n\\toprule\n";
+                header_line = "Month & PM & CB-Emg & CB-Equip & CB-Env & CB-Other & TST & RP & Misc\\\\\n\\midrule\n";
+            } else { /* spend only */
+                table_spec = "\\begin{longtable}{lr}\n\\toprule\n";
+                header_line = "Month & Spend\\\\\n\\midrule\n";
+            }
+            if (!buffer_append_cstr(&buf, table_spec)) {
                 json_free(timeline_root);
                 free(timeline_parse_error);
                 goto cleanup;
             }
-            if (!buffer_append_cstr(&buf, "Month & PM & CB-Emg & CB-Env & CB-Other & TST & RP & Misc & Spend\\\\\n\\midrule\n")) {
+            if (!buffer_append_cstr(&buf, header_line)) {
                 json_free(timeline_root);
                 free(timeline_parse_error);
                 goto cleanup;
@@ -13823,18 +14340,20 @@ static int build_location_overview_tex(const ReportJob *job,
                 }
                 const char *month = json_as_string(json_object_get(entry, "month"));
                 long pm = 0;
-                json_as_long(json_object_get(entry, "pm"), &pm);
                 long cb_emg = 0;
-                json_as_long(json_object_get(entry, "cb_emergency"), &cb_emg);
+                long cb_equipment = 0;
                 long cb_env = 0;
-                json_as_long(json_object_get(entry, "cb_env"), &cb_env);
                 long cb_other = 0;
-                json_as_long(json_object_get(entry, "cb_other"), &cb_other);
                 long tst = 0;
-                json_as_long(json_object_get(entry, "tst"), &tst);
                 long rp = 0;
-                json_as_long(json_object_get(entry, "rp"), &rp);
                 long misc = 0;
+                json_as_long(json_object_get(entry, "pm"), &pm);
+                json_as_long(json_object_get(entry, "cb_emergency"), &cb_emg);
+                json_as_long(json_object_get(entry, "cb_equipment"), &cb_equipment);
+                json_as_long(json_object_get(entry, "cb_env"), &cb_env);
+                json_as_long(json_object_get(entry, "cb_other"), &cb_other);
+                json_as_long(json_object_get(entry, "tst"), &tst);
+                json_as_long(json_object_get(entry, "rp"), &rp);
                 json_as_long(json_object_get(entry, "misc"), &misc);
                 double spend_total = json_as_double_default(json_object_get(entry, "spend"), 0.0);
                 char *month_clean = sanitize_ascii(month ? month : "");
@@ -13845,28 +14364,69 @@ static int build_location_overview_tex(const ReportJob *job,
                     free(timeline_parse_error);
                     goto cleanup;
                 }
-                if (!buffer_appendf(&buf, "%s & %ld & %ld & %ld & %ld & %ld & %ld & %ld & ", month_tex, pm, cb_emg, cb_env, cb_other, tst, rp, misc)) {
+                if (include_service_cols) {
+                    if (!buffer_appendf(&buf, "%s & %ld & %ld & %ld & %ld & %ld & %ld & %ld & %ld", month_tex, pm, cb_emg, cb_equipment, cb_env, cb_other, tst, rp, misc)) {
+                        free(month_tex);
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
                     free(month_tex);
-                    json_free(timeline_root);
-                    free(timeline_parse_error);
-                    goto cleanup;
-                }
-                free(month_tex);
-                if (!buffer_append_currency(&buf, spend_total)) {
-                    json_free(timeline_root);
-                    free(timeline_parse_error);
-                    goto cleanup;
-                }
-                if (!buffer_append_cstr(&buf, "\\\\\n")) {
-                    json_free(timeline_root);
-                    free(timeline_parse_error);
-                    goto cleanup;
+                    if (include_spend_col) {
+                        if (!buffer_append_cstr(&buf, " & ")) {
+                            json_free(timeline_root);
+                            free(timeline_parse_error);
+                            goto cleanup;
+                        }
+                        if (!buffer_append_currency(&buf, spend_total)) {
+                            json_free(timeline_root);
+                            free(timeline_parse_error);
+                            goto cleanup;
+                        }
+                    }
+                    if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                } else {
+                    if (!buffer_appendf(&buf, "%s & ", month_tex)) {
+                        free(month_tex);
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                    free(month_tex);
+                    if (!buffer_append_currency(&buf, spend_total)) {
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
+                    if (!buffer_append_cstr(&buf, "\\\\\n")) {
+                        json_free(timeline_root);
+                        free(timeline_parse_error);
+                        goto cleanup;
+                    }
                 }
             }
             if (!buffer_append_cstr(&buf, "\\bottomrule\n\\end{longtable}\n")) {
                 json_free(timeline_root);
                 free(timeline_parse_error);
                 goto cleanup;
+            }
+            if (!timeline_service_available) {
+                if (!buffer_append_cstr(&buf, "\\textit{Service history not available for this window; spend trend shown only.}\\\\par\n")) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
+            }
+            if (!timeline_financial_available) {
+                if (!buffer_append_cstr(&buf, "\\textit{Financial history not available for this window; service trend shown only.}\\\\par\n")) {
+                    json_free(timeline_root);
+                    free(timeline_parse_error);
+                    goto cleanup;
+                }
             }
         } else {
             if (!buffer_append_cstr(&buf, "Detailed month-by-month charts are available in the digital dashboard for this location.\\\\par\n")) {
@@ -13911,6 +14471,14 @@ cleanup:
     free(range_label);
     free(range_tex);
     free(generated_tex);
+    for (int timeline_series_i = 0; timeline_series_i < TIMELINE_SERIES_COUNT; ++timeline_series_i) {
+        buffer_free(&timeline_series[timeline_series_i].coords);
+    }
+    buffer_free(&timeline_symbolic);
+    buffer_free(&timeline_spend_coords);
+    buffer_free(&timeline_legend);
+    buffer_free(&service_mix_symbols);
+    buffer_free(&service_mix_coords);
     buffer_free(&buf);
     if (!success) {
         if (error_out && !*error_out) {
