@@ -3260,8 +3260,10 @@ const dataCoverage = createMemo(() => {
                       <Show when={devices().length > 0} fallback={<p class="deficiency-empty">No devices found.</p>}>
                         <For each={devices()}>
                           {(device: LocationDevice) => {
-                            const filtered = (device.deficiencies ?? []).filter((item) =>
-                              showResolvedDeficiencies() ? true : !item.resolved
+                            const filtered = createMemo(() =>
+                              (device.deficiencies ?? []).filter((item) =>
+                                showResolvedDeficiencies() ? true : !item.resolved
+                              )
                             );
                             const totalDeficienciesDevice = device.deficiencies?.length ?? 0;
                             const openDeficienciesDevice = device.deficiencies?.filter((item) => !item.resolved).length ?? 0;
